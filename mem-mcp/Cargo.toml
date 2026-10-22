@@ -2,6 +2,8 @@
 name = "mem-mcp"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+repository = "https://github.com/Jerry-Hang/acdm"
 description = "MCP Server (stdio) for Agent Cross-Device Memory System"
 
 [[bin]]

@@ -1,4 +1,6 @@
 use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -8,7 +10,10 @@ use mem_core::git::{
 };
 use mem_core::render::write_project_readme;
 use mem_core::resolve::resolve_conflicts;
-use mem_core::{generate_id, Event, FileRecord, MemIndex, MemStore, ProjectMeta};
+use mem_core::{
+    default_device_name, generate_id, normalize_file_name, now_rfc3339, resolve_store_root, Event,
+    FileRecord, MemIndex, MemStore, ProjectMeta,
+};
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
@@ -76,43 +81,6 @@ fn mcp_text_content(text: impl Into<String>) -> Value {
     })
 }
 
-fn now_rfc3339() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let dur = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = dur.as_secs();
-
-    let mut days = (secs / 86400) as i64;
-    let day_secs = (secs % 86400) as u32;
-    let hour = day_secs / 3600;
-    let minute = (day_secs % 3600) / 60;
-    let second = day_secs % 60;
-
-    days += 719468;
-    let era = if days >= 0 { days } else { days - 146096 } / 146097;
-    let doe = (days - era * 146097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-
-    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, hour, minute, second)
-}
-
-fn get_default_device() -> String {
-    std::process::Command::new("hostname")
-        .output()
-        .ok()
-        .and_then(|out| String::from_utf8(out.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown-device".to_string())
-}
-
 fn get_tools_list() -> Value {
     serde_json::json!([
         {
@@ -174,7 +142,7 @@ fn get_tools_list() -> Value {
                                     "description": "SHA256 hex digest"
                                 }
                             },
-                            "required": ["file_name", "action"]
+                            "required": ["file_name"]
                         }
                     }
                 },
@@ -328,18 +296,12 @@ fn handle_get_context(store: &MemStore, args: GetContextArgs) -> Result<Value, S
                 out.push_str("(No README.md available)\n");
             }
 
-            // 3. Last 5 events
+            // 3. Last 5 events. The store returns them oldest-first and already
+            // handles month-file boundaries plus legacy timestamp formats.
             out.push_str("\n--- Recent Events (last 5) ---\n");
-            let all_events = store.read_all_events().unwrap_or_default();
-            let mut proj_events: Vec<Event> =
-                all_events.into_iter().filter(|e| e.project == project).collect();
-            proj_events.sort_by(|a, b| a.ts.cmp(&b.ts));
-
-            let recent = if proj_events.len() > 5 {
-                proj_events.split_off(proj_events.len() - 5)
-            } else {
-                proj_events
-            };
+            let recent = store
+                .read_latest_events_for_project(&project, 5)
+                .map_err(|e| format!("Failed to read recent events: {}", e))?;
 
             if recent.is_empty() {
                 out.push_str("(No events found for this project)\n");
@@ -397,7 +359,7 @@ fn handle_add_event(store: &MemStore, args: AddEventArgs) -> Result<Value, Strin
     let device = args
         .device
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(get_default_device);
+        .unwrap_or_else(default_device_name);
     let agent = args
         .agent
         .filter(|s| !s.trim().is_empty())
@@ -408,17 +370,23 @@ fn handle_add_event(store: &MemStore, args: AddEventArgs) -> Result<Value, Strin
     for f in raw_files {
         let action = f.action.unwrap_or_else(|| "Modified".to_string());
         let file_id = generate_id();
+        // MCP clients usually send absolute paths. Store the canonical,
+        // store-relative identity so that `mem_query by=filename` (which indexes
+        // relative names) and cross-device matching keep working.
+        let file_name = normalize_file_name(Path::new(&f.file_name), &store.root);
         files.push(FileRecord {
             file_id,
-            file_name: f.file_name,
+            file_name,
             action,
             size_bytes: f.size_bytes.unwrap_or(0),
             hash: f.hash.unwrap_or_default(),
         });
     }
 
-    // Auto-create minimal project meta if it doesn't exist
-    if !store.project_exists(&args.project) {
+    // Auto-create minimal project meta if it doesn't exist. Checking the file
+    // itself (not the directory) keeps working after `mem_render` created
+    // `projects/<name>/` without metadata.
+    if store.read_project_meta(&args.project).is_err() {
         let meta = ProjectMeta {
             name: args.project.clone(),
             description: format!("Project {}", args.project),
@@ -473,8 +441,8 @@ fn format_event_full(out: &mut String, event: &Event) {
 }
 
 fn handle_query(store: &MemStore, args: QueryArgs) -> Result<Value, String> {
-    let index = MemIndex::build(store)
-        .map_err(|e| format!("Failed to build memory index: {}", e))?;
+    let index =
+        MemIndex::build(store).map_err(|e| format!("Failed to build memory index: {}", e))?;
 
     match args.by.to_lowercase().as_str() {
         "project" => {
@@ -622,20 +590,18 @@ struct SyncArgs {
 fn handle_sync(store: &MemStore, args: Option<SyncArgs>) -> Result<Value, String> {
     let mut steps = Vec::new();
 
-    let is_clean = git_status_clean(&store.root)
-        .map_err(|e| format!("Git status check failed: {}", e))?;
+    let is_clean =
+        git_status_clean(&store.root).map_err(|e| format!("Git status check failed: {}", e))?;
 
     if !is_clean {
-        git_add_all(&store.root)
-            .map_err(|e| format!("git add -A failed: {}", e))?;
+        git_add_all(&store.root).map_err(|e| format!("git add -A failed: {}", e))?;
 
         let commit_msg = args
             .and_then(|a| a.message)
             .filter(|m| !m.trim().is_empty())
             .unwrap_or_else(|| "Auto-sync memory store".to_string());
 
-        git_commit(&store.root, &commit_msg)
-            .map_err(|e| format!("git commit failed: {}", e))?;
+        git_commit(&store.root, &commit_msg).map_err(|e| format!("git commit failed: {}", e))?;
         steps.push(format!("Committed local changes (\"{}\")", commit_msg));
     } else {
         steps.push("Working directory clean".to_string());
@@ -654,8 +620,7 @@ fn handle_sync(store: &MemStore, args: Option<SyncArgs>) -> Result<Value, String
         steps.push("Pulled remote changes with rebase".to_string());
     }
 
-    git_push(&store.root)
-        .map_err(|e| format!("git push failed: {}", e))?;
+    git_push(&store.root).map_err(|e| format!("git push failed: {}", e))?;
     steps.push("Pushed to remote successfully".to_string());
 
     Ok(mcp_text_content(format!(
@@ -665,14 +630,15 @@ fn handle_sync(store: &MemStore, args: Option<SyncArgs>) -> Result<Value, String
 }
 
 fn handle_resolve(store: &MemStore) -> Result<Value, String> {
-    let report = resolve_conflicts(&store.root)
-        .map_err(|e| format!("Conflict resolution failed: {}", e))?;
+    let report =
+        resolve_conflicts(&store.root).map_err(|e| format!("Conflict resolution failed: {}", e))?;
 
     Ok(mcp_text_content(format!(
-        "Conflict resolution completed: {} files resolved, {} conflict markers resolved, {} duplicate items removed.",
+        "Conflict resolution completed: {} files resolved, {} conflict markers resolved, {} duplicate items removed, {} non-record lines preserved.",
         report.resolved_files.len(),
         report.total_conflicts_resolved,
-        report.deduplicated_items
+        report.deduplicated_items,
+        report.lines_preserved
     )))
 }
 
@@ -682,8 +648,12 @@ struct RenderArgs {
 }
 
 fn handle_render(store: &MemStore, args: RenderArgs) -> Result<Value, String> {
-    write_project_readme(store, &args.project)
-        .map_err(|e| format!("Failed to render README for project '{}': {}", args.project, e))?;
+    write_project_readme(store, &args.project).map_err(|e| {
+        format!(
+            "Failed to render README for project '{}': {}",
+            args.project, e
+        )
+    })?;
 
     Ok(mcp_text_content(format!(
         "Successfully rendered README for project '{}'.",
@@ -702,10 +672,7 @@ fn handle_request(store: &MemStore, request: JsonRpcRequest) -> Option<JsonRpcRe
         return None;
     }
 
-    let id = match request.id {
-        Some(id) => id,
-        None => return None,
-    };
+    let id = request.id?;
 
     match request.method.as_str() {
         "initialize" => {
@@ -722,9 +689,10 @@ fn handle_request(store: &MemStore, request: JsonRpcRequest) -> Option<JsonRpcRe
             Some(success_response(id, result))
         }
         "ping" => Some(success_response(id, serde_json::json!({}))),
-        "tools/list" => {
-            Some(success_response(id, serde_json::json!({ "tools": get_tools_list() })))
-        }
+        "tools/list" => Some(success_response(
+            id,
+            serde_json::json!({ "tools": get_tools_list() }),
+        )),
         "tools/call" => {
             let call_params: ToolCallParams = match request.params {
                 Some(p) => match serde_json::from_value(p) {
@@ -799,16 +767,73 @@ fn handle_request(store: &MemStore, request: JsonRpcRequest) -> Option<JsonRpcRe
     }
 }
 
+// ----------------- Command-line arguments -----------------
+
+/// Parse the MCP server's start-up arguments.
+///
+/// MCP clients configure the server as a command plus arguments. The only flag
+/// understood here is `--path <dir>` (also accepted as `--path=<dir>`), which
+/// pins the memory store root instead of letting it be discovered from the
+/// working directory. Unknown arguments are rejected rather than ignored: a
+/// typo silently using the wrong store is worse than refusing to start.
+fn parse_store_path_arg<I>(args: I) -> Result<Option<PathBuf>, String>
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    let mut args = args.into_iter();
+    let mut explicit: Option<PathBuf> = None;
+
+    while let Some(arg) = args.next() {
+        let text = arg.to_str();
+        let inline_value = text
+            .and_then(|text| text.strip_prefix("--path="))
+            .map(PathBuf::from);
+        let is_flag = text == Some("--path");
+
+        if !is_flag && inline_value.is_none() {
+            return Err(format!(
+                "unrecognized argument {:?}; usage: mem-mcp [--path <store-root>]",
+                arg
+            ));
+        }
+
+        let value = match inline_value {
+            Some(value) => value,
+            None => args
+                .next()
+                .map(PathBuf::from)
+                .ok_or_else(|| "--path requires a directory argument".to_string())?,
+        };
+        if value.as_os_str().is_empty() {
+            return Err("--path requires a non-empty directory argument".to_string());
+        }
+        explicit = Some(value);
+    }
+
+    Ok(explicit)
+}
+
 fn main() {
-    let current_dir = match std::env::current_dir() {
-        Ok(dir) => dir,
+    let explicit_root = match parse_store_path_arg(std::env::args_os().skip(1)) {
+        Ok(root) => root,
+        Err(message) => {
+            eprintln!("mem-mcp: {}", message);
+            std::process::exit(2);
+        }
+    };
+
+    // Resolve the store root exactly like the CLI: explicit `--path` first, then
+    // $ACDM_STORE, then the nearest enclosing `.mem`/`events/` directory, then
+    // the current working directory.
+    let store_root = match resolve_store_root(explicit_root.as_deref()) {
+        Ok(root) => root,
         Err(e) => {
-            eprintln!("Failed to get current working directory: {}", e);
+            eprintln!("Failed to resolve memory store root: {}", e);
             std::process::exit(1);
         }
     };
 
-    let store = MemStore::new(current_dir);
+    let store = MemStore::new(store_root);
     if let Err(e) = store.init() {
         eprintln!("Notice: store initialization check: {}", e);
     }
@@ -863,5 +888,56 @@ fn main() {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_store_path_arg;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    fn parse(args: &[&str]) -> Result<Option<PathBuf>, String> {
+        parse_store_path_arg(args.iter().copied().map(OsString::from))
+    }
+
+    #[test]
+    fn test_parse_path_flag_with_separate_value() {
+        assert_eq!(
+            parse(&["--path", "/tmp/store"]).unwrap(),
+            Some(PathBuf::from("/tmp/store"))
+        );
+    }
+
+    #[test]
+    fn test_parse_path_flag_with_inline_value() {
+        assert_eq!(
+            parse(&["--path=/tmp/store"]).unwrap(),
+            Some(PathBuf::from("/tmp/store"))
+        );
+    }
+
+    #[test]
+    fn test_parse_without_arguments_uses_discovery() {
+        assert_eq!(parse(&[]).unwrap(), None);
+    }
+
+    #[test]
+    fn test_parse_keeps_last_path() {
+        assert_eq!(
+            parse(&["--path=/one", "--path", "/two"]).unwrap(),
+            Some(PathBuf::from("/two"))
+        );
+    }
+
+    #[test]
+    fn test_parse_rejects_missing_or_empty_value() {
+        assert!(parse(&["--path"]).is_err());
+        assert!(parse(&["--path="]).is_err());
+    }
+
+    #[test]
+    fn test_parse_rejects_unknown_argument() {
+        assert!(parse(&["--bogus"]).is_err());
     }
 }

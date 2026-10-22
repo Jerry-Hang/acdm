@@ -2,6 +2,8 @@
 name = "mem-cli"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+repository = "https://github.com/Jerry-Hang/acdm"
 description = "CLI for Agent Cross-Device Memory System"
 
 [[bin]]
@@ -10,9 +12,4 @@ path = "src/main.rs"
 
 [dependencies]
 mem-core = { path = "../mem-core" }
-serde = { workspace = true }
-serde_json = { workspace = true }
 clap = { version = "4", features = ["derive"] }
-sha2 = "0.10"
-hex = "0.4"
-chrono = { version = "0.4", features = ["serde"] }

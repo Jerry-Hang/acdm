@@ -1,0 +1,594 @@
+//! End-to-end tests for the `mem` binary.
+//!
+//! Every test drives the real binary through `CARGO_BIN_EXE_mem` and owns its own
+//! temporary directory, so the suite needs no dev-dependencies and is safe to run
+//! in parallel. `ACDM_STORE` is stripped from each child environment so a value
+//! exported in the developer shell can never redirect a test at the wrong store.
+
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Path of the `mem` binary built by cargo for this test run.
+const MEM_BIN: &str = env!("CARGO_BIN_EXE_mem");
+
+/// Monotonic counter so stores created by different tests never collide.
+static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Minimal self-cleaning temporary directory.
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new(label: &str) -> Self {
+        let unique = format!(
+            "acdm_cli_it_{}_{}_{}",
+            label,
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let path = env::temp_dir().join(unique);
+        fs::create_dir_all(&path).expect("create temporary test directory");
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Create a store inside the temporary directory and initialise it.
+    fn init_store(&self, name: &str) -> PathBuf {
+        let store = self.path.join(name);
+        fs::create_dir_all(&store).expect("create store directory");
+        let output = run(&store, &["init"]);
+        assert_success(&output);
+        store
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Build a `mem` invocation with a fixed working directory and a clean environment.
+fn mem(cwd: &Path) -> Command {
+    let mut command = Command::new(MEM_BIN);
+    command.current_dir(cwd);
+    command.env_remove("ACDM_STORE");
+    command
+}
+
+fn run(cwd: &Path, args: &[&str]) -> Output {
+    mem(cwd)
+        .args(args)
+        .output()
+        .expect("failed to run the mem binary")
+}
+
+fn stdout(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+fn assert_success(output: &Output) {
+    assert!(
+        output.status.success(),
+        "mem command failed with {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        stdout(output),
+        stderr(output)
+    );
+}
+
+/// All event lines from `events/*.jsonl`, oldest month first.
+fn event_lines(store: &Path) -> Vec<String> {
+    let events_dir = store.join("events");
+    let mut files: Vec<PathBuf> = fs::read_dir(&events_dir)
+        .expect("read events directory")
+        .map(|entry| entry.expect("read events directory entry").path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+        .collect();
+    files.sort();
+
+    let mut lines = Vec::new();
+    for path in files {
+        let content = fs::read_to_string(&path).expect("read events jsonl file");
+        lines.extend(content.lines().map(|line| line.to_string()));
+    }
+    lines
+}
+
+/// All records from `projects/<project>/files.jsonl`.
+fn file_record_lines(store: &Path, project: &str) -> Vec<String> {
+    let path = store.join("projects").join(project).join("files.jsonl");
+    let content = fs::read_to_string(&path).expect("read files.jsonl");
+    content
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| line.to_string())
+        .collect()
+}
+
+/// Extract the value of the `"ts"` field from one serialized event line.
+fn event_ts(line: &str) -> String {
+    let marker = "\"ts\":\"";
+    let start = line.find(marker).expect("event line has a ts field") + marker.len();
+    let rest = &line[start..];
+    let end = rest.find('"').expect("ts value is terminated");
+    rest[..end].to_string()
+}
+
+#[test]
+fn init_creates_marker_and_store_layout() {
+    let tmp = TempDir::new("init");
+    let store = tmp.path().join("store");
+    fs::create_dir_all(&store).expect("create store directory");
+
+    let output = run(&store, &["init"]);
+    assert_success(&output);
+
+    assert!(store.join(".mem").is_file(), ".mem marker must exist");
+    assert!(store.join("events").is_dir(), "events/ must exist");
+    assert!(store.join("projects").is_dir(), "projects/ must exist");
+    assert!(
+        !store.join("nodes").exists(),
+        "the legacy nodes/ directory must not be created"
+    );
+
+    let out = stdout(&output);
+    assert!(
+        out.contains(".mem"),
+        "init output must mention the marker: {}",
+        out
+    );
+    assert!(
+        !out.contains("nodes/"),
+        "init output must not advertise nodes/: {}",
+        out
+    );
+}
+
+#[test]
+fn add_from_store_subdirectory_records_store_relative_path() {
+    let tmp = TempDir::new("subdir");
+    let store = tmp.init_store("store");
+    let project_dir = store.join("projects").join("demo");
+    let src_dir = project_dir.join("src");
+    fs::create_dir_all(&src_dir).expect("create source directory");
+    fs::write(src_dir.join("app.txt"), "hello from the store\n").expect("write app.txt");
+
+    let output = run(
+        &project_dir,
+        &[
+            "add",
+            "-p",
+            "demo",
+            "-s",
+            "add app",
+            "-d",
+            "test-device",
+            "src/app.txt",
+        ],
+    );
+    assert_success(&output);
+
+    let records = file_record_lines(&store, "demo");
+    assert_eq!(records.len(), 1);
+    assert!(
+        records[0].contains("\"file_name\":\"projects/demo/src/app.txt\""),
+        "store-relative identity expected, got: {}",
+        records[0]
+    );
+    assert!(
+        records[0].contains("\"action\":\"Created\""),
+        "the first record of a file must be Created: {}",
+        records[0]
+    );
+}
+
+#[test]
+fn add_from_git_repository_uses_repo_relative_identity() {
+    let tmp = TempDir::new("gitrepo");
+    let store = tmp.init_store("store");
+    // A real (empty) git work tree as the identity baseline; no commit is needed.
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(repo.join("src")).expect("create repo source directory");
+    let git_init = Command::new("git")
+        .current_dir(&repo)
+        .args(["init", "--quiet"])
+        .output()
+        .expect("run git init");
+    assert!(
+        git_init.status.success(),
+        "git init failed: {}",
+        String::from_utf8_lossy(&git_init.stderr)
+    );
+    let target = repo.join("src").join("lib.rs");
+    fs::write(&target, "pub fn answer() -> u32 { 42 }\n").expect("write lib.rs");
+
+    let output = run(
+        &store,
+        &[
+            "add",
+            "-p",
+            "demo",
+            "-s",
+            "track repo lib",
+            "-d",
+            "test-device",
+            target.to_str().expect("UTF-8 temporary path"),
+        ],
+    );
+    assert_success(&output);
+
+    let records = file_record_lines(&store, "demo");
+    assert_eq!(records.len(), 1);
+    assert!(
+        records[0].contains("\"file_name\":\"src/lib.rs\""),
+        "repository-relative identity expected, got: {}",
+        records[0]
+    );
+
+    // Regression: querying by the recorded, normalised name must find the event.
+    let query = run(&store, &["query", "-n", "src/lib.rs"]);
+    assert_success(&query);
+    let out = stdout(&query);
+    assert!(
+        out.contains("Found 1 event(s)"),
+        "query by normalised name must match: {}",
+        out
+    );
+    assert!(
+        !out.contains("No events found"),
+        "query must hit the recorded file: {}",
+        out
+    );
+}
+
+#[test]
+fn add_writes_fixed_width_utc_timestamp() {
+    let tmp = TempDir::new("timestamp");
+    let store = tmp.init_store("store");
+    let file = store.join("note.txt");
+    fs::write(&file, "timestamp test\n").expect("write note.txt");
+
+    let output = run(
+        &store,
+        &[
+            "add",
+            "-p",
+            "demo",
+            "-s",
+            "timestamp",
+            file.to_str().expect("UTF-8 temporary path"),
+        ],
+    );
+    assert_success(&output);
+
+    let lines = event_lines(&store);
+    assert_eq!(lines.len(), 1);
+    let ts = event_ts(&lines[0]);
+    assert_eq!(ts.len(), 30, "timestamp must be fixed width 30: {ts:?}");
+    assert!(ts.ends_with('Z'), "timestamp must be UTC: {ts:?}");
+    let bytes = ts.as_bytes();
+    assert_eq!(bytes[4], b'-');
+    assert_eq!(bytes[10], b'T');
+    assert_eq!(bytes[19], b'.');
+    assert!(
+        stdout(&output).contains(&format!("Timestamp: {ts}")),
+        "the CLI must echo the canonical timestamp: {}",
+        stdout(&output)
+    );
+}
+
+#[test]
+fn add_outside_store_and_git_warns_and_records_absolute_path() {
+    let tmp = TempDir::new("outside");
+    let store = tmp.init_store("store");
+    let outside = tmp.path().join("outside");
+    fs::create_dir_all(&outside).expect("create outside directory");
+    let loose = outside.join("loose.txt");
+    fs::write(&loose, "loose file\n").expect("write loose.txt");
+
+    let output = run(
+        &store,
+        &[
+            "add",
+            "-p",
+            "demo",
+            "-s",
+            "loose",
+            loose.to_str().expect("UTF-8 temporary path"),
+        ],
+    );
+    assert_success(&output);
+
+    let err = stderr(&output);
+    assert!(
+        err.contains("Warning:"),
+        "an add outside the store and any git repository must warn on stderr: {}",
+        err
+    );
+
+    let records = file_record_lines(&store, "demo");
+    assert_eq!(records.len(), 1);
+    let absolute = loose.to_string_lossy().replace('\\', "/");
+    assert!(
+        records[0].contains(&format!("\"file_name\":\"{absolute}\"")),
+        "an unnormalisable path is recorded absolutely, got: {}",
+        records[0]
+    );
+}
+
+#[test]
+fn root_resolution_uses_path_env_var_and_upward_search() {
+    let tmp = TempDir::new("root");
+    let store = tmp.init_store("store");
+    fs::write(store.join("root-note.txt"), "root resolution\n").expect("write root-note.txt");
+    let add = run(
+        &store,
+        &["add", "-p", "demo", "-s", "root note", "root-note.txt"],
+    );
+    assert_success(&add);
+
+    let outside = tmp.path().join("elsewhere");
+    fs::create_dir_all(&outside).expect("create unrelated directory");
+
+    // 1. An explicit --path always wins.
+    let by_path = run(
+        &outside,
+        &["--path", store.to_str().expect("UTF-8 path"), "list"],
+    );
+    assert_success(&by_path);
+    assert!(
+        stdout(&by_path).contains("demo"),
+        "--path must select the store: {}",
+        stdout(&by_path)
+    );
+
+    // 2. $ACDM_STORE is used when --path is absent.
+    let by_env = mem(&outside)
+        .args(["list"])
+        .env("ACDM_STORE", &store)
+        .output()
+        .expect("run mem with ACDM_STORE");
+    assert_success(&by_env);
+    assert!(
+        stdout(&by_env).contains("demo"),
+        "ACDM_STORE must select the store: {}",
+        stdout(&by_env)
+    );
+
+    // 3. From a nested directory the nearest ancestor store is discovered.
+    let nested = store.join("projects").join("demo");
+    fs::create_dir_all(&nested).expect("create nested directory");
+    let by_search = run(&nested, &["list"]);
+    assert_success(&by_search);
+    assert!(
+        stdout(&by_search).contains("demo"),
+        "upward search must find the store: {}",
+        stdout(&by_search)
+    );
+
+    // Nothing may be created in the unrelated directory.
+    assert!(
+        fs::read_dir(&outside)
+            .expect("read unrelated directory")
+            .next()
+            .is_none(),
+        "no store artifacts may be created in an unrelated directory"
+    );
+}
+
+#[test]
+fn query_list_compact_and_render_work_with_correct_counts() {
+    let tmp = TempDir::new("workflow");
+    let store = tmp.init_store("store");
+    fs::write(store.join("alpha.txt"), "alpha v1\n").expect("write alpha.txt");
+    fs::write(store.join("beta.txt"), "beta v1\n").expect("write beta.txt");
+
+    for (summary, file) in [("add alpha", "alpha.txt"), ("add beta", "beta.txt")] {
+        let output = run(&store, &["add", "-p", "demo", "-s", summary, file]);
+        assert_success(&output);
+    }
+    fs::write(store.join("alpha.txt"), "alpha v2\n").expect("rewrite alpha.txt");
+    let output = run(
+        &store,
+        &["add", "-p", "demo", "-s", "modify alpha", "alpha.txt"],
+    );
+    assert_success(&output);
+
+    let records = file_record_lines(&store, "demo");
+    assert_eq!(records.len(), 3, "three records must be appended");
+    assert!(
+        records[2].contains("\"action\":\"Modified\""),
+        "the second write of the same file must be Modified: {}",
+        records[2]
+    );
+
+    let query = run(&store, &["query", "-p", "demo"]);
+    assert_success(&query);
+    assert!(
+        stdout(&query).contains("Found 3 event(s)"),
+        "query -p must list all three events: {}",
+        stdout(&query)
+    );
+
+    let list_projects = run(&store, &["list"]);
+    assert_success(&list_projects);
+    let list_out = stdout(&list_projects);
+    assert!(
+        list_out.contains("PROJECT"),
+        "list header expected: {}",
+        list_out
+    );
+    assert!(
+        list_out.contains("demo"),
+        "project row expected: {}",
+        list_out
+    );
+
+    let list_files = run(&store, &["list", "-p", "demo"]);
+    assert_success(&list_files);
+    let files_out = stdout(&list_files);
+    assert!(
+        files_out.contains("alpha.txt") && files_out.contains("beta.txt"),
+        "latest file rows expected: {}",
+        files_out
+    );
+
+    let render = run(&store, &["render", "-p", "demo"]);
+    assert_success(&render);
+    let readme = store.join("projects").join("demo").join("README.md");
+    assert!(readme.is_file(), "render must write README.md");
+    let readme_text = fs::read_to_string(&readme).expect("read README.md");
+    assert!(
+        readme_text.contains("alpha.txt"),
+        "README must list tracked files: {}",
+        readme_text
+    );
+
+    let compact = run(&store, &["compact", "-p", "demo"]);
+    assert_success(&compact);
+    let compact_out = stdout(&compact);
+    assert!(
+        compact_out.contains("Records before: 3"),
+        "compact must report three records before: {}",
+        compact_out
+    );
+    assert!(
+        compact_out.contains("Records after:  2"),
+        "compact must report two records after: {}",
+        compact_out
+    );
+    assert!(
+        compact_out.contains("Records pruned: 1"),
+        "compact must prune one duplicate: {}",
+        compact_out
+    );
+    assert_eq!(
+        file_record_lines(&store, "demo").len(),
+        2,
+        "files.jsonl must hold two records after compaction"
+    );
+}
+
+#[test]
+fn resolve_reports_preserved_lines() {
+    let tmp = TempDir::new("resolve");
+    let store = tmp.init_store("store");
+    let events_dir = store.join("events");
+    fs::create_dir_all(&events_dir).expect("create events directory");
+    let truncated = r#"{"event_id":"eid_3","ts":"2026-10-22T03:00:00Z","summary":"TRUNCATED"#;
+    let conflicted = format!(
+        r#"{{"event_id":"eid_1","ts":"2026-10-22T01:00:00Z","device":"d1","agent":"a1","project":"p1","summary":"s1","files":[]}}
+<<<<<<< HEAD
+{{"event_id":"eid_2","ts":"2026-10-22T02:00:00Z","device":"d1","agent":"a1","project":"p1","summary":"s2","files":[]}}
+=======
+{{"event_id":"eid_2","ts":"2026-10-22T02:00:00Z","device":"d1","agent":"a1","project":"p1","summary":"s2-theirs","files":[]}}
+>>>>>>> branch
+{truncated}
+"#
+    );
+    let events_file = events_dir.join("2026-10.jsonl");
+    fs::write(&events_file, conflicted).expect("write conflicted event log");
+
+    let output = run(&store, &["resolve"]);
+    assert_success(&output);
+
+    let out = stdout(&output);
+    assert!(
+        out.contains("Resolved files:      1"),
+        "resolve must report one resolved file: {}",
+        out
+    );
+    assert!(
+        out.contains("Conflicts resolved:  1"),
+        "resolve must report one conflict: {}",
+        out
+    );
+    assert!(
+        out.contains("Lines preserved:     1"),
+        "resolve must report the preserved unparseable line: {}",
+        out
+    );
+
+    let resolved = fs::read_to_string(&events_file).expect("read resolved event log");
+    assert!(
+        !resolved.contains("<<<<<<<"),
+        "conflict markers must be gone: {}",
+        resolved
+    );
+    assert!(
+        resolved.contains(truncated),
+        "the unparseable line must survive verbatim: {}",
+        resolved
+    );
+}
+
+/// Regression: `mem render` creates `projects/<name>/`, so `mem add` used to
+/// skip writing `meta.json` forever, leaving the project without metadata.
+#[test]
+fn render_before_add_still_creates_project_metadata() {
+    let tmp = TempDir::new("render-then-add");
+    let store = tmp.init_store("store");
+
+    // Rendering a project that has no metadata yet must not break, and its
+    // fallback "Created At" must use the canonical fixed-width UTC timestamp.
+    let out = run(&store, &["render", "-p", "ghost"]);
+    assert_success(&out);
+
+    let readme = fs::read_to_string(store.join("projects").join("ghost").join("README.md"))
+        .expect("read rendered README");
+    let created_at = readme
+        .lines()
+        .find_map(|line| line.strip_prefix("- **Created At:** "))
+        .expect("README must contain a Created At line");
+    assert_eq!(
+        created_at.len(),
+        30,
+        "fallback metadata timestamp must be the canonical 30-char form: {}",
+        created_at
+    );
+    assert!(
+        created_at.ends_with('Z'),
+        "fallback metadata timestamp must be UTC: {}",
+        created_at
+    );
+
+    fs::write(store.join("hello.txt"), "hello\n").expect("write tracked file");
+    let out = run(
+        &store,
+        &["add", "-p", "ghost", "-s", "after render", "hello.txt"],
+    );
+    assert_success(&out);
+
+    let meta_path = store.join("projects").join("ghost").join("meta.json");
+    assert!(
+        meta_path.is_file(),
+        "meta.json must be written even though render created the directory first"
+    );
+    let meta = fs::read_to_string(&meta_path).expect("read meta.json");
+    assert!(
+        meta.contains("\"name\": \"ghost\""),
+        "meta.json must describe the project: {}",
+        meta
+    );
+
+    // `mem list` must now show a real creation time instead of "-".
+    let out = run(&store, &["list"]);
+    assert_success(&out);
+    assert!(
+        !stdout(&out).contains("ghost                     0         -"),
+        "project row must use the metadata creation time: {}",
+        stdout(&out)
+    );
+}

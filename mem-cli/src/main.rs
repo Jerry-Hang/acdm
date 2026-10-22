@@ -1,10 +1,8 @@
 use std::error::Error;
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
-use sha2::{Digest, Sha256};
 
 use mem_core::compact::compact_project_files;
 use mem_core::git::{
@@ -12,14 +10,13 @@ use mem_core::git::{
 };
 use mem_core::render::write_project_readme;
 use mem_core::resolve::resolve_conflicts;
-use mem_core::{generate_id, Event, FileRecord, MemIndex, MemStore, ProjectMeta};
+use mem_core::{
+    compute_sha256, default_device_name, generate_id, normalize_file_name, now_rfc3339,
+    resolve_store_root, Event, FileRecord, MemIndex, MemStore, ProjectMeta, STORE_MARKER,
+};
 
 #[derive(Parser)]
-#[command(
-    name = "mem",
-    about = "Agent Cross-Device Memory System CLI",
-    version
-)]
+#[command(name = "mem", about = "Agent Cross-Device Memory System CLI", version)]
 struct Cli {
     /// Root directory for memory store (defaults to finding .mem or events/ upwards, fallback to CWD)
     #[arg(long, global = true)]
@@ -75,7 +72,7 @@ enum Commands {
         #[arg(long)]
         file_id: Option<String>,
 
-        /// Find events containing this filename
+        /// Find events recorded for this exact file name (use the stored relative path)
         #[arg(short = 'n', long)]
         filename: Option<String>,
 
@@ -110,51 +107,6 @@ enum Commands {
         #[arg(short = 'p', long)]
         project: String,
     },
-}
-
-fn resolve_root(custom_path: Option<PathBuf>) -> io::Result<PathBuf> {
-    if let Some(p) = custom_path {
-        return Ok(p);
-    }
-    let current = std::env::current_dir()?;
-    let mut check: &Path = &current;
-    loop {
-        if check.join(".mem").exists() || check.join("events").is_dir() {
-            return Ok(check.to_path_buf());
-        }
-        match check.parent() {
-            Some(parent) => check = parent,
-            None => break,
-        }
-    }
-    Ok(current)
-}
-
-fn get_device_name() -> String {
-    std::process::Command::new("hostname")
-        .output()
-        .ok()
-        .and_then(|output| {
-            if output.status.success() {
-                String::from_utf8(output.stdout)
-                    .ok()
-                    .map(|s| s.trim().to_string())
-            } else {
-                None
-            }
-        })
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
-            std::env::var("HOSTNAME")
-                .or_else(|_| std::env::var("COMPUTERNAME"))
-                .unwrap_or_else(|_| "localhost".to_string())
-        })
-}
-
-fn compute_file_hash(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hex::encode(hasher.finalize())
 }
 
 fn print_event(event: &Event) {
@@ -204,7 +156,10 @@ fn run() -> Result<(), Box<dyn Error>> {
             println!("Created directory structure:");
             println!("  ├── events/       (Append-only event log)");
             println!("  ├── projects/     (Project metadata and file records)");
-            println!("  └── nodes/        (Device node info)");
+            println!(
+                "  └── {}          (Store marker file; lets the CLI/MCP find the store from any subdirectory)",
+                STORE_MARKER
+            );
         }
 
         Commands::Add {
@@ -214,14 +169,24 @@ fn run() -> Result<(), Box<dyn Error>> {
             agent,
             files,
         } => {
-            let root = resolve_root(cli.path)?;
+            let root = resolve_store_root(cli.path.as_deref())?;
             let store = MemStore::new(root);
 
             let existing_files = store.get_latest_files(&project).unwrap_or_default();
             let mut file_records = Vec::new();
 
             for file_path in &files {
-                let file_str = file_path.to_string_lossy().to_string();
+                // File identity is normalised (store-relative, then git-relative) so
+                // the same file matches across devices; existence uses the raw path.
+                let file_name = normalize_file_name(file_path, &store.root);
+                if Path::new(&file_name).is_absolute() {
+                    eprintln!(
+                        "Warning: '{}' is outside the memory store and outside any git repository; \
+                         recording it under its absolute path, which will not match on other devices.",
+                        file_path.display()
+                    );
+                }
+
                 let exists = file_path.exists();
                 let (action, size_bytes, hash) = if !exists {
                     ("Deleted".to_string(), 0u64, String::new())
@@ -230,8 +195,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                         format!("Failed to read file '{}': {}", file_path.display(), e)
                     })?;
                     let size = bytes.len() as u64;
-                    let hash = compute_file_hash(&bytes);
-                    let is_known = existing_files.iter().any(|f| f.file_name == file_str);
+                    let hash = compute_sha256(&bytes);
+                    let is_known = existing_files.iter().any(|f| f.file_name == file_name);
                     let act = if is_known { "Modified" } else { "Created" };
                     (act.to_string(), size, hash)
                 };
@@ -239,16 +204,16 @@ fn run() -> Result<(), Box<dyn Error>> {
                 let file_id = generate_id();
                 file_records.push(FileRecord {
                     file_id,
-                    file_name: file_str,
+                    file_name,
                     action,
                     size_bytes,
                     hash,
                 });
             }
 
-            let ts = chrono::Utc::now().to_rfc3339();
+            let ts = now_rfc3339();
             let event_id = generate_id();
-            let dev_name = device.unwrap_or_else(get_device_name);
+            let dev_name = device.unwrap_or_else(default_device_name);
 
             let event = Event {
                 event_id,
@@ -260,7 +225,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                 files: file_records,
             };
 
-            if !store.project_exists(&project) {
+            // Check the metadata itself, not the directory: `mem render` may
+            // already have created `projects/<name>/`, which would otherwise make
+            // `add` believe the project was fully initialised.
+            if store.read_project_meta(&project).is_err() {
                 let meta = ProjectMeta {
                     name: project.clone(),
                     description: format!("Project {}", project),
@@ -285,7 +253,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                     file.action,
                     file.file_name,
                     file.size_bytes,
-                    if file.hash.is_empty() { "-" } else { &file.hash }
+                    if file.hash.is_empty() {
+                        "-"
+                    } else {
+                        &file.hash
+                    }
                 );
             }
         }
@@ -296,7 +268,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             filename,
             fuzzy,
         } => {
-            let root = resolve_root(cli.path)?;
+            let root = resolve_store_root(cli.path.as_deref())?;
             let store = MemStore::new(root);
             let index = MemIndex::build(&store)?;
 
@@ -407,7 +379,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
 
         Commands::List { project } => {
-            let root = resolve_root(cli.path)?;
+            let root = resolve_store_root(cli.path.as_deref())?;
             let store = MemStore::new(root);
 
             match project {
@@ -417,10 +389,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                         println!("No projects found in memory store.");
                     } else {
                         println!(
-                            "{:<24} {:<8} {:<26} {}",
-                            "PROJECT", "FILES", "CREATED AT", "DESCRIPTION"
+                            "{:<24} {:<8} {:<32} DESCRIPTION",
+                            "PROJECT", "FILES", "CREATED AT"
                         );
-                        println!("{}", "-".repeat(90));
+                        println!("{}", "-".repeat(96));
                         for p in projects {
                             let meta = store.read_project_meta(&p).ok();
                             let file_count =
@@ -428,7 +400,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                             let created_at =
                                 meta.as_ref().map(|m| m.created_at.as_str()).unwrap_or("-");
                             let desc = meta.as_ref().map(|m| m.description.as_str()).unwrap_or("-");
-                            println!("{:<24} {:<8} {:<26} {}", p, file_count, created_at, desc);
+                            println!("{:<24} {:<8} {:<32} {}", p, file_count, created_at, desc);
                         }
                     }
                 }
@@ -438,10 +410,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                         println!("No files recorded for project '{}'.", p);
                     } else {
                         println!(
-                            "{:<32} {:<10} {:<14} {:<22} {}",
-                            "FILE NAME", "ACTION", "SIZE (BYTES)", "FILE ID", "HASH (SHA256)"
+                            "{:<32} {:<10} {:<14} {:<37} HASH (SHA256)",
+                            "FILE NAME", "ACTION", "SIZE (BYTES)", "FILE ID"
                         );
-                        println!("{}", "-".repeat(110));
+                        println!("{}", "-".repeat(125));
                         for file in files {
                             let hash_short = if file.hash.len() > 16 {
                                 format!("{}...", &file.hash[..16])
@@ -451,7 +423,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                                 file.hash.clone()
                             };
                             println!(
-                                "{:<32} {:<10} {:<14} {:<22} {}",
+                                "{:<32} {:<10} {:<14} {:<37} {}",
                                 file.file_name,
                                 file.action,
                                 file.size_bytes,
@@ -465,7 +437,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
 
         Commands::Compact { project } => {
-            let root = resolve_root(cli.path)?;
+            let root = resolve_store_root(cli.path.as_deref())?;
             let store = MemStore::new(root);
             println!("Compacting file records for project '{}'...", project);
             let report = compact_project_files(&store, &project)?;
@@ -479,12 +451,12 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
 
         Commands::Sync => {
-            let root = resolve_root(cli.path)?;
+            let root = resolve_store_root(cli.path.as_deref())?;
             println!("Checking Git repository status at: {}", root.display());
             let is_clean = git_status_clean(&root)?;
             if !is_clean {
-                let dev = get_device_name();
-                let now = chrono::Utc::now().to_rfc3339();
+                let dev = default_device_name();
+                let now = now_rfc3339();
                 let commit_msg = format!("Auto-sync from {} at {}", dev, now);
                 println!(
                     "Repository is dirty. Staging and committing changes: \"{}\"",
@@ -503,7 +475,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                 let has_conflicts = git_has_conflicts(&root).unwrap_or(false);
                 if has_conflicts {
                     eprintln!("\n⚠️  Warning: Git conflicts detected during pull --rebase!");
-                    eprintln!("Please run `mem resolve` to automatically resolve JSONL conflict markers.");
+                    eprintln!(
+                        "Please run `mem resolve` to automatically resolve JSONL conflict markers."
+                    );
                     return Ok(());
                 }
                 // pull failed but no conflicts — could be "no remote tracking branch" etc.
@@ -517,13 +491,14 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
 
         Commands::Resolve => {
-            let root = resolve_root(cli.path)?;
+            let root = resolve_store_root(cli.path.as_deref())?;
             println!("Resolving conflicts in JSONL files at: {}", root.display());
             let report = resolve_conflicts(&root)?;
             println!("Conflict Resolution Report:");
             println!("  Resolved files:      {}", report.resolved_files.len());
             println!("  Conflicts resolved:  {}", report.total_conflicts_resolved);
             println!("  Deduplicated items:  {}", report.deduplicated_items);
+            println!("  Lines preserved:     {}", report.lines_preserved);
             if !report.resolved_files.is_empty() {
                 println!("  Files updated:");
                 for f in &report.resolved_files {
@@ -533,7 +508,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
 
         Commands::Render { project } => {
-            let root = resolve_root(cli.path)?;
+            let root = resolve_store_root(cli.path.as_deref())?;
             let store = MemStore::new(root);
             println!("Rendering README.md for project '{}'...", project);
             write_project_readme(&store, &project)?;
