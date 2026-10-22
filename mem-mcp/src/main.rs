@@ -3,10 +3,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use mem_core::compact::compact_project_files;
-use mem_core::git::{git_add_all, git_commit, git_pull_rebase, git_push, git_status_clean};
+use mem_core::git::{
+    git_add_all, git_commit, git_has_conflicts, git_pull_rebase, git_push, git_status_clean,
+};
 use mem_core::render::write_project_readme;
 use mem_core::resolve::resolve_conflicts;
-use mem_core::{generate_id, Event, FileRecord, MemIndex, MemStore};
+use mem_core::{generate_id, Event, FileRecord, MemIndex, MemStore, ProjectMeta};
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
@@ -415,6 +417,17 @@ fn handle_add_event(store: &MemStore, args: AddEventArgs) -> Result<Value, Strin
         });
     }
 
+    // Auto-create minimal project meta if it doesn't exist
+    if !store.project_exists(&args.project) {
+        let meta = ProjectMeta {
+            name: args.project.clone(),
+            description: format!("Project {}", args.project),
+            github_url: None,
+            created_at: ts.clone(),
+        };
+        let _ = store.write_project_meta(&args.project, &meta);
+    }
+
     let file_count = files.len();
     let event = Event {
         event_id: event_id.clone(),
@@ -628,9 +641,18 @@ fn handle_sync(store: &MemStore, args: Option<SyncArgs>) -> Result<Value, String
         steps.push("Working directory clean".to_string());
     }
 
-    git_pull_rebase(&store.root)
-        .map_err(|e| format!("git pull --rebase failed: {}", e))?;
-    steps.push("Pulled remote changes with rebase".to_string());
+    if let Err(pull_err) = git_pull_rebase(&store.root) {
+        if git_has_conflicts(&store.root).unwrap_or(false) {
+            return Err(format!(
+                "Git conflict detected during pull --rebase: {}. Please call the `mem_resolve` tool to automatically deduplicate and merge the JSONL records.",
+                pull_err
+            ));
+        }
+        // Non-conflict error (e.g. no upstream changes or network blip), log note and proceed
+        steps.push(format!("pull note: {}", pull_err));
+    } else {
+        steps.push("Pulled remote changes with rebase".to_string());
+    }
 
     git_push(&store.root)
         .map_err(|e| format!("git push failed: {}", e))?;

@@ -1,3 +1,4 @@
+use crate::models::ProjectMeta;
 use crate::storage::MemStore;
 use fs2::FileExt;
 use std::error::Error;
@@ -6,7 +7,12 @@ use std::io::Write;
 
 /// Render README.md content for a project based on its meta, tracked files, and recent events.
 pub fn render_project_readme(store: &MemStore, project: &str) -> Result<String, Box<dyn Error>> {
-    let meta = store.read_project_meta(project)?;
+    let meta = store.read_project_meta(project).unwrap_or_else(|_| ProjectMeta {
+        name: project.to_string(),
+        description: format!("Project {}", project),
+        github_url: None,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    });
     let files = store.get_latest_files(project)?;
 
     // Retrieve all events for this project and take the latest 10
@@ -73,7 +79,9 @@ pub fn render_project_readme(store: &MemStore, project: &str) -> Result<String, 
 /// Render and write README.md to projects/<name>/README.md with exclusive file lock.
 pub fn write_project_readme(store: &MemStore, project: &str) -> Result<(), Box<dyn Error>> {
     let md = render_project_readme(store, project)?;
-    let readme_path = store.project_dir(project).join("README.md");
+    let proj_dir = store.project_dir(project);
+    std::fs::create_dir_all(&proj_dir)?;
+    let readme_path = proj_dir.join("README.md");
 
     let mut file = OpenOptions::new()
         .create(true)
