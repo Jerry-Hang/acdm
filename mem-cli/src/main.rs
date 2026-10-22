@@ -498,12 +498,17 @@ fn run() -> Result<(), Box<dyn Error>> {
 
             println!("Pulling remote changes with rebase...");
             let pull_res = git_pull_rebase(&root);
-            let has_conflicts = git_has_conflicts(&root).unwrap_or(false);
 
-            if pull_res.is_err() || has_conflicts {
-                eprintln!("\n⚠️  Warning: Git conflicts detected during pull --rebase!");
-                eprintln!("Please run `mem resolve` to automatically resolve JSONL conflict markers.");
-                return Ok(());
+            if pull_res.is_err() {
+                let has_conflicts = git_has_conflicts(&root).unwrap_or(false);
+                if has_conflicts {
+                    eprintln!("\n⚠️  Warning: Git conflicts detected during pull --rebase!");
+                    eprintln!("Please run `mem resolve` to automatically resolve JSONL conflict markers.");
+                    return Ok(());
+                }
+                // pull failed but no conflicts — could be "no remote tracking branch" etc.
+                // Log warning but continue to push
+                eprintln!("⚠️  git pull --rebase returned an error (possibly no remote changes). Continuing...");
             }
 
             println!("Pushing changes to remote...");
