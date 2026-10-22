@@ -59,6 +59,7 @@ mem --path /path/to/store list -p <project>
 - If it shows `src/main.rs`, confirm that the directory separator and case used in the query are exactly the same.
 - Confirm that the `-p` project name matches (the project name is the logical name used at write time, not a directory name).
 - If a record written just now cannot be found: confirm that it was written to the same store (§1), and check whether the current month's file under `events/` gained a line.
+- If the file lives on a path reached through a symlink: identity is normalized by canonicalizing the longest existing prefix, so a symlinked store/project directory yields the same relative `file_name` as its real path. If an older record still shows an absolute path, treat it as a legacy record and migrate it (see "Migration B" in `MIGRATION.md`).
 
 ## 3. Timeline order looks wrong
 
@@ -70,18 +71,20 @@ mem --path /path/to/store list -p <project>
 
 ## 4. `mem sync` fails
 
-`mem sync` performs, in order: automatic commit of a dirty working tree (commit message `Auto-sync from <device> at <timestamp>`) →
-`git pull --rebase --autostash` → `git push`. Any step that fails ends with a non-zero exit code.
+`mem sync` performs, in order: holding the store-wide write lock, automatic commit of a dirty working tree (commit message `Auto-sync from <device> at <timestamp>`) →
+`git pull --rebase` (**without `--autostash`**; skipped when the branch has no upstream) → `git push`. A non-conflict pull failure **aborts** the sync
+instead of continuing to push, and a Git conflict ends the command with a **non-zero exit code** (MCP returns `isError`). Any step that fails ends with a non-zero exit code.
 
 | Symptom | Cause | Handling |
 | --- | --- | --- |
-| `git pull ... failed: ... no tracking information` / `no upstream` | The local branch has no upstream configured | `git -C <store> push -u origin <branch>` (push manually once first) |
+| `No upstream configured; skipped pull` (not an error) | The local branch has no upstream configured | If you want to pull, run `git -C <store> push -u origin <branch>` once |
 | `git push ... failed: ... No configured push destination` | No remote configured | `git -C <store> remote add origin <url>`, or re-initialize with `mem init --remote <url>` |
-| `rejected` / `non-fast-forward` | The remote has new commits and the local rebase did not succeed | Run `git -C <store> pull --rebase --autostash` first, and handle conflicts per §5 |
+| `rejected` / `non-fast-forward` | The remote has new commits and the local rebase did not succeed | Run `git -C <store> pull --rebase` first, and handle conflicts per §5 |
+| `git pull --rebase failed and the repository is not conflicted` | Network/authentication/index problem; the sync was aborted on purpose | Fix the underlying git problem, then re-run `mem sync` |
 | `Permission denied (publickey)` / `Authentication failed` | Git credential problem | Fix the SSH key or HTTPS credentials; ACDM does not manage credentials |
-| Conflicts reported | JSONL merge conflict | See §5 |
+| Conflicts reported (exit code 1) | JSONL merge conflict | See §5 |
 
-Note: if the store is not a Git repository (only `mem init` was used without a remote), `sync` fails at the push stage;
+Note: if the store is not a Git repository (only `mem init` was used without a remote), `sync` fails when it runs `git status`/`git push`;
 in that case switch to local-only usage, or create the repository/remote.
 
 ## 5. Handling conflicts
@@ -90,31 +93,29 @@ When syncing across devices it is very common for two devices to append to the s
 conflict markers. Handling:
 
 ```bash
-mem --path /path/to/store sync     # output reports conflicts
+mem --path /path/to/store sync     # reports conflicts and exits non-zero
 mem --path /path/to/store resolve  # automatically resolve JSONL conflicts
 mem --path /path/to/store sync     # sync again
 ```
 
 `mem resolve` behavior (see [ARCHITECTURE.md](ARCHITECTURE.md#7-synchronization-and-conflict-resolution) for details):
 
-- Discards `<<<<<<<` / `=======` / `>>>>>>>` / `|||||||` marker lines;
-- Records with the same `event_id` / `file_id` are **last-write-wins** (when ambiguous, the later version in the file is kept);
+- Removes only the **exact** Git marker shapes (`=======` must be the whole line; `<<<<<<<` / `>>>>>>>` / `|||||||` must be followed by end-of-line or a space), so a data line that merely starts with marker-like characters is preserved;
+- Works on raw bytes, so non-UTF-8 lines and CRLF endings are preserved verbatim (never silently dropped); records with the same `event_id` / `file_id` are **last-write-wins**, and `FileRecord`s keep their causal order;
 - Parseable records are sorted by time and written back; **unparseable lines are preserved verbatim** (placed at the end of the file);
-- After writing back it runs `git add`; only when a rebase state actually exists (`.git/rebase-merge` / `rebase-apply`) does it run
-  `git rebase --continue`, independent of the system language.
+- After writing back it runs `git add`; only when a rebase state actually exists (`.git/rebase-merge` / `rebase-apply`) does it run `git rebase --continue`, independent of the system language, and it loops through a multi-commit rebase (up to 100 rounds) in one call.
 
 Troubleshooting:
 
-- A non-zero `Lines preserved` in the output means there are unparseable lines (usually truncated lines produced by an interrupted write). This is
+- A non-zero `Lines preserved` in the output means there are unparseable lines (usually truncated lines produced by an interrupted write, or invalid UTF-8). This is
   **intentional data protection**, not an error. After checking the content, delete them with an editor or leave them as they are.
 - `git add ... failed: warning`: the file may be ignored by `.gitignore` or have a special path.
   Check with `git -C <store> check-ignore -v events/2026-10.jsonl`, and use `git add -f` if necessary.
 - Still conflicting after resolve: check `git -C <store> status`; confirm the conflicting file is inside the repository, has a `.jsonl` suffix,
-  and that a rebase/merge is currently in progress. Remaining conflicts usually mean there is a **non-JSONL file conflict**,
+  and that a rebase/merge is currently in progress. JSONL-only conflicts are resolved and the rebase is advanced automatically; the command fails only when a **non-JSONL file conflict** remains,
   most commonly `projects/<project>/meta.json`: when two devices write metadata for the same project for the first time at the same time,
   both create `meta.json`; JSONL can merge automatically, but `meta.json` cannot.
-  `mem resolve` resolves JSONL first, then fails at `git rebase --continue` and prints an **actionable error**
-  listing the paths that are still unresolved. Recovery:
+  `mem resolve` prints an **actionable error** listing the paths that are still unresolved. Recovery:
 
   ```bash
   git -C /path/to/store status --short          # find the meta.json shown as UU
@@ -129,9 +130,13 @@ Troubleshooting:
 
 ## 6. Fewer records after `compact`
 
-The semantics of `mem compact -p <project>` are "keep only the latest record for each `file_name`", so a reduced record count is
-expected behavior (the output reports before / after / pruned). It keeps `Deleted` records. Run it in a clean working tree,
-and `sync` once afterwards.
+`mem compact -p <project>` **rebuilds `files.jsonl` from the append-only event log**, keeping the last writer per `file_name`; a reduced record count is
+expected behavior (the output reports before / after / pruned). It keeps `Deleted` records.
+
+Because the event log is the source of truth, `compact` is also the **repair command for the projection**: if `files.jsonl` was lost, truncated, or left stale
+(for example by a crash between the two appends, or by an old concurrent-write race), one `compact` restores the complete latest state — `records before`
+then counts the damaged projection and the `after` count is the reconstructed one. It holds the store-wide write lock, so a concurrent `mem add` on the same machine
+waits instead of being lost. Still run it in a clean working tree, and `sync` once afterwards.
 
 ## 7. Project README.md is overwritten
 
@@ -145,16 +150,14 @@ if you need extra notes, write them in a different file, or change the rendering
   no `Content-Length` header is needed.
 - **Exits immediately on startup**: unknown startup arguments print usage and `exit 2` (to prevent a typo from silently using the wrong store);
   make sure you only pass `--path`.
-- **Tool call returns an error**: look at `error.code`:
-  - `-32700` the request is not valid JSON;
-  - `-32601` unknown method or unknown tool;
-  - `-32602` `tools/call` parameters do not match the schema;
-  - `-32603` tool execution failed (see the specific reason in `error.message`).
-- **Tool execution failed but the server is still alive**: this is expected behavior; fix the parameters and retry.
+- **Tool call returns an error**: distinguish the two channels:
+  - JSON-RPC `error` means a protocol problem: `-32700` the request is not valid JSON; `-32600` the `jsonrpc` field is not `"2.0"` or the request line exceeds 16 MiB; `-32601` unknown method or unknown tool; `-32602` the `tools/call` parameters or the tool's arguments do not match the schema (including an invalid `action` value).
+  - A **successful response with `result.isError = true`** means the tool ran but failed logically (Git conflict, failed sync, invalid query dimension, unsafe project name, failed compact/render); read `result.content[0].text` for the reason and retry after fixing it. `-32603` is reserved for genuine internal server faults.
+- **Tool execution failed but the server is still alive**: this is expected behavior; fix the arguments or the underlying git state and retry. An over-long request line is discarded and answered with `-32600` without desynchronizing the stream.
 - **Store not found / events written to a strange location**: MCP runs `init` at startup (creating a store in the resolved root when it is missing).
   It is recommended to pass `--path` explicitly or set `ACDM_STORE`, to avoid depending on the client process's CWD.
-- **Multiple clients in parallel**: each client starts its own `mem-mcp` process; appends are protected by an `fs2` exclusive lock,
-  so concurrent writes from multiple processes are safe; queries are lock-free (`mmap` reads a snapshot).
+- **Multiple clients in parallel**: each client starts its own `mem-mcp` process; all writes (append, compact, resolve, sync) take the store-wide `fs2` cross-process lock, so concurrent writes on one machine are serialized, and reads are lock-free (`fs::read`, no mmap).
+- **Invalid project names**: `project` must be a single safe path component (no `/`, `\`, `.`/`..`, control characters; ≤200 bytes); otherwise the tool returns `isError` with `invalid project name`, and nothing is written outside `projects/`.
 
 ## 9. Performance issues
 
@@ -191,6 +194,8 @@ PY
 - `unparseable > 0`: usually truncated lines produced by an interrupted write, which the read side skips; you can handle them with `mem resolve` (which preserves them verbatim)
   or by deleting the lines by hand.
 - The read side's tolerance for bad lines means "can be listed by `list`" does not imply "the data is complete"; keeping a backup is recommended.
+- **Projection vs. event log**: `projects/<project>/files.jsonl` is derived data. If `list -p` shows fewer or older records than the events suggest,
+  run `mem compact -p <project>` to rebuild the projection from the event log; this also repairs a missing or truncated `files.jsonl` left by a crash.
 
 ## 11. Diagnostics to include before filing an issue
 
@@ -207,7 +212,8 @@ As well as the command that failed, the full stderr, the MCP client configuratio
 
 ## 12. Known limitations
 
-- No concurrent multi-writer transactions: there is only one exclusive lock, and cross-device consistency is "eventual consistency + deduplication".
-- The SHA-256 in event records is supplied by the writer (the CLI computes it; MCP callers may pass an empty value).
-- Non-UTF-8 paths: they can be written and read, but the `resolve` staging path is passed to Git in lossy form.
+- Writes on one machine are serialized by a single store-wide lock (append / compact / resolve / sync); there is still no cross-device lock and no multi-writer transaction, so cross-device consistency is "eventual consistency + deduplication".
+- The SHA-256 in event records is supplied by the writer (the CLI computes it by streaming; MCP callers may pass an empty value).
+- Non-UTF-8 paths: they can be written and read, but the `resolve` staging path is passed to Git in lossy form. (Non-UTF-8 *content* in JSONL is preserved byte-for-byte by `resolve` since 0.1.1.)
+- Project names are restricted to one safe path component; names containing path separators or control characters are rejected by the CLI and MCP.
 - No built-in authentication or encryption: the security of the store depends on Git remote permissions and disk permissions.

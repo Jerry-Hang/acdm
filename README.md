@@ -4,14 +4,14 @@
 
 [![CI](https://github.com/Jerry-Hang/acdm/actions/workflows/ci.yml/badge.svg)](https://github.com/Jerry-Hang/acdm/actions/workflows/ci.yml)
 
-*ACDM (Agent Cross-Device Memory System) is a serverless, cross-device memory layer for AI agents that work on the same project from different machines. It records project events as append-only, month-sharded JSONL and synchronizes them through Git, so every machine sees the same history without running a database or a hosted backend. One Rust workspace ships two entry points: the `mem` CLI for humans and scripts, and `mem-mcp`, a stdio MCP server for agents. Timestamps and IDs are fixed-width UTC, file paths are normalized into repo-relative identities, and JSONL merge conflicts are resolved automatically by `mem resolve` — preserve-first, never silently dropping data. The project is MIT-licensed and currently at v0.1.0.*
+*ACDM (Agent Cross-Device Memory System) is a serverless, cross-device memory layer for AI agents that work on the same project from different machines. It records project events as append-only, month-sharded JSONL and synchronizes them through Git, so every machine sees the same history without running a database or a hosted backend. One Rust workspace ships two entry points: the `mem` CLI for humans and scripts, and `mem-mcp`, a stdio MCP server for agents. Timestamps and IDs are fixed-width UTC, file paths are normalized into repo-relative identities, and JSONL merge conflicts are resolved automatically by `mem resolve` — preserve-first, never silently dropping data. The project is MIT-licensed and currently at v0.1.1.*
 
 ACDM gives cross-device AI agents a shared project memory through **Git sync + append-only JSONL**: an agent records events on any machine, and after syncing, another machine can look up the same history.
 
-- **Git sync**: the store directory is maintained as a Git repository, and `mem sync` handles committing, rebase-pulling, and pushing.
+- **Git sync**: the store directory is maintained as a Git repository, and `mem sync` commits every local change, pulls with rebase, and pushes. A conflict stops the sync with a non-zero exit (MCP: `isError`), and a non-conflict pull failure aborts instead of pushing over it.
 - **append-only JSONL**: events are appended month by month, so history only grows and is never rewritten; the read side tolerates corrupt lines, and a single bad line does not break the whole store.
-- **SHA256 tracking**: every file record carries `size_bytes` and a SHA256 `hash`, which can be used to tell whether file contents changed.
-- **Automatic conflict resolution**: `mem resolve` drops conflict markers, de-duplicates by `event_id` / `file_id` (last write wins), keeps unparseable lines verbatim, and preserves unknown fields as-is.
+- **SHA256 tracking**: every file record carries `size_bytes` and a SHA256 `hash`, which can be used to tell whether file contents changed; `mem add` hashes files in 64 KiB chunks instead of loading them whole.
+- **Automatic conflict resolution**: `mem resolve` removes only exact Git conflict markers, de-duplicates by `event_id` / `file_id` (last write wins, causal order preserved), keeps unparseable lines and non-UTF-8 bytes verbatim, preserves unknown fields, and advances a multi-commit rebase in one call.
 - **CLI + MCP entry points**: humans and scripts use the `mem` command line; AI agents connect through `mem-mcp` (a stdio MCP server).
 
 ## Documentation
@@ -147,10 +147,10 @@ CI (`.github/workflows/ci.yml`) runs the following on every `push` / `pull_reque
 
 | Metric | Current value |
 | --- | --- |
-| Tests | **55 total, all passing**: 30 `mem-core` unit tests + 9 CLI integration tests + 6 MCP unit tests + 10 MCP integration tests |
+| Tests | **84 total, all passing**: 48 `mem-core` unit tests + 13 CLI integration tests + 6 MCP unit tests + 17 MCP integration tests |
 | Static checks | In local verification, `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo doc` (rustdoc) are all warning-free; CI covers fmt / clippy / test / release build |
-| Release binaries | `mem` 3.09 MB, `mem-mcp` 2.81 MB (release profile: `strip = true`, `lto = "thin"`, `codegen-units = 1`) |
-| Version / license | v0.1.0 / MIT |
+| Release binaries | `mem` 3.11 MB, `mem-mcp` 2.85 MB (release profile: `strip = true`, `lto = "thin"`, `codegen-units = 1`) |
+| Version / license | v0.1.1 / MIT |
 
 ## Store discovery rules
 
@@ -227,7 +227,7 @@ mem --path ./memory list -p ACDM
 mem --path ./memory compact -p ACDM
 ```
 
-`files.jsonl` keeps only the latest record per `file_name`, replacing the original file via a temporary file + atomic rename.
+`files.jsonl` is a **projection rebuilt from the append-only event log**: `compact` holds the store-wide write lock, replays every event in time order, keeps the last writer per `file_name`, and atomically replaces the file via a temporary file + rename. Running it also heals a projection that a crash left missing or truncated, and it cannot lose records appended concurrently.
 
 ### 6. Render a project README
 
@@ -239,7 +239,7 @@ mem --path ./memory render -p ACDM
 ### 7. Sync and conflict resolution
 
 ```bash
-# Sync: commit if the working tree is dirty, then pull --rebase --autostash, then push
+# Sync: commit all local changes, then pull --rebase (no autostash), then push
 mem --path ./memory sync
 
 # If sync reports a conflict: automatically clean up conflict markers in JSONL
@@ -249,7 +249,7 @@ mem --path ./memory resolve
 mem --path ./memory sync
 ```
 
-When `sync` detects a Git conflict it does not merge automatically; it tells you to run `mem resolve`. `resolve` runs `git rebase --continue` only when a rebase is actually in progress (`.git/rebase-merge` or `.git/rebase-apply`).
+`sync` commits first and holds the store write lock for the whole operation. It skips the pull when the branch has no upstream, and it aborts (non-zero exit) when a non-conflict pull error occurs instead of pushing over an inconsistent state. When the pull hits a Git conflict, it does not merge automatically: it prints the completed steps, tells you to run `mem resolve`, and exits non-zero. `resolve` runs `git rebase --continue` only while a rebase is actually in progress (`.git/rebase-merge` or `.git/rebase-apply`), and a single call keeps resolving and continuing until the rebase finishes (up to 100 rounds).
 
 ### Example output (actual run)
 
@@ -353,12 +353,14 @@ When neither `--path` nor `ACDM_STORE` is given, the store is discovered from th
 | `mem_add_event` | `project`, `summary`, `device?`, `agent?`, `files?` | Records an event; `agent` defaults to `mcp-agent`, `device` defaults to the current hostname |
 | `mem_query` | `by`, `value` | `by` is one of: `project` / `file_id` / `filename` / `fuzzy` |
 | `mem_list_projects` | none | Lists all projects |
-| `mem_compact` | `project` | Compacts the project's `files.jsonl` |
-| `mem_sync` | `message?` | Commit (default message `Auto-sync memory store`), rebase-pull, push |
-| `mem_resolve` | none | Automatically resolves JSONL conflicts |
+| `mem_compact` | `project` | Rebuilds the project's `files.jsonl` projection from the event log (also heals a missing/stale projection) |
+| `mem_sync` | `message?` | Commit all changes (default message `Auto-sync memory store`), pull with rebase (no autostash), push; conflicts and failures come back as `isError` results |
+| `mem_resolve` | none | Automatically resolves JSONL conflicts, advancing a multi-commit rebase in one call |
 | `mem_render` | `project` | Generates `projects/<project>/README.md` |
 
-`mem_add_event`'s `files` is an array whose elements follow `FileRecord`: `file_name` (required), `action` (optional; `Created` / `Modified` / `Deleted`, defaults to `Modified`), `size_bytes`, `hash`. If `file_name` is an absolute path, it is first normalized to a store / Git-repository-relative path before being written, so it can match across devices.
+`mem_add_event`'s `files` is an array whose elements follow `FileRecord`: `file_name` (required), `action` (optional; exactly `Created` / `Modified` / `Deleted`, defaults to `Modified`), `size_bytes`, `hash`. If `file_name` is an absolute path, it is first normalized to a store / Git-repository-relative path before being written, so it can match across devices. Project names must be a single safe path component (non-empty, not `.`/`..`, no `/`, `\`, or control characters, at most 200 bytes); CLI and MCP both reject anything else.
+
+Protocol-level problems use JSON-RPC errors (`-32700` malformed JSON, `-32600` invalid request such as a wrong `jsonrpc` version or an over-long request line, `-32601` unknown tool/method, `-32602` invalid tool arguments). Tool-level failures (git conflict, invalid query dimension, unsafe project name, a failed sync, ...) are returned as a normal response with `result.isError = true` and a readable message, so an agent can correct itself and retry. A single request line is capped at 16 MiB; an oversized line is rejected with `-32600` and the server keeps serving.
 
 ## Design highlights
 
@@ -380,7 +382,7 @@ Fixed width means string order equals time order, so plain string sorting is chr
 
 - The timestamp is **UTC**, so IDs written by devices in different time zones still sort consistently.
 - Fixed-width fields guarantee that lexicographic order is chronological order.
-- Nanoseconds + pid + an in-process counter make cross-device collisions extremely unlikely (the old format had only seconds + pid + at most 100 counts, so two devices could generate the same ID and conflict resolution would mistake them for "the same record").
+- Nanoseconds + pid + an in-process counter make cross-device collisions extremely unlikely (the old format had only seconds + pid + at most 100 counts, so two devices could generate the same ID and conflict resolution would mistake them for "the same record"). The counter starts from a random offset derived from the process start time and pid, which lowers the collision odds further in containers where every process has pid 1; the ID format is unchanged.
 
 ### File identity
 
@@ -391,32 +393,34 @@ Fixed width means string order equals time order, so plain string sorting is chr
 3. Relative to the current working directory;
 4. When none of the above applies, fall back to an absolute path.
 
-A `\` in a path is replaced with `/`, and `.` / `..` are resolved lexically (the file need not exist). This keeps the same file's identity stable across devices and mount points.
+The longest on-disk-existing prefix of a path is canonicalized (symbolic links resolved), and the still-missing tail is appended lexically, so a store or file reached through a symlink keeps the same identity as its real path. A `\` in a path is replaced with `/`, and `.` / `..` are resolved lexically (the file need not exist).
 
 ### Conflict resolution guarantees
 
 `mem resolve` handles Git conflict markers in all `.jsonl` files:
 
-- Drops `<<<<<<<` / `=======` / `>>>>>>>` / `|||||||` conflict marker lines;
-- De-duplicates records with the same `event_id` / `file_id`, with **later occurrences (theirs) overriding earlier ones (ours)**;
-- **Keeps unparseable lines verbatim** at the end of the file, never dropping them silently (for example a truncated last line);
+- Removes only the exact marker shapes Git writes (`=======` must be exactly that line; `<<<<<<<` / `>>>>>>>` / `|||||||` must be followed by end-of-line or a space), so a data line that merely starts with marker-like characters is preserved;
+- Works on raw bytes, so unparseable lines — including invalid UTF-8 and CRLF endings — are preserved verbatim, never silently dropped;
+- De-duplicates records with the same `event_id` / `file_id`, with **later occurrences (theirs) overriding earlier ones (ours)** and `FileRecord`s kept in causal order;
 - Re-emits the raw line text of known records as-is, **preserving unknown fields, field order, and formatting**;
-- Runs `git rebase --continue` only when a rebase is actually active (`.git/rebase-merge` / `.git/rebase-apply`), avoiding reliance on Git's localized error messages.
+- Runs `git rebase --continue` only when a rebase is actually active (`.git/rebase-merge` / `.git/rebase-apply`), avoiding reliance on Git's localized error messages, and loops through a multi-commit rebase (up to 100 rounds) in a single call.
 
 ### Concurrency and reads
 
-- `append_event` takes an exclusive lock (`fs2`) after opening a file and then appends, so multiple processes writing the same JSONL cannot truncate each other.
-- `compact` writes `files.jsonl.tmp` first and then atomically renames it over the original file.
-- Reads use `memmap2` for zero-copy scanning; `MemIndex` builds `by_project` / `by_file_id` / `by_filename` indexes in memory, on which `query` and MCP's `mem_query` are both based.
+- Every write operation (event append, projection rebuild, conflict resolution, sync) takes a **store-wide cross-process write lock** (`fs2` advisory lock). The lock file lives in `$XDG_RUNTIME_DIR` (or the system temp directory), is keyed by a hash of the canonical store path, and is never committed to the Git repository, so writers are serialized without polluting the store.
+- `append_event` additionally holds a per-file exclusive lock while appending, and the projection rebuild writes `files.jsonl.tmp` first and atomically renames it over the original file.
+- Reads take no locks and use plain `fs::read` (buffered file reads) rather than memory mapping, so a concurrent truncation or rebase can never cause a `SIGBUS`/undefined behavior; `MemIndex` builds `by_project` / `by_file_id` / `by_filename` indexes in memory, on which `query` and MCP's `mem_query` are both based.
 - The read side tolerates per-line faults: a line that is not valid JSON is skipped rather than causing an error, so a single corrupt line does not make the store unreadable.
 
 ## Known limitations and migration notes
 
 - **Legacy timestamp formats**: historical data may contain two legacy formats (second-precision `...Z` and nanosecond `...+00:00`). They are still readable, and time ordering is based on parsed time; newly written data uses the fixed-width UTC nanosecond `...Z` format exclusively.
-- **Legacy absolute-path records**: early versions may have written a file's absolute path into `file_name`. Those records remain readable, but queries by relative path name (`query -n`, MCP `mem_query` with `filename`) will not find them. You can use `mem compact -p <project>` to clean up historical duplicates and re-run `mem add` to record a relative-path identity, converging step by step.
-- **Single `--fuzzy` semantics**: `--fuzzy` / MCP's `fuzzy` runs a Rust regex over the raw JSON text of event lines; it is not full-text tokenized search, and an invalid regex errors out directly.
-- **Git dependency**: `sync` / `resolve` require `git` to be available locally; `sync` also requires a usable `origin` and push credentials configured on the repository.
-- **Concurrent writes**: multi-process appends to the same store are serialized by file locks; `compact` and an in-flight append are not part of a global transaction, so avoid running `compact` on the critical path of a sync.
+- **Legacy absolute-path records**: early versions may have written a file's absolute path into `file_name`. Those records remain readable, but queries by relative path name (`query -n`, MCP `mem_query` with `filename`) will not find them. Re-running `mem add` records a relative-path identity; `mem compact -p <project>` rebuilds the projection from the event log (which also heals a missing or truncated `files.jsonl`) but does not rewrite historical `file_name` values.
+- **Project names are constrained**: a project name must be one safe path component (non-empty, not `.`/`..`, no `/` or `\`, no control characters, at most 200 bytes), otherwise the CLI and MCP reject it with `invalid project name`.
+- **Single `--fuzzy` semantics**: `--fuzzy` / MCP's `fuzzy` runs a Rust regex over the raw JSON text of event lines; it is not full-text tokenized search. Compiled regex programs are capped at 10 MiB, and an invalid regex errors out directly.
+- **Git dependency**: `sync` / `resolve` require `git` to be available locally; `sync` skips the pull when the branch has no upstream, aborts on a non-conflict pull failure, and needs a push target (remote/credentials) to succeed.
+- **No `--autostash`**: `sync` commits all changes before pulling and holds the store write lock, so there is nothing to stash; this avoids the hard-to-recover state where a stash pop conflicts in the middle of a rebase.
+- **Concurrency scope**: writes to the same store on one machine are serialized by the store-wide lock; there is still no cross-device lock, so concurrent edits on different machines converge through Git and `mem resolve`.
 
 ## License
 

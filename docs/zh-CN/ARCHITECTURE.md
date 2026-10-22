@@ -3,7 +3,7 @@
 # ACDM 架构
 
 > 读者：想理解 ACDM 如何工作、准备贡献代码或排查存储/同步问题的开发者。
-> 本文描述当前源码（v0.1.0）的实际行为；为什么这样设计见 [DESIGN.md](DESIGN.md)，命令用法见 [CLI.md](CLI.md) 与 [MCP.md](MCP.md)。
+> 本文描述当前源码（v0.1.1）的实际行为；为什么这样设计见 [DESIGN.md](DESIGN.md)，命令用法见 [CLI.md](CLI.md) 与 [MCP.md](MCP.md)。
 
 ## 1. 设计目标与约束
 
@@ -23,6 +23,8 @@ ACDM 要在多台机器、多个 AI Agent 之间共享「项目记忆」。它�
 - 只支持「各设备本地写 + 周期性同步」的弱一致模型，不提供跨设备事务；
 - Git 是唯一传输层，没有内置网络协议；
 - 文件内容不入库，只记录元数据（路径 / 大小 / SHA256）；
+- 单机写操作由 store 跨进程写锁串行，读路径无锁；
+- 入口在接触文件系统前做输入校验：项目名必须是单一安全路径组件（见 5.3）；
 - 单机规模假设：适合仓库级 store（数千到数万条事件）；没有持久化索引，每次查询重建；
 - 时间排序依赖设备时钟（见 [DESIGN.md](DESIGN.md) 的一致性模型一节）。
 
@@ -63,13 +65,15 @@ ACDM 要在多台机器、多个 AI Agent 之间共享「项目记忆」。它�
 
 入口只有一个方向：`mem-cli` / `mem-mcp` → `mem-core`；`mem-core` 不认识任何入口。两个入口都通过 [`resolve_store_root`](../../mem-core/src/util.rs) 定位 store，并共享同一套时间戳、ID 与路径规范化函数，避免「CLI 和 MCP 行为不一致」。
 
+`mem-mcp` 是 stdio 上的换行分隔 JSON-RPC 2.0 server：它只接受 `jsonrpc: "2.0"`，并把两类失败分开——协议错误返回 JSON-RPC error（`-32700` 非法 JSON、`-32600` 非法请求、`-32601` 未知工具/方法、`-32602` 参数不合法），工具级业务失败则返回**成功响应 + `result.isError = true`**，便于 Agent 读取错误并重试。单行请求上限 16 MiB：超限行会被流式丢弃并返回 `-32600`，不会拖垮 server，也不会让输入流失步。
+
 ## 3. 写路径
 
 ### 3.1 `mem add`（CLI）
 
 入口在 [`mem-cli/src/main.rs`](../../mem-cli/src/main.rs) 的 `Commands::Add` 分支：
 
-1. clap 解析全局 `--path` 与 `add` 参数；[`resolve_store_root`](../../mem-core/src/util.rs) 得到 store 根目录。
+1. clap 解析全局 `--path` 与 `add` 参数；[`validate_project_name`](../../mem-core/src/storage.rs) 在任何 store 操作前拒绝不安全的项目名；[`resolve_store_root`](../../mem-core/src/util.rs) 得到 store 根目录。
 2. 构造 `MemStore`，用 `get_latest_files(project)` 取该项目当前的文件最新状态（用于判断 `Created` / `Modified`）。
 3. 对每个待记录文件：
 
@@ -78,7 +82,7 @@ ACDM 要在多台机器、多个 AI Agent 之间共享「项目记忆」。它�
    | 路径规范化 | [`normalize_file_name(file_path, &store.root)`](../../mem-core/src/util.rs)；若结果仍是绝对路径（既不在 store、也不在任何 git 仓库、也不在 CWD 之下），向 stderr 打一条警告 |
    | 存在性 | 用**用户传入的原始路径**判断，不用规范化名 |
    | 不存在 | `action = Deleted`，`size_bytes = 0`，`hash = ""` |
-   | 存在 | `fs::read` 读取整个文件 → `size_bytes = 字节数`，`hash = compute_sha256(bytes)` |
+   | 存在 | [`hash_file(path)`](../../mem-core/src/models.rs) 以 64 KiB 分块流式计算 → `size_bytes = 字节数`，`hash` = SHA256 十六进制；文件不会整体读入内存 |
    | action | 规范化名在「最新文件记录」里已存在 → `Modified`，否则 `Created` |
    | file_id | [`generate_id()`](../../mem-core/src/id_gen.rs) 生成 |
 
@@ -100,12 +104,13 @@ ACDM 要在多台机器、多个 AI Agent 之间共享「项目记忆」。它�
 
 [`MemStore::append_event`](../../mem-core/src/storage.rs) 是唯一的写事件入口：
 
-1. 计算分片名：`ts` 长度 ≥ 7 且第 5 个字节是 `-` → 取 `ts[..7]`（即 `YYYY-MM`）；否则退化为 `default`。
-2. 确保 `events/` 存在，以 `create + append` 打开 `events/YYYY-MM.jsonl`。
-3. `fs2` 排他锁 → `serde_json::to_string(event)` 序列化为**单行** JSON → `writeln!` 追加 → `flush` → 解锁。
-4. 若 `event.files` 非空：确保 `projects/<project>/` 存在，以同样方式打开 `projects/<project>/files.jsonl`，排他锁下**每条 `FileRecord` 写一行**，`flush` 后解锁。
+1. 校验项目名，然后取 **store 写锁**，并在下面两次追加期间一直持有。
+2. 计算分片名：`ts` 长度 ≥ 7 且第 5 个字节是 `-` → 取 `ts[..7]`（即 `YYYY-MM`）；否则退化为 `default`。
+3. 确保 `events/` 存在，以 `create + append` 打开 `events/YYYY-MM.jsonl`。
+4. `fs2` 排他锁 → `serde_json::to_string(event)` 序列化为**单行** JSON → `writeln!` 追加 → `flush` → 解锁。
+5. 若 `event.files` 非空：确保 `projects/<project>/` 存在，以同样方式打开 `projects/<project>/files.jsonl`，排他锁下**每条 `FileRecord` 写一行**，`flush` 后解锁。
 
-两条追加（事件日志 + 文件视图）不在同一个事务里：进程若在两次追加之间崩溃，会出现「事件已写入、`files.jsonl` 未更新」的状态。`events/*.jsonl` 是完整历史（source of truth），`files.jsonl` 是可从事件流重放重建的派生视图；当前没有内置重建命令，但可以用脚本从事件重放。
+两条追加（事件日志 + 文件视图）不在同一个事务里：进程若在两次追加之间崩溃，会出现「事件已写入、`files.jsonl` 未更新」的状态。`events/*.jsonl` 是完整历史（source of truth），`files.jsonl` 是可从事件流重放重建的派生投影；[`mem compact`](../../mem-core/src/compact.rs) 会从事件日志重建它（见 6.4），因此这一状态可以自愈。
 
 ### 3.4 部分写入与容错
 
@@ -120,7 +125,7 @@ ACDM 要在多台机器、多个 AI Agent 之间共享「项目记忆」。它�
 [`MemIndex::build`](../../mem-core/src/index.rs) 是 `query` 与 MCP `mem_query` 的公共基础，每次查询时**重新构建**：
 
 1. 列出 `events/` 下所有 `.jsonl` 文件并排序（不限于月份分片）。
-2. 对每个文件 `memmap2::Mmap::map` 做零拷贝映射，按 `\n` 切行，同时累计字节偏移：`offset += line_len + 1`。
+2. 对每个文件用 `fs::read` 整体读取（普通缓冲 I/O，不做内存映射，因此并发截断不会触发 `SIGBUS`），按 `\n` 切行，同时累计字节偏移：`offset += line_len + 1`。
 3. 每个能解析为 `Event` 的行构造 `EventPointer { event_id, file_path, byte_offset, ts, project }`。
 4. 填充三个索引维度：
 
@@ -136,7 +141,7 @@ ACDM 要在多台机器、多个 AI Agent 之间共享「项目记忆」。它�
 
 ### 4.3 正则模糊搜索
 
-`MemIndex::fuzzy_search(store, pattern)`：`Regex::new(pattern)` 编译一次；按文件名排序扫描所有 `events/*.jsonl`，对每个非空行先 UTF-8 解码、再用正则匹配**原始 JSON 行文本**，命中后解析为 `Event`。匹配语义是正则而非分词，行内任何字段（包括 `summary`、`project`、路径）都可能命中。
+`MemIndex::fuzzy_search(store, pattern)`：`RegexBuilder` 编译一次，并设置 **10 MiB 的编译程序尺寸上限**（防止 Agent 提供的病态正则耗尽内存）；按文件名排序扫描所有 `events/*.jsonl`，对每个非空行先 UTF-8 解码、再用正则匹配**原始 JSON 行文本**，命中后解析为 `Event`。匹配语义是正则而非分词，行内任何字段（包括 `summary`、`project`、路径）都可能命中。
 
 ### 4.4 最近事件：`read_latest_events_for_project`
 
@@ -222,6 +227,8 @@ ACDM 要在多台机器、多个 AI Agent 之间共享「项目记忆」。它�
 | `github_url` | string \| null | 否（可省略或为 `null`） | 关联仓库地址 |
 | `created_at` | string | 是 | 创建时间（固定宽度 UTC 纳秒） |
 
+每个 `project` 值（以及 CLI/MCP 的项目名参数）在用作路径之前都由 [`validate_project_name`](../../mem-core/src/storage.rs) 校验：非空、恰好一个普通路径组件（拒绝 `.`/`..`/绝对路径）、不含 `/`、`\` 或控制字符、最多 200 字节，防止项目名逃出 `projects/`。
+
 ### 5.4 `.mem` 标记文件
 
 `mem init` / `MemStore::init` 在 store 根写入（已存在则不覆盖）：
@@ -263,9 +270,9 @@ YYYYMMDDHHMMSS_<nanos:09>_<pid%100000:05>_<counter%10000:04>
 | 日期时间 | 14 | `Utc::now().format("%Y%m%d%H%M%S")` | UTC，跨时区可排序 |
 | 纳秒 | 9 | `timestamp_subsec_nanos()` | 同秒内排序 + 跨设备去重 |
 | pid | 5 | `process::id() % 100_000` | 区分同机不同进程 |
-| 计数器 | 4 | 进程内 `AtomicU64 % 10_000` | 同进程突发去重 |
+| 计数器 | 4 | 由（启动时间, pid）派生的进程内计数器种子，逐次自增后 `% 10_000` | 同进程突发去重 |
 
-定宽 + 高位时间 → 字典序即时间序。`event_id` 内嵌时间与事件 `ts` 是两次独立取时，可能相差数百纳秒；排序以 `ts` 为准。
+定宽 + 高位时间 → 字典序即时间序。计数器不再固定从 0 开始，而是以「启动时间 + pid」派生一个随机偏移起步，因此两个 pid 相同的进程（容器里常见 pid 恒为 1）即使在同一纳秒生成 ID，也更难撞上相同计数器；ID 格式不变。`event_id` 内嵌时间与事件 `ts` 是两次独立取时，可能相差数百纳秒；排序以 `ts` 为准。
 
 **时间戳格式**（[`util.rs`](../../mem-core/src/util.rs)）：
 
@@ -290,10 +297,10 @@ YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ     # 恰好 30 字符，UTC
 
 实现细节：
 
-- 先做纯词法的绝对化与 `.` / `..` 解析（不要求文件存在，不调用 `canonicalize`）；
+- 先做词法绝对化与 `.` / `..` 解析，再对**已存在的最长前缀**做 `fs::canonicalize`（解析符号链接），不存在的尾部按词法拼接（被删除的文件也保持确定的身份）；
+- 每次 `strip_prefix` 比较的两侧都做同样的规范化，因此经由软链访问的 store 与真实路径得到相同的相对身份；
 - 组件统一用 `/`（Windows 的 `\` 会被替换）；
-- 非 UTF-8 路径经 `to_string_lossy` 处理，可能有损；
-- 符号链接不解析，按传入路径的字面位置判断。
+- 非 UTF-8 路径经 `to_string_lossy` 处理，可能有损。
 
 ### 5.8 项目 README 生成规则
 
@@ -322,6 +329,7 @@ YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ     # 恰好 30 字符，UTC
 - 元数据缺失时用 `Project <name>` 兜底，`created_at` 取当前时间；
 - 文件表来自 `get_latest_files`（每个 `file_name` 最新一条）；
 - 时间线取最近 10 条事件、最新在前；
+- 所有插值（项目名、描述、`created_at`、`github_url` 标签、文件表单元格、时间线字段）写入前都会转义：`|` → `\|`，CR/LF 折叠为空格，记录的数据无法破坏 Markdown 表格/时间线结构或注入内容；
 - `write_project_readme` 以 `create + truncate + 排他锁` 整体重写，不是只追加。
 
 ## 6. 并发与一致性
@@ -330,19 +338,19 @@ YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ     # 恰好 30 字符，UTC
 
 | 操作 | 锁 | 说明 |
 | --- | --- | --- |
-| `append_event`（事件行） | `fs2` 排他锁 | 打开 `events/<ym>.jsonl` 后加锁，写一行、`flush`、解锁 |
-| `append_event`（文件行） | `fs2` 排他锁 | 对 `files.jsonl` 同样处理 |
-| `write_project_meta` | `fs2` 排他锁 | `truncate` 覆盖写 |
-| `write_project_readme` | `fs2` 排他锁 | `truncate` 覆盖写 |
-| `resolve` 写回 | `fs2` 排他锁 | 重新整文件覆盖后 `git add` |
+| 所有 store 写操作：`append_event`、`compact`、`resolve`、`sync`、`write_project_meta`、`write_project_readme` | store 跨进程写锁（`fs2`） | 每个 store 一把锁，锁文件按 store 规范路径的哈希命名、放在 `$XDG_RUNTIME_DIR`（或系统临时目录），不写进 Git 仓库 |
+| `append_event`（事件行） | 额外 `fs2` 排他锁 | 打开 `events/<ym>.jsonl` 后加锁，写一行、`flush`、解锁 |
+| `append_event`（文件行） | 额外 `fs2` 排他锁 | 对 `files.jsonl` 同样处理 |
+| `resolve` 写回 | 额外 `fs2` 排他锁 | 重新整文件覆盖后 `git add` |
 
-`fs2` 的锁是**建议锁（advisory）**：只对同样使用该库加锁的进程有效，可保护同机多进程（CLI 与 MCP 同时跑），不跨设备生效。
+store 跨进程写锁让**同一台机器上的多文件操作**在进程之间串行：追加不会与投影重建、冲突解决或 rebase 交错。`fs2` 锁是**建议锁（advisory）**，不跨设备生效；跨设备顺序由 Git 同步与 `mem resolve` 收敛。
 
 ### 6.2 读侧
 
-- 读路径**不加锁**，用 `memmap2` 映射文件；每次读取都重新打开文件、重新映射，不存在长期持有的映射。
+- 读路径**不加锁**；每次读取都重新打开文件并用普通 `fs::read` 读取，不存在长期持有的映射或句柄。
+- 读路径不使用 `mmap`：并发的 `resolve` / `pull` 可能随时截断或替换文件，读被截断文件的映射是未定义行为（可能触发 `SIGBUS`），普通读取始终安全。
 - 读端逐行容错：某行非法 JSON 就跳过该行；单行损坏不会让 store 不可读。
-- `memmap2` 对空文件是特殊情况，代码先判断文件长度为 0 直接返回空结果。
+- 空文件被显式处理（直接返回空结果）。
 
 ### 6.3 跨设备一致性
 
@@ -350,48 +358,58 @@ YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ     # 恰好 30 字符，UTC
 - 没有跨设备锁：两台设备同时修改同一 store 由 Git 的 rebase 与 `mem resolve` 合并（见第 7 节）。
 - 语义上是「事件日志 + 最近状态」：事件按时间近似排序，冲突记录同一 ID 时后写覆盖（last-write-wins），不是字段级合并。
 
-### 6.4 `compact` 的原子替换
+### 6.4 `compact` 的投影重建
 
-[`compact_project_files`](../../mem-core/src/compact.rs)：
+[`compact_project_files`](../../mem-core/src/compact.rs) 从事件日志重建 `files.jsonl`，同时完成压缩与自愈：
 
-1. 读入全部 `files.jsonl` 记录 → 按 `file_name` 保留最后一条（`BTreeMap` insert 覆盖）；
-2. 以排他锁写同目录临时文件 `files.jsonl.tmp`；
-3. `fs::rename(tmp, files.jsonl)` —— 同一文件系统内原子替换，读端要么看到旧完整文件、要么看到新完整文件；
-4. rename 失败时删除临时文件并返回错误。
+1. 校验项目名，然后取 store 写锁，并一直持有到下面的 rename。
+2. 统计现有 `files.jsonl` 的非空行数作为 `records_before`（文件不存在时为 0）。
+3. 读取权威事件日志（`read_all_events`），筛出本项目的全部事件，用 `sort_events` 按因果/时间顺序排序。
+4. 按事件顺序把每条 `FileRecord` 写入 `BTreeMap<file_name, FileRecord>`——同一 `file_name` 后写覆盖先写。
+5. 若既无投影又无任何事件，返回 0/0 报告，不创建目录。
+6. 把投影写入 `files.jsonl.tmp`，`flush` + `sync_all` 后 `fs::rename` 覆盖 `files.jsonl`——同一文件系统内原子替换，读端要么看到旧完整文件、要么看到新完整文件。
 
-注意：`compact` 只整理 `files.jsonl`，不触碰 `events/*.jsonl`；若在 `compact` 进行的同时有其它进程追加 `files.jsonl`，rename 会覆盖掉那段时间的新记录。因此 `compact` 定位为手动/周期性维护操作，不要与并发写入重叠。
+整个「读取 → 重放 → 替换」序列持有 store 写锁，因此并发追加不会再在读与 rename 之间被覆盖丢失；重建来源是事件日志，所以崩溃留下的投影缺失或截断也能被修复。`Records before / after / pruned` 输出保持不变。
 
 ## 7. 同步与冲突解决
 
 ### 7.1 同步流程
 
-**CLI `mem sync`**（[`mem-cli/src/main.rs`](../../mem-cli/src/main.rs)）：
+**CLI `mem sync`**（[`mem-cli/src/main.rs`](../../mem-cli/src/main.rs)）**与 MCP `mem_sync`**（[`mem-mcp/src/main.rs`](../../mem-mcp/src/main.rs)）**共用 [`sync_store`](../../mem-core/src/git.rs)**，流程与保证一致：
 
 ```
 resolve_store_root
       │
       ▼
-git status --porcelain  ──clean──▶ 打印 clean
+获取 store 跨进程写锁（全程持有）
+      │
+      ▼
+git status --porcelain  ──clean──▶ step: "Working directory clean"
       │dirty
       ▼
 git add -A ; git commit -m "Auto-sync from <device> at <ts>"
       │
       ▼
-git pull --rebase --autostash
-      │
-      ├─ 失败且 git_has_conflicts() ──▶ 打印警告，提示运行 mem resolve，本次结束
-      ├─ 其它失败 ───────────────────▶ 打印警告，继续
+has upstream?  ──no──▶ step: "No upstream configured; skipped pull"
+      │yes
       ▼
-git push   ──▶ 打印成功
+git pull --rebase            (no --autostash；工作树刚提交过)
+      │
+      ├─ conflict ────────▶ SyncOutcome::Conflict
+      │                     CLI: 打印 steps + 提示运行 mem resolve，非零退出
+      │                     MCP: 返回带相同提示的 isError 结果
+      ├─ other failure ───▶ 报错中止（绝不在失败的 pull 之上继续 push）
+      ▼
+git push   ──▶ SyncOutcome::Success（steps 由调用方打印）
 ```
 
-**MCP `mem_sync`**（[`mem-mcp/src/main.rs`](../../mem-mcp/src/main.rs)）流程相同，差异：
+差异只在入口层：
 
-- 提交信息可用 `message` 参数覆盖，缺省 `Auto-sync memory store`；
-- 检测到冲突时返回 tool error，提示调用 `mem_resolve`；
-- 返回文本列出各步骤结果（clean/committed、pulled、pushed 等）。
+- 提交信息：CLI 固定 `Auto-sync from <device> at <ts>`；MCP 可用 `message` 参数覆盖，缺省 `Auto-sync memory store`；
+- 冲突/失败：CLI 打印步骤 + stderr 警告，`main` 以非零退出码结束；MCP 把同样的错误文本包装成 `result.isError = true` 的成功响应；
+- 打印/返回的步骤文本相同（clean/committed、pulled、pushed 等）。
 
-`git_has_conflicts`（[`git.rs`](../../mem-core/src/git.rs)）同时检查三处：`git ls-files -u` 的未合并文件、`git status --porcelain` 的冲突状态码（`UU` / `AA` / `UD` / `DU` / `DD` / `AU` / `UA`）、以及被跟踪文件内容中的 `<<<<<<<` 标记。
+[`git_has_conflicts`](../../mem-core/src/git.rs) 只依据 Git 自身的记录：`git ls-files -u` 的未合并文件、`git status --porcelain` 的冲突状态码（`UU` / `AA` / `UD` / `DU` / `DD` / `AU` / `UA`）、以及 rebase/merge 状态目录（`rebase-merge` / `rebase-apply` / `MERGE_HEAD`）。它**不再扫描文件内容**找 `<<<<<<<`：事件摘要或文档里恰好引用该字符串不会造成永久误判，也省掉 O(仓库大小) 的扫描。
 
 ### 7.2 JSONL 冲突的形态
 
@@ -413,25 +431,25 @@ Git 对文本行做三方合并，两个分片都追加了不同事件时，冲�
 
 [`resolve_conflicts`](../../mem-core/src/resolve.rs) 的步骤：
 
-1. 递归扫描 store 下所有 `.jsonl`（`WalkBuilder::hidden(false)`，包含隐藏文件），按路径排序。
-2. 只处理包含 `<<<<<<<` 的文件，读入全文（要求 UTF-8）。
-3. 逐行去除冲突标记：`<<<<<<<` / `=======` / `>>>>>>>` / `|||||||` 开头的行丢弃，同时统计冲突块数；其余非空行保留**原始行文本**（含首尾空白）。
+1. 取 store 写锁并全程持有；随后进入循环：递归扫描 store 下所有 `.jsonl`（`WalkBuilder::hidden(false)`，包含隐藏文件），按路径排序。
+2. 只处理包含 `<<<<<<<` 字节的文件；以**字节**方式读入全文，不再要求合法 UTF-8。
+3. 逐行去除**精确形态**的冲突标记：`=======` 必须整行恰好是七个 `=`；`<<<<<<<` / `|||||||` / `>>>>>>>` 之后只能是行尾或一个空格（可带 label）。以标记前缀开头的普通数据行不算标记、会被保留；同时统计冲突块数，其余非空行保留**原始字节**（含首尾空白与 CRLF）。
 4. 按「第一条可解析行」判定文件类型：`Event` → `FileRecord` → 通用 JSON（`Generic`）→ `Unknown`。
 5. 对每条数据行分类：
 
    | 类型 | 解析成功 | 解析失败 |
    | --- | --- | --- |
-   | `Event` | 以 `event_id` 为去重键、`ts` 为排序时间 | 逐字保留 |
-   | `FileRecord` | 以 `file_id` 为去重键 | 逐字保留 |
-   | `Generic` | 以 `event_id` / `file_id` / `id` 之一为键（缺省用整行） | 逐字保留 |
-   | `Unknown` | — | 全部逐字保留 |
+   | `Event` | 以 `event_id` 为去重键、`ts` 为排序时间 | 逐字节保留 |
+   | `FileRecord` | 以 `file_id` 为去重键，保持因果顺序 | 逐字节保留 |
+   | `Generic` | 以 `event_id` / `file_id` / `id` 之一为键（缺省用整行） | 逐字节保留 |
+   | `Unknown` | — | 全部逐字节保留 |
 
-6. 去重：同 key 后出现者覆盖先出现者（last-write-wins）；统计被去重条数。
-7. 排序：`Event` / `Generic` 按 `ts_cmp` + 键排序；`FileRecord` 按 `file_id`；`Unknown` 不排序。
+6. 去重：同 key 后出现者覆盖先出现者（last-write-wins）；统计被去重条数。`FileRecord` 不做重排：只保留每个 key 最后一次出现的位置，避免打乱历史顺序、让 `files.jsonl` 的 last-write-wins 被旧状态覆盖。
+7. 排序：`Event` / `Generic` 按 `ts_cmp` + 键排序；`Unknown` 不排序。
 8. 无法解析的行（含相同内容的重复行折叠一次）**追加在文件末尾**。
 9. 以排他锁 `truncate` 覆盖写回。
 10. 若 store 根存在 `.git`：`git add -- <相对路径>` 把解决后的文件暂存（失败仅警告）。
-11. 最后：仅当 `.git/rebase-merge` 或 `.git/rebase-apply` 存在时，执行 `git rebase --continue`（`GIT_EDITOR=true` 防止阻塞）。
+11. 若存在 rebase 状态（`.git/rebase-merge` / `.git/rebase-apply`），执行 `git rebase --continue`（`GIT_EDITOR=true` 防止阻塞），然后回到第 1 步继续下一轮；一次调用最多循环 100 轮，直到 rebase 结束。若剩余冲突包含非 JSONL 文件，则停止并打印可操作的错误（列出非 JSONL 文件与所有未解决路径）。
 
 `ResolveReport` 汇报：`resolved_files`、`total_conflicts_resolved`、`deduplicated_items`、`lines_preserved`。
 
@@ -446,8 +464,8 @@ Git 对文本行做三方合并，两个分片都追加了不同事件时，冲�
 
 ### 7.5 冲突解决之后的流程
 
-1. `mem resolve` 写回 JSONL 并 `git add`；若 rebase 仍在进行，自动 `git rebase --continue` 完成剩余提交。
-2. 用户再执行一次 `mem sync`：若还有未提交改动会提交，随后 pull/push；若工作区干净则直接 pull/push。
+1. `mem resolve` 写回 JSONL 并 `git add`；若 rebase 仍在进行，会在同一次调用里循环 `git rebase --continue` 推进剩余提交（上限 100 轮）。只有非 JSONL 文件仍冲突时才需要手工处理并在 `git add` 后继续 rebase。
+2. 用户再执行一次 `mem sync`：若还有未提交改动会提交，随后 pull/push；若工作区干净则直接 pull/push。冲突会以非零退出码结束，不再被当作成功。
 3. 冲突期间**不要**手工编辑 JSONL 或运行 `git checkout`，让 `mem resolve` 统一处理（否则可能把冲突标记重新引入或丢行）。
 
 ## 8. 性能特征与限制
@@ -462,7 +480,7 @@ Git 对文本行做三方合并，两个分片都追加了不同事件时，冲�
 | `fuzzy_search` | O(事件总字节数) | O(命中事件数) | 正则扫所有行 |
 | `read_latest_events_for_project` | 最坏 O(事件总字节数) | O(读入月份的记录) | 从最新月份倒查，凑满即停 |
 | `get_latest_files` | O(`files.jsonl` 行数) | O(不同文件数) | `BTreeMap` 去重 |
-| `compact` | O(`files.jsonl` 行数) | O(不同文件数) | 读全量 + 临时文件 + rename |
+| `compact` | O(事件总数) | O(不同文件数) | 从事件日志重放 + 临时文件 + rename；持 store 写锁 |
 | `list_projects` | O(项目数) | O(项目数) | `ignore` 深度 1 遍历 |
 
 ### 8.2 规模假设
@@ -475,9 +493,10 @@ Git 对文本行做三方合并，两个分片都追加了不同事件时，冲�
 ### 8.3 其它限制
 
 - **无持久化索引/缓存**：每次查询重建，进程退出即丢；
-- **读全文件**：CLI `add` 为计算 SHA256 把文件整体读入内存，超大文件会占用等量内存；MCP 由调用方提供 `size_bytes` / `hash`，不读内容；
-- **`resolve` 要求文件是合法 UTF-8**（`read_to_string`），非 UTF-8 的 JSONL 会导致该文件处理失败；
-- **mmap 依赖常规文件**：空文件被特殊处理；在部分网络文件系统上 mmap 性能可能下降；
+- **`add` 流式计算哈希**：CLI 以 64 KiB 分块读取文件计算 SHA256，内存占用 O(1)，但超大文件仍会消耗等量 I/O；MCP 由调用方提供 `size_bytes` / `hash`，不读内容；
+- **`resolve` 按字节处理**：不再要求合法 UTF-8，非 UTF-8 字节逐字保留；但 `git add` 的路径仍以 lossy 形式传给 Git；
+- **没有 mmap**：读取用普通 `fs::read`，避免并发截断导致的未定义行为；代价是每个分片每次读取都要完整读入内存（分片按月切分，单文件大小可控）；
+- **资源上限**：MCP 单行请求 16 MiB、fuzzy 正则编译程序 10 MiB，防止超大输入耗尽资源；
 - **没有 fsync**：依赖 OS 页缓存与 Git 的提交语义，适合「记忆」而非金融账本。
 
 ## 9. 扩展点
@@ -493,7 +512,7 @@ Git 对文本行做三方合并，两个分片都追加了不同事件时，冲�
 
 1. 在 [`get_tools_list`](../../mem-mcp/src/main.rs) 中加 `name` / `description` / `inputSchema`；
 2. 在 `handle_request` 的 `tools/call` 分发里加一个分支，把 `arguments` 反序列化成参数结构体，调用 `mem-core` 的公开函数；
-3. 返回 `mcp_text_content(...)` 包装的文本结果；错误经 `Err(String)` 转成 JSON-RPC error（`-32603`）。
+3. 返回 `mcp_text_content(...)` 包装的文本结果；参数反序列化失败返回 `-32602`，handler 业务失败经 `Err(String)` 转成**成功响应 + `result.isError = true`**（`-32603` 保留给服务端故障，不再用于业务错误）。
 
 ### 9.3 新增 CLI 子命令
 

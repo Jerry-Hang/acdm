@@ -70,18 +70,23 @@ mem --path /path/to/store list -p <project>
 
 ## 4. `mem sync` 失败
 
-`mem sync` 依次做：脏工作区自动 commit（提交信息 `Auto-sync from <device> at <timestamp>`）→
-`git pull --rebase --autostash` → `git push`。任何一步失败都会以非零退出码结束。
+`mem sync` 与 MCP `mem_sync` 共用同一实现（`mem_core::git::sync_store`），全程持有 store 写锁：
+脏工作区自动 commit（提交信息 `Auto-sync from <device> at <timestamp>`）→
+`git pull --rebase`（不再带 `--autostash`）→ `git push`。无 upstream 时跳过 pull；
+pull 失败若**不是冲突**会直接中止（不再继续 push 掩盖原因）；检测到冲突时 CLI 打印提示并以
+**退出码 1** 结束，MCP 返回 `result.isError = true`。
 
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
-| `git pull ... failed: ... no tracking information` / `no upstream` | 本地分支没设置上游 | `git -C <store> push -u origin <branch>`（先手动推一次） |
+| `git pull ... failed: ... no tracking information` / `no upstream` | 本地分支没设置上游（sync 会跳过 pull，但 push 仍会失败） | `git -C <store> push -u origin <branch>`（先手动推一次） |
 | `git push ... failed: ... No configured push destination` | 没配置 remote | `git -C <store> remote add origin <url>`，或 `mem init --remote <url>` 重新初始化 |
-| `rejected` / `non-fast-forward` | 远端有新提交且本地未成功 rebase | 先 `git -C <store> pull --rebase --autostash`，冲突按 §5 |
+| `rejected` / `non-fast-forward` | 远端有新提交且本地未成功 rebase | 先 `git -C <store> pull --rebase`，冲突按 §5 |
 | `Permission denied (publickey)` / `Authentication failed` | Git 凭据问题 | 修 SSH key 或 HTTPS 凭据；ACDM 不管理凭据 |
-| 提示 conflicts | JSONL 合并冲突 | 见 §5 |
+| `could not apply ...` / 提示 conflicts | JSONL 合并冲突（sync 退出码 1） | 见 §5 |
+| `git pull --rebase failed and the repository is not conflicted; aborting sync...` | 非冲突的 pull 失败（网络、认证、脏工作区等） | 按提示先修好 git 状态再重试；不会再继续 push |
 
-注意：如果 store 不是 Git 仓库（只用了 `mem init` 没配 remote），`sync` 会在 push 阶段失败；
+注意：如果 store 根本不是 Git 仓库（只用了 `mem init`，没有 `git init`），`sync` 在第一步
+`git status` 就会失败；如果只是没有 remote/upstream，sync 会跳过 pull，但 push 仍会失败。
 此时改用本地用法即可，或补建仓库/remote。
 
 ## 5. 冲突处理
@@ -90,18 +95,22 @@ mem --path /path/to/store list -p <project>
 冲突标记。处理：
 
 ```bash
-mem --path /path/to/store sync     # 输出提示 conflicts
-mem --path /path/to/store resolve  # 自动解决 JSONL 冲突
+mem --path /path/to/store sync     # 冲突时退出码 1，提示运行 mem resolve
+mem --path /path/to/store resolve  # 自动解决 JSONL 冲突（含多提交 rebase）
 mem --path /path/to/store sync     # 再次同步
 ```
 
 `mem resolve` 的行为（详见 [ARCHITECTURE.md](ARCHITECTURE.md#7-同步与冲突解决)）：
 
-- 丢弃 `<<<<<<<` / `=======` / `>>>>>>>` / `|||||||` 标记行；
-- 同 `event_id` / `file_id` 的记录**后写覆盖**（歧义时保留文件里靠后的版本）；
-- 能解析的记录按时间排序后写回；**无法解析的行逐字保留**（放在文件末尾）；
+- 只删除 Git **精确形态**的标记：`=======` 必须整行恰好是七个 `=`，`<<<<<<<` / `>>>>>>>` / `|||||||`
+  之后只能是行尾或空格；以标记前缀开头的普通数据行会被保留；
+- 按**字节**处理：非 UTF-8 字节与 CRLF 换行都逐字保留，不再因为文件不是合法 UTF-8 而失败；
+- 同 `event_id` / `file_id` 的记录**后写覆盖**（歧义时保留文件里靠后的版本）；`FileRecord` 保持因果顺序，
+  不再按 `file_id` 重排；
+- 能解析的 `Event` / `Generic` 记录按时间排序后写回；**无法解析的行逐字保留**（放在文件末尾）；
 - 写回后 `git add`；只有确实存在 rebase 状态（`.git/rebase-merge` / `rebase-apply`）时才
-  `git rebase --continue`，与系统语言无关。
+  `git rebase --continue`，并循环推进多个冲突提交（上限 100 轮），与系统语言无关；
+- 整个操作持有 store 写锁，与追加/压缩/同步串行。
 
 排查：
 
@@ -113,8 +122,8 @@ mem --path /path/to/store sync     # 再次同步
   且当前处于 rebase/merge 状态。剩余冲突通常意味着存在**非 JSONL 文件冲突**，
   最常见的是 `projects/<project>/meta.json`：两台设备同时首次为同一项目写入元数据时，
   两边都创建了 `meta.json`，JSONL 可以自动合并，而 `meta.json` 不行。
-  `mem resolve` 会先解决 JSONL，然后在 `git rebase --continue` 处失败，并打印一条**可操作的错误**，
-  列出仍未解决的路径。恢复方式：
+  `mem resolve` 会先解决 JSONL 并循环推进 rebase，直到只剩非 JSONL 文件时停下，
+  然后打印一条**可操作的错误**，列出非 JSONL 文件与所有仍未解决的路径。恢复方式：
 
   ```bash
   git -C /path/to/store status --short          # 找到 UU 的 meta.json
@@ -129,8 +138,9 @@ mem --path /path/to/store sync     # 再次同步
 
 ## 6. `compact` 后记录变少
 
-`mem compact -p <project>` 的语义是「每个 `file_name` 只保留最新一条记录」，所以记录数减少是
-预期行为（输出会给出 before / after / pruned）。它保留 `Deleted` 记录。建议在干净工作区执行，
+`mem compact -p <project>` 从**事件日志**重建 `files.jsonl` 投影：按时间顺序重放所有事件，每个
+`file_name` 只保留最后写入者，所以记录数减少是预期行为（输出会给出 before / after / pruned）。
+它保留 `Deleted` 记录，并会自愈崩溃/并发导致的投影缺失或截断；全程持有 store 写锁，可与追加并发执行。
 执行后 `sync` 一次。
 
 ## 7. 项目 README.md 被覆盖
@@ -145,22 +155,27 @@ mem --path /path/to/store sync     # 再次同步
   不需要 `Content-Length` 头。
 - **启动即退出**：未知启动参数会打印 usage 并 `exit 2`（防止拼写错误静默用错 store）；
   确认只传 `--path`。
-- **工具调用返回 error**：看 `error.code`：
+- **工具调用返回 error**：先区分协议错误与业务错误：
   - `-32700` 请求不是合法 JSON；
+  - `-32600` `jsonrpc` 不是 `"2.0"`，或单行请求超过 16 MiB（超限后 server 会丢弃该行并继续服务）；
   - `-32601` 未知方法或未知工具；
-  - `-32602` `tools/call` 参数不匹配 schema；
-  - `-32603` 工具执行失败（看 `error.message` 里的具体原因）。
-- **工具执行失败但 server 还活着**：这是预期行为，修正参数后重试即可。
+  - `-32602` 工具参数不匹配 schema（缺字段、类型错、`action` 不是 `Created`/`Modified`/`Deleted` 等）；
+  - **业务失败**（git 冲突、非法查询维度、不安全项目名、正则错误等）不再返回 JSON-RPC error，
+    而是成功响应 + `result.isError = true`，错误文本在 `result.content[].text`；
+    `-32603` 保留给真正的服务端故障，当前版本不会出现。
+- **工具执行失败但 server 还活着**：这是预期行为，读 `isError` 文本、修正参数后重试即可。
 - **找不到 store / 事件写到奇怪位置**：MCP 启动时会 `init`（缺 store 时在解析出的根目录自建）。
   建议显式 `--path` 或设置 `ACDM_STORE`，避免依赖客户端进程的 CWD。
-- **多客户端并发**：每个客户端各自启动一个 `mem-mcp` 进程；追加写入由 `fs2` 排他锁保护，
-  多进程同时写是安全的；查询无锁（`mmap` 读快照）。
+- **多客户端并发**：每个客户端各自启动一个 `mem-mcp` 进程；写操作由**跨进程 store 写锁**（`fs2`，
+  锁文件在运行时/临时目录、不进仓库）串行化，多进程同时写是安全的；查询无锁（普通文件读取，不再用 `mmap`）。
 
 ## 9. 性能问题
 
 - 每次 `mem query` 都会**从头构建内存索引**（扫描全部 `events/*.jsonl`），复杂度 O(事件数)。
   事件量到几十万条时单次查询会明显变慢；这是当前设计的已知限制（见 [DESIGN.md](DESIGN.md)）。
-- `mem query --fuzzy` 是正则逐行扫描，比其它查询更慢；尽量收窄正则。
+- `mem query --fuzzy` 是正则逐行扫描，比其它查询更慢；尽量收窄正则。正则编译程序上限 10 MiB，
+  超大正则会报 `Compiled regex exceeds size limit of 10485760 bytes.`；`mem add` 以 64 KiB 分块
+  流式计算 SHA256，超大文件也不会整文件读入内存。
 - `mem render` 只取最近 10 条事件，不受历史总量影响。
 - 建议定期 `mem compact`；旧月份的 `events/YYYY-MM.jsonl` 可以归档到仓库外
   （注意：归档后 `mem render` 时间线与最近事件将不含这些月份，属于预期）。
@@ -207,7 +222,7 @@ ls -la /path/to/store /path/to/store/events
 
 ## 12. 已知限制
 
-- 无并发多写者事务：只有一个排他锁，跨设备一致性是「最终一致 + 去重」。
+- 无并发多写者事务：写操作由 store 跨进程写锁串行，单机并发安全，但跨设备一致性仍是「最终一致 + 去重」，没有分布式事务。
 - 事件记录里的 SHA-256 由写入方提供（CLI 会计算；MCP 调用方可以传空）。
-- 非 UTF-8 路径：可以写入与读取，但 `resolve` 的 stage 路径会以 lossy 形式传给 Git。
-- 没有内置的鉴权与加密：store 的安全性依赖 Git 远端权限与磁盘权限。
+- 非 UTF-8 路径：可以写入与读取；`resolve` 已按字节处理，但 `git add` 的 stage 路径会以 lossy 形式传给 Git。
+- 没有内置的鉴权与加密：store 的安全性依赖 Git 远端权限与磁盘权限；项目名经过安全校验，文件路径与摘要仍需自行审查。

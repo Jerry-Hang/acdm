@@ -4,7 +4,7 @@
 
 > 读者：需要日常使用或脚本化调用 `mem` 的开发者与 AI Agent 操作者。本文覆盖全部 8 个子命令的参数、输出格式、退出码与真实边界行为；Agent 侧的 MCP 入口见 [MCP.md](MCP.md)，架构与设计动机见 [ARCHITECTURE.md](ARCHITECTURE.md) 与 [DESIGN.md](DESIGN.md)。
 
-本文以 `mem-cli/src/main.rs` 的 clap 定义为**唯一权威**（参数名、必填性、默认值均以源码为准）。文中所有示例输出都在 v0.1.0 的实际二进制上运行得到；为可读性，示例中的 store 绝对路径统一替换为 `/path/to/store` 占位符，事件 ID、时间戳、SHA256 与其余文本保持原样。示例中执行 git 提交前均已配置 git 用户身份；涉及 git 错误信息的地方以 `LC_ALL=C` 运行，因此错误文本是英文（git 错误消息随 locale 变化）。
+本文以 `mem-cli/src/main.rs` 的 clap 定义为**唯一权威**（参数名、必填性、默认值均以源码为准）。文中示例输出在 v0.1.0 / v0.1.1 的实际二进制上运行得到（0.1.1 行为变更处以 0.1.1 重新实测）；为可读性，示例中的 store 绝对路径统一替换为 `/path/to/store` 占位符，事件 ID、时间戳、SHA256 与其余文本保持原样。示例中执行 git 提交前均已配置 git 用户身份；涉及 git 错误信息的地方以 `LC_ALL=C` 运行，因此错误文本是英文（git 错误消息随 locale 变化）。
 
 ## 目录
 
@@ -161,7 +161,7 @@ For more information, try '--help'.
 [exit code 2]
 ```
 
-- **唯一的例外**：`sync` 检测到 Git 冲突时以退出码 0 结束，只在 stderr 提示运行 `mem resolve`（见 [3.6 sync](#36-sync)）。
+- `sync` 检测到 Git 冲突时是**运行时错误**：stdout 打印已完成的步骤，stderr 提示运行 `mem resolve`，退出码 1（0.1.0 曾以退出码 0 结束，0.1.1 起改为非零，脚本可直接按退出码判断；见 [3.6 sync](#36-sync)）。
 
 ## 3. 子命令
 
@@ -260,13 +260,13 @@ mem add [OPTIONS] --project <PROJECT> --summary <SUMMARY> <FILES>...
 
 1. 读取该项目 `projects/<project>/files.jsonl` 中现有的 `file_name` 集合（每个文件名只取最新记录）。
 2. 对每个 `<FILES>`：
-   - 规范化文件身份 `file_name`：优先相对 store 根；文件在 store 外时相对最近的 git 仓库根；再退回相对 CWD；都无法相对化时保留**绝对路径**，并向 stderr 打印警告；
-   - 文件存在：读取内容，`size_bytes` = 字节数，`hash` = 内容的 SHA256 十六进制；若 `file_name` 已在该项目的已知文件名中则为 `Modified`，否则为 `Created`；
+   - 规范化文件身份 `file_name`：优先相对 store 根；文件在 store 外时相对最近的 git 仓库根；再退回相对 CWD；都无法相对化时保留**绝对路径**，并向 stderr 打印警告（已存在的前缀会做 `fs::canonicalize` 解析符号链接，不存在的尾部按词法拼接）；
+   - 文件存在：以 64 KiB 分块流式计算 SHA256，`size_bytes` = 字节数，`hash` = 十六进制摘要；若 `file_name` 已在该项目的已知文件名中则为 `Modified`，否则为 `Created`；
    - 文件不存在：记为 `Deleted`，`size_bytes = 0`，`hash = ""`；
    - 为每条记录生成独立的 `file_id`。
 3. 生成事件：`event_id` 形如 `YYYYMMDDHHMMSS_nanos9_pid5_counter4`（UTC）；`ts` 为固定宽度 UTC 纳秒 `YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ`。
 4. 若 `projects/<project>/meta.json` 读取失败（不存在），自动写入最小元数据：`description` 为 `"Project <name>"`、`github_url` 为 `null`、`created_at` 等于本次事件时间。
-5. 追加事件行到 `events/YYYY-MM.jsonl`，并把本次的每条 `FileRecord` 追加到 `projects/<project>/files.jsonl`（追加时持有排他文件锁）。
+5. 校验项目名后，持 store 跨进程写锁把事件行追加到 `events/YYYY-MM.jsonl`，并把本次的每条 `FileRecord` 追加到 `projects/<project>/files.jsonl`（追加时另持排他文件锁）。
 
 **真实输出（Created）**
 
@@ -351,6 +351,7 @@ Successfully recorded event: 20261022130629_780024199_23222_0001                
 
 **注意事项**
 
+- `-p/--project` 必须是单一安全路径组件：非空、不是 `.`/`..`、不含 `/` 或 `\`、无控制字符、≤200 字节；否则报 `Error: invalid project name ...` 并退出 1（在任何 store 操作之前校验）。
 - `<FILES>` 是必填的位置参数，至少传一个；路径可以是相对 CWD，也可以是绝对路径。
 - `Created` / `Modified` 只根据 `file_name` 是否已出现在该项目的 `files.jsonl`（含历史记录，去重后）来判断；不比较内容 hash，因此对同一文件即使内容没变，第二次记录也会是 `Modified`。
 - 文件不存在也会产生一条 `Deleted` 记录，路径仍然按同样规则规范化。
@@ -498,7 +499,7 @@ No events matched pattern 'zzz-not-present'.
 
 - `--file-id` 匹配的是 `FileRecord.file_id`（每条文件记录都有独立 ID），输出会带上父事件的完整信息。
 - `-n/--filename` 匹配的是**规范化后的相对 `file_name`**（如 `src/hello.txt`），且是**整串精确匹配**、不是子串搜索（查 `hello.txt` 不会命中 `src/hello.txt`）；不是系统绝对路径；历史数据中的绝对路径记录用相对名查不到（见 [MIGRATION.md](MIGRATION.md)）。
-- `--fuzzy` 是对事件原始 JSONL 行做 Rust `regex` 匹配，不是全文分词；正则非法时先打印搜索标题，再在 stderr 报 `Error: regex parse error: ...` 并以退出码 1 结束。
+- `--fuzzy` 是对事件原始 JSONL 行做 Rust `regex` 匹配，不是全文分词；正则非法时先打印搜索标题，再在 stderr 报 `Error: regex parse error: ...` 并以退出码 1 结束。正则编译程序有 10 MiB 尺寸上限，超大正则会报 `Error: Compiled regex exceeds size limit of 10485760 bytes.`
 - 过滤条件可以组合，输出顺序固定为 project → file_id → filename → fuzzy。
 - 每次查询都会重新扫描事件文件建立索引；store 很大时查询会变慢，这属于当前实现的已知特征，不是常驻服务。
 
@@ -581,10 +582,11 @@ mem compact [OPTIONS] --project <PROJECT>
 
 **行为**
 
-1. 读取 `projects/<project>/files.jsonl` 的全部记录（文件不存在时视为 0 条，直接返回 0/0，不创建目录）；
-2. 以 `file_name` 为键，保留**最后出现**的一条记录（即最新写入的一条）；
-3. 把结果写到同目录的临时文件 `files.jsonl.tmp`，再原子 `rename` 覆盖原文件；
-4. 输出压缩前后的记录数与剪除数。
+1. 校验项目名，取 store 跨进程写锁（一直持有到 rename）；
+2. 统计现有 `projects/<project>/files.jsonl` 的非空行数作为 `records_before`（文件不存在时为 0）；
+3. 从事件日志重放该项目全部事件（`sort_events` 按时间排序），以 `file_name` 为键保留**最后写入**的记录；
+4. 若既无投影又无事件，返回 0/0/0 且不创建目录；否则把结果写到同目录的临时文件 `files.jsonl.tmp`，再原子 `rename` 覆盖原文件；
+5. 输出压缩前后的记录数与剪除数。
 
 **真实输出**
 
@@ -612,10 +614,11 @@ src/util.txt                     Created    12             20261022130617_176154
 
 **注意事项**
 
-- `compact` 只重写 `projects/<project>/files.jsonl`，**不会改动 `events/`**；`query` 的历史事件仍然完整可查。
+- `compact` 从事件日志重建 `projects/<project>/files.jsonl`，**不会改动 `events/`**；`query` 的历史事件仍然完整可查。
 - 重写后文件内记录按 `file_name` 字典序排列（内部使用 `BTreeMap`），不再是原始追加顺序。
 - 剪除数 = `records_before - records_after`（由 CLI 计算并打印）。
-- 写临时文件后原子 rename，进程中断最多留下 `files.jsonl.tmp`（已被 store 的 `.gitignore` `*.tmp` 覆盖）；避免在同步关键路径上与追加写并发跑 `compact`。
+- 因为投影是从事件日志重放的，`compact` 能**自愈**崩溃/并发导致的投影缺失或截断；整个操作持有 store 写锁，可与追加写并发执行，不会丢记录。
+- 写临时文件后原子 rename 并 `sync_all`，进程中断最多留下 `files.jsonl.tmp`（已被 store 的 `.gitignore` `*.tmp` 覆盖）。
 
 ### 3.6 sync
 
@@ -636,22 +639,24 @@ mem sync [OPTIONS]
 
 **行为（严格按执行顺序）**
 
-1. 在 store 根执行 `git status --porcelain`；不是 git 仓库或 git 不可用 → `Error: ...` 退出 1。
+1. 在 store 根执行 `git status --porcelain`，并全程持有 store 跨进程写锁；不是 git 仓库或 git 不可用 → `Error: ...` 退出 1。
 2. 工作区**不干净**：`git add -A`，再 `git commit -m "Auto-sync from <device> at <ts>"`。其中 `<device>` 取本机 hostname（同 `add` 的规则），`<ts>` 是固定宽度 UTC 纳秒时间戳。
-3. `git pull --rebase --autostash`。
+3. 检查当前分支是否有 upstream：
+   - 没有 upstream → **跳过 pull**，继续下一步（push 会因缺少推送目标而失败，错误由 git 给出）；
+   - 有 upstream → `git pull --rebase`（**不再带 `--autostash`**：同步前已提交全部改动并持写锁；带 autostash 时若 stash pop 在 rebase 中冲突，会留下没有 rebase 状态的冲突工作区，极难恢复）。
 4. 若 pull 失败：
-   - 若检测到冲突（未合并文件、porcelain 冲突码，或已跟踪文件里出现 `<<<<<<<`）：向 **stderr** 打印两行警告，然后**以退出码 0 返回**（不执行 push）。此时工作区保留冲突标记，等待 `mem resolve`；
-   - 若失败但不是冲突（常见原因：当前分支没有 upstream、网络/认证问题；程序自己的提示文字写作 `possibly no remote changes`）：stderr 打印一行 `⚠️  git pull --rebase returned an error ...`，**继续执行 push**。
+   - 若检测到冲突（`git ls-files -u` 未合并文件、porcelain 冲突码，或 rebase/merge 状态目录）：stdout 继续打印已完成的步骤，向 **stderr** 打印「⚠️  git conflict detected; run `mem resolve`, then retry `mem sync`」，随后以 `Error: sync stopped on a git conflict: ...` **退出码 1** 结束（不执行 push）；此时工作区保留冲突标记，等待 `mem resolve`；
+   - 若不是冲突：直接以 `Error: git pull --rebase failed and the repository is not conflicted; aborting sync ...` **退出码 1** 中止，**不再继续 push**（旧版本会忽略该错误继续 push，掩盖真实原因）。
 5. `git push`；失败则 `Error: ...` 退出 1；成功打印 `✅ Sync successful: repository is up-to-date and pushed to remote.`
 
 **真实输出（脏工作区，remote + upstream 已配置）**
 
 ```text
 $ mem --path ./store sync
-Checking Git repository status at: /path/to/store
-Repository is dirty. Staging and committing changes: "Auto-sync from localhost at 2026-10-22T13:06:38.558947367Z"
-Pulling remote changes with rebase...
-Pushing changes to remote...
+Synchronizing memory store at: /path/to/store
+  • Committed local changes ("Auto-sync from localhost at 2026-10-22T16:14:50.164699829Z")
+  • Pulled remote changes with rebase
+  • Pushed to remote successfully
 ✅ Sync successful: repository is up-to-date and pushed to remote.
 ```
 
@@ -661,42 +666,40 @@ Pushing changes to remote...
 
 ```text
 $ mem --path ./store sync
-Checking Git repository status at: /path/to/store
-Repository working directory is clean.
-Pulling remote changes with rebase...
-Pushing changes to remote...
+Synchronizing memory store at: /path/to/store
+  • Working directory clean
+  • Pulled remote changes with rebase
+  • Pushed to remote successfully
 ✅ Sync successful: repository is up-to-date and pushed to remote.
 ```
 
-**真实输出（拉取时发生冲突：退出码 0，stdout + stderr）**
+**真实输出（拉取时发生冲突：退出码 1，stdout + stderr）**
 
 两台设备各自向同一个 `events/2026-10.jsonl` 追加事件，A 先同步，B 再同步：
 
 ```text
-$ mem --path ./store-b sync
-Checking Git repository status at: /path/to/store-b
-Repository is dirty. Staging and committing changes: "Auto-sync from localhost at 2026-10-22T13:07:02.640933631Z"
-Pulling remote changes with rebase...
+$ LC_ALL=C mem --path ./store-b sync
+Synchronizing memory store at: /path/to/store-b
+  • Committed local changes ("Auto-sync from localhost at 2026-10-22T16:17:56.885385697Z")
 
-# stderr：
-⚠️  Warning: Git conflicts detected during pull --rebase!
-Please run `mem resolve` to automatically resolve JSONL conflict markers.
-[exit code 0]
+# stderr:
+⚠️  git conflict detected; run `mem resolve`, then retry `mem sync`
+Error: sync stopped on a git conflict: Git conflict detected during pull --rebase: git command 'git pull --rebase' failed: From /path/to/remote
+   3283b63..452cb6d  main       -> origin/main
+Rebasing (1/1)error: could not apply c4b16c4... Auto-sync from localhost at 2026-10-22T16:17:56.885385697Z
+...
+[exit code 1]
 ```
 
 依次执行 `mem resolve` 与再次 `mem sync` 后的真实输出见 [3.7 resolve](#37-resolve) 的「两台设备 rebase 冲突后的真实恢复流程」。
 
-**真实输出（无 remote / 无 upstream：git 操作失败）**
+**真实输出（无 remote / 无 upstream：跳过 pull，push 失败）**
 
 ```text
-# store 是 git 仓库，但没有任何 remote，也没有 upstream
+# The store is a git repository, but has neither a remote nor an upstream
 $ LC_ALL=C mem --path ./store sync
-Checking Git repository status at: /path/to/store
-Repository working directory is clean.
-Pulling remote changes with rebase...
-Pushing changes to remote...
-# stderr：
-⚠️  git pull --rebase returned an error (possibly no remote changes). Continuing...
+Synchronizing memory store at: /path/to/store
+# stderr:
 Error: git command 'git push' failed: fatal: No configured push destination.
 Either specify the URL from the command-line or configure a remote repository using
 
@@ -705,14 +708,7 @@ Either specify the URL from the command-line or configure a remote repository us
 and then push using the remote name
 
     git push <name>
-
-To push to multiple remotes at once, configure a remote group using
-
-    git config remotes.<groupname> "<remote1> <remote2>"
-
-and then push using the group name
-
-    git push <groupname>
+...
 [exit code 1]
 ```
 
@@ -720,7 +716,7 @@ and then push using the group name
 
 ```text
 $ LC_ALL=C mem --path ./store sync
-Checking Git repository status at: /path/to/store
+Synchronizing memory store at: /path/to/store
 # stderr：
 Error: git command 'git status --porcelain' failed: fatal: not a git repository (or any parent up to mount point /)
 Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).
@@ -730,7 +726,7 @@ Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).
 **注意事项**
 
 - 前置条件：store 根是 git 仓库；已配置可用的 remote 与当前分支的 upstream（`git push -u origin HEAD` 或 `git clone` 可建立）；已配置 git 用户身份（`user.name` / `user.email`）——工作区需要提交而身份未配置时，提交会失败并退出 1。
-- 冲突时命令**不会**自动合并，也**不会** abort rebase；它只是把冲突状态留给 `mem resolve`。因此冲突场景下 `sync` 的退出码是 0，脚本需要一个显式检查（例如 `git status` / 检查 `events/*.jsonl` 是否包含 `<<<<<<<`）。
+- 冲突时命令**不会**自动合并，也**不会** abort rebase；它把冲突状态留给 `mem resolve`。冲突场景下 `sync` 的退出码是 **1**（0.1.0 曾为 0），脚本直接按退出码判断即可，不需要再扫描文件内容。
 - 提交信息固定为 `Auto-sync from <device> at <ts>`；`sync` 不提供自定义消息参数（MCP 的 `mem_sync` 支持可选 `message`，见 [MCP.md](MCP.md)）。
 - git 的错误文本受 locale 影响，示例使用 `LC_ALL=C`；内容本身是 git 原始输出。
 - `sync` 不调用任何冲突解决逻辑（不会自动执行 `resolve`），也不创建 remote；远端配置只由 `mem init --remote` 或手工 git 命令完成。
@@ -754,16 +750,16 @@ mem resolve [OPTIONS]
 
 **行为**
 
-1. 递归扫描 store 下所有 `*.jsonl`（`hidden(false)`：隐藏文件也会扫描；store 是 git 仓库时 `.gitignore` 过滤生效）；只处理包含 `<<<<<<<` 的文件。
-2. 去掉 `<<<<<<<`、`=======`、`>>>>>>>`、`|||||||` 冲突标记行。
+1. 取 store 跨进程写锁并全程持有，然后进入循环：递归扫描 store 下所有 `*.jsonl`（`hidden(false)`：隐藏文件也会扫描；store 是 git 仓库时 `.gitignore` 过滤生效）；只处理包含 `<<<<<<<` 字节的文件。
+2. **按字节**读入文件（不要求合法 UTF-8），去掉**精确形态**的冲突标记：`=======` 必须整行恰好是七个 `=`；`<<<<<<<` / `|||||||` / `>>>>>>>` 之后只能是行尾或一个空格（可带 label）。以标记前缀开头的普通数据行不算标记、会被保留。
 3. 按文件内容识别记录类型（`Event` / `FileRecord` / 其他 JSON / 无法识别），分别处理：
    - 合法记录按去重键（`event_id` / `file_id`）去重，**后出现者胜出**；
-   - 事件记录按时间戳解析后排序（兼容旧格式），时间戳相同再用 `event_id` 排序；文件记录按 `file_id` 排序；其他合法 JSON 记录按 `ts`（若有）再去重键排序；
-   - **无法解析为对应记录类型的行逐字保留**（含原始前后空白），放到文件末尾；完全相同的保留行去重；
+   - 事件记录按时间戳解析后排序（兼容旧格式），时间戳相同再用 `event_id` 排序；其他合法 JSON 记录按 `ts`（若有）再去重键排序；**`FileRecord` 不重排**，只保留每个键最后一次出现的位置（保持因果顺序，避免旧状态覆盖 `files.jsonl` 的 last-write-wins）；
+   - **无法解析为对应记录类型的行逐字节保留**（含原始前后空白、CRLF、非 UTF-8 字节），放到文件末尾；完全相同的保留行去重；
    - 合法记录**原样重发原始行文本**，因此未知字段、字段顺序、格式都不会丢失。
-4. 写回解析后的文件（持排他锁）。
+4. 写回解析后的文件（额外持排他文件锁）。
 5. store 根存在 `.git` 时，对每个被改写的文件执行 `git add -- <相对路径>`。
-6. 只有当 `.git/rebase-merge` 或 `.git/rebase-apply` 存在（确实有 rebase 在进行）时，才执行 `git rebase --continue`（用 `GIT_EDITOR=true` 避免编辑器阻塞）。检测不依赖 git 的本地化错误文本。
+6. 若 `.git/rebase-merge` 或 `.git/rebase-apply` 存在（确实有 rebase 在进行），执行 `git rebase --continue`（用 `GIT_EDITOR=true` 避免编辑器阻塞），然后回到第 1 步继续下一轮；一次调用最多循环 100 轮，多提交 rebase 也能一次推进完。检测不依赖 git 的本地化错误文本。
 
 **真实输出（非 git 目录中的手工冲突文件：含 1 条无法解析的截断行）**
 
@@ -830,10 +826,10 @@ Conflict Resolution Report:
     • /path/to/store-b/projects/demo/files.jsonl
 
 $ mem --path ./store-b sync
-Checking Git repository status at: /path/to/store-b
-Repository working directory is clean.
-Pulling remote changes with rebase...
-Pushing changes to remote...
+Synchronizing memory store at: /path/to/store-b
+  • Working directory clean
+  • Pulled remote changes with rebase
+  • Pushed to remote successfully
 ✅ Sync successful: repository is up-to-date and pushed to remote.
 ```
 
@@ -841,10 +837,10 @@ Pushing changes to remote...
 
 **注意事项**
 
-- `resolve` 只处理 `.jsonl` 文件。**非 JSONL 的冲突不会处理**，例如 `projects/<p>/meta.json`（两台设备同时为同一新项目写入元数据时可能冲突）；这类冲突必须先手工解决并 `git add`。若步骤 6 的 `git rebase --continue` 因这些文件失败，命令会打印一条可操作的错误，列出仍未解决的路径，并提示 `git add <file>` 后重试；故障排查参见 [TROUBLESHOOTING.md](TROUBLESHOOTING.md)。
+- `resolve` 只处理 `.jsonl` 文件。**非 JSONL 的冲突不会处理**，例如 `projects/<p>/meta.json`（两台设备同时为同一新项目写入元数据时可能冲突）；这类冲突必须先手工解决并 `git add`。若循环中的 `git rebase --continue` 因这些文件失败，命令会打印一条可操作的错误，列出非 JSONL 文件和所有仍未解决的路径，并提示 `git add <file>` 后重试；故障排查参见 [TROUBLESHOOTING.md](TROUBLESHOOTING.md)。
 - 不在 git 仓库中也能运行：只是清理冲突标记，不会 `git add`、不会继续 rebase。
 - `Files updated` 中显示的是绝对路径。
-- 保留行永远不会被静默丢弃；历史合法记录也不会被重写（除冲突标记、去重与排序外，行文本保持原样）。
+- 保留行（含非 UTF-8 字节与 CRLF）永远不会被静默丢弃；历史合法记录也不会被重写（除冲突标记、去重与排序外，行文本保持原样）。
 - 去重是「后出现者胜出」：rebase 场景中通常意味着 `theirs` 分支的记录覆盖 `ours` 中同 ID 的记录。
 
 ### 3.8 render
@@ -870,7 +866,8 @@ mem render [OPTIONS] --project <PROJECT>
 1. 读取 `projects/<project>/meta.json`；**读取失败时**使用内存中的兜底元数据（`name` = 项目名、`description` = `"Project <name>"`、`github_url` = null、`created_at` = 当前时间），**不会写回 `meta.json`**；
 2. 取该项目每个 `file_name` 的最新记录生成文件表；
 3. 取该项目最近 10 条事件生成时间线（最新在前）；
-4. 用排他锁写 `projects/<project>/README.md`（目录不存在则创建），每次覆盖。
+4. 所有插值先转义：`|` → `\|`，CR/LF 折叠为空格（防止记录的数据破坏表格/时间线结构或注入内容）；
+5. 用排他锁写 `projects/<project>/README.md`（目录不存在则创建），每次覆盖。
 
 生成的 README 结构：
 
@@ -972,6 +969,7 @@ ghost                    0        -                                -
 - `render` 是纯生成操作：每次覆盖 `projects/<project>/README.md`，不会修改 `files.jsonl` / `meta.json` / `events/`。
 - `meta.json` 缺失时只影响本次渲染，不会补写；之后任意一次 `mem add`（或 MCP 的 `mem_add_event`）才会自动补 `meta.json`，`list` 的 `CREATED AT` / `DESCRIPTION` 也才会从 `-` 变成真实值。
 - 空 hash 在表格中渲染为两个反引号（`` `` ），这是当前格式的真实输出。
+- 文件表与时间线中的所有插值都会转义：文件名/动作/hash/时间戳/agent/device/summary 里的 `|` 写成 `\|`，换行折叠为空格。
 - 时间线最多 10 条，按时间升序读取后反转为最新在前。
 
 ## 4. 环境变量
@@ -983,6 +981,7 @@ ghost                    0        -                                -
 | `PATH` | `sync` / `resolve` | 需要能找到 `git` 可执行文件 |
 | git 相关变量（`GIT_AUTHOR_NAME`、`GIT_COMMITTER_*`、`GIT_EDITOR` 等） | git 提交行为 | `sync` 的提交、`resolve` 的 `rebase --continue` 都会继承环境；`resolve` 内部固定把 `GIT_EDITOR` 设为 `true` |
 | `LC_ALL` / `LANG` | 报错语言 | git 子进程的 stderr 本地化；示例使用 `LC_ALL=C` 以得到英文错误 |
+| `XDG_RUNTIME_DIR` | store 写锁位置 | store 跨进程写锁的锁文件目录；未设置或不可用时退回系统临时目录（锁文件不进入 Git 仓库） |
 
 `ACDM_STORE` 示例（真实输出）：
 
@@ -1035,7 +1034,7 @@ mem --path ./memory add -p ACDM -s "change on A" -d laptop-a -a claude src/index
 mem --path ./memory sync
 
 # 常见冲突处理（见 5.3）
-mem --path ./memory sync        # 若 stderr 提示冲突
+mem --path ./memory sync        # 冲突时退出码为 1
 mem --path ./memory resolve
 mem --path ./memory sync
 ```
@@ -1082,7 +1081,7 @@ mem --path ~/acdm-memory render -p my-project
 
 ### 5.5 脚本调用
 
-- 用退出码判断结果：`0` 成功；`1` 运行时错误；`2` 参数错误。注意 `sync` 冲突时也返回 0（需要额外检查）。
+- 用退出码判断结果：`0` 成功；`1` 运行时错误；`2` 参数错误。`sync` 冲突时返回 1，可直接据此进入 `mem resolve` 流程。
 - 命令输出面向人类阅读，**没有 `--json` 之类的机器可读输出模式**；脚本若需结构化数据，建议直接读 store 内的 `events/*.jsonl` 与 `projects/<p>/files.jsonl`（格式见 [README.md](../../README.zh-CN.md#数据结构)）。
 - 错误信息走 stderr，正常结果走 stdout；解析时分开处理（例如 `query --fuzzy` 非法正则会先输出 stdout 标题再在 stderr 报错）。
 

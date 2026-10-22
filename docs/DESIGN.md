@@ -60,15 +60,16 @@ Costs (accepted and documented):
 
 ### 3.1 Single-writer lock
 
-On one machine, `append_event`, the overwrite writes of `meta.json` / `README.md`, and the `resolve` write-back all hold an `fs2` exclusive lock (advisory lock). This guarantees that **multiple processes on the same machine** (CLI and MCP active at the same time) do not truncate each other's appends.
+On one machine, every write operation — event append, projection rebuild (`compact`), conflict resolution, `sync`, and the overwrite writes of `meta.json` / `README.md` — takes a **store-wide cross-process advisory lock** (`fs2`). The lock file is derived from a hash of the canonical store path and kept in `$XDG_RUNTIME_DIR` (or the system temp directory), so it never pollutes the synchronized Git repository. One lock held across a whole multi-file operation removes the interleaving windows that per-file locks cannot cover: an append cannot slip into the middle of a projection rebuild, a rebase, or a conflict resolution.
 
-The lock only works on the local machine: it is not a distributed lock; cross-device writes converge through conflict resolution after Git sync.
+The lock only works on the local machine: it is not a distributed lock; cross-device writes converge through conflict resolution after Git sync. Reads take no lock at all.
 
 ### 3.2 Weak consistency across devices
 
 - Each device has its own local store copy, **strongly isolated until sync**;
 - Only after `mem sync` (commit → pull --rebase → push) succeeds do the devices reach agreement;
 - At any moment two devices may see different histories; this is deliberately accepted weak consistency.
+- Sync fails loudly instead of faking success: a non-conflict pull failure aborts the sync (no push over an inconsistent state), and a conflict ends the CLI command with a non-zero exit code (MCP: an `isError` result) that tells the caller to run conflict resolution. A machine without an upstream simply skips the pull and tries to push.
 
 ### 3.3 Scope of last-write-wins
 
@@ -102,9 +103,9 @@ YYYYMMDDHHMMSS_<nanos:09>_<pid%100000:05>_<counter%10000:04>
 | Time precision | Nanoseconds | Same-second bursts are distinguishable; the probability of two devices hitting the same nanosecond is also extremely low |
 | Fixed width | 14 / 9 / 5 / 4 | Lexicographic order = chronological order (under the same prefix), convenient for sorting, comparing, and human reading |
 | pid | `process::id() % 100_000` | Distinguishes different processes on the same machine |
-| Counter | In-process `AtomicU64 % 10_000` | Deduplicates same-nanosecond bursts within one process |
+| Counter | Per-process counter seeded from the process start time + pid, `% 10_000` | Deduplicates same-nanosecond bursts within one process without starting every process at zero |
 
-Choosing a "sortable composite ID" instead of UUID v4: UUIDs are random, unreadable, and unsortable; ACDM needs "time-ordered + printable + no extra dependencies". The cost is dependence on the device clock and pid semantics (see 4.3).
+Choosing a "sortable composite ID" instead of UUID v4: UUIDs are random, unreadable, and unsortable; ACDM needs "time-ordered + printable + no extra dependencies". The cost is dependence on the device clock and pid semantics (see 4.3). Starting the counter from a time+pid-derived random offset (0.1.1) keeps the format while making it much less likely that two container processes with the same pid mint the same ID in the same nanosecond.
 
 ### 4.2 Flaws of the old format (why it had to change)
 
@@ -145,7 +146,7 @@ Therefore `file_name` must be a path **relative to a stable anchor**, uniformly 
 | 3 | CWD | Fallback: the file is neither in the store nor in a git repository, but relative to the current directory it is at least more likely to be consistent than an absolute path |
 | 4 | absolute path | Last resort. The CLI prints a warning: such records cannot be matched on other devices |
 
-The implementation does not require the file to exist (pure lexical resolution), so records for "already deleted" files also get a consistent identity; symlinks are not resolved and are judged by their literal path.
+The implementation does not require the file to exist: it canonicalizes the longest on-disk-existing prefix (following symbolic links) and appends the missing tail lexically. Both the store root and the file side are canonicalized the same way, so a store or file reached through a symlink (`/tmp` on some systems, macOS `/var` → `/private/var`, a symlinked project directory) yields the same relative identity as its real path — an absolute-path fallback caused by mismatched symlink forms was itself a cross-device identity bug fixed in 0.1.1.
 
 ### 5.3 Assumptions and boundaries
 
@@ -175,10 +176,13 @@ These lines cannot be fully understood by the current version, but they may be *
 | Case | Handling | Rationale |
 | --- | --- | --- |
 | Cannot be parsed as the current record type | Preserved verbatim (including whitespace), appended to the end of the file | Better to leave one unintelligible line in the file than to delete user data |
+| Invalid UTF-8 bytes | Preserved byte-for-byte | "Never silently drop data" has to hold for arbitrary bytes, not only for valid text |
 | Unknown fields | Preserved as-is (re-emit the original line text rather than re-serialize it) | Forward compatibility: fields written by a new version are not lost after an old version merges them |
 | Unparseable lines with identical content | Collapsed into one | Avoids duplicate growth of identical truncated lines from both sides; lines with different content are not collapsed |
 | Multiple lines with the same `event_id` / `file_id` | Later write wins (keep the last one) | Events/records are atomic; the same ID means the same record, so take the later side |
 | Conflict marker lines | Discarded | They are Git metadata, not data |
+
+Marker recognition is deliberately narrow: only the exact shapes Git writes are removed (`=======` as the whole line; `<<<<<<<` / `|||||||` / `>>>>>>>` followed by end-of-line or a space). A truncated JSON line such as `======= broken line` is *data* and must be preserved; matching a broad prefix would silently delete it.
 
 The boundary between "preserve" and "later write wins" is clear: **different IDs → preserve all; same ID → keep only one**.
 
@@ -191,20 +195,25 @@ Inserting them back into their original positions could break the continuity of 
 After conflict merging, line order may come from interleaved appends on both sides. To make the result deterministic and repeatable (same input → same output), the resolver:
 
 - `Event` / `Generic`: sorts by parsed time + key;
-- `FileRecord`: sorts by `file_id`;
+- `FileRecord`: **keeps the original causal order**, retaining only the last occurrence of each `file_id` at its original position;
 - `Unknown`: not sorted (only the original relative order is kept).
 
-Normal syncs produce few conflicts anyway; normalized ordering makes "the same input always yield the same output", which simplifies review and testing.
+Re-sorting `FileRecord`s by `file_id` (the pre-0.1.1 behavior) scrambled history: because `get_latest_files` / `compact` apply last-write-wins in file order, a lexicographically larger but older record could be picked as the "latest" state. Keeping causal order is what makes the projection semantics sound.
+
+Normal syncs produce few conflicts anyway; normalized ordering for events makes "the same input always yield the same output", which simplifies review and testing.
 
 ### 6.4 Deciding whether to continue the rebase
 
 The old implementation detected "is a rebase in progress" by matching the English error text of `git rebase --continue`, which turned a normal path into a hard failure under non-English locales. Now it only checks whether Git's state directories (`.git/rebase-merge` / `.git/rebase-apply`) exist — a language-independent source of truth: if they are there, a rebase is in progress; if not, there is none.
 
+A rebase that replays several conflicting commits needs one resolve → `git add` → `git rebase --continue` round per commit. `mem resolve` loops those rounds itself (bounded at 100), using Git's unmerged-file list to decide whether it can still make progress; it stops with a precise error only when a **non-JSONL** file is conflicted, because such a file genuinely needs a human.
+
 ### 6.5 Costs
 
 - Not a field-level merge: when the same event differs on both sides, the whole "theirs" entry wins and the "ours" content is discarded (only one is kept);
-- Output order may differ from the original append order;
+- Output order may differ from the original append order (except for `FileRecord`s, whose causal order is preserved);
 - Unparseable lines are concentrated at the end, which human reviewers need to know;
+- Unparseable content can be preserved but not interpreted — resolution cannot merge it, only keep it;
 - Resolving conflicts requires an explicit `mem resolve`; it is not fully automatic (to avoid silently changing data while unattended).
 
 ## 7. Security and privacy boundaries
@@ -224,6 +233,7 @@ The old implementation detected "is a rebase in progress" by matching the Englis
 
 - Before syncing to a public repository, review the contents of `events/` and `projects/`: paths and summaries may reveal private project structure;
 - `mem sync` runs `git add -A` against the store root, **so any file in the store directory will be committed**. Make sure the store directory holds only ACDM data; do not put project source code, `.env`, keys, etc. under the store root;
+- Project names supplied by an agent are validated as one safe path component (no separators, no `.`/`..`, no control characters, ≤200 bytes). This is a security boundary, not cosmetics: without it a `project` argument like `../x` would write `meta.json` / `README.md` outside `projects/` (fixed in 0.1.1);
 - Git history is immutable: even if a record is later deleted/overwritten, it may remain in historical commits. If you want to publish, prefer creating a fresh clean store and recording again rather than cleaning up the old repository;
 - SHA256 does not "leak contents", but it can be used to fingerprint known content; for strongly confidential scenarios, treat even hashes and sizes as sensitive information;
 - ACDM itself has no authentication/encryption: `mem-mcp` runs as the local user over stdio; the store is stored in plaintext on disk; transport security depends on the Git remote protocol (SSH/HTTPS).
@@ -240,18 +250,21 @@ The old implementation detected "is a rebase in progress" by matching the Englis
 | Limitation | Current state | Impact | Mitigation/future |
 | --- | --- | --- | --- |
 | Index rebuilt O(N) every time | Every `query` / `mem_query` scans all events | Queries become slower as the event count grows | Incremental/persistent index in the future |
-| No fsync | `append_event` only `flush`es | Power loss may lose the last append | Accepted; Git commits provide another layer of durability |
-| Single-writer recommendation | flock on the same machine, no cross-device locks | Concurrent writes to the same store from multiple devices must converge via sync | Convention: "write locally, sync periodically" |
-| No multi-writer transactions | Two separate appends to `events/` and `files.jsonl` | A crash may leave them briefly inconsistent | events is the source of truth; the files view can be rebuilt by script |
-| `compact` vs concurrent writes | tmp + rename atomic replacement | Records appended concurrently during compaction may be overwritten | Run `compact` manually only when there are no writes |
-| Large files read byte by byte | The CLI reads the whole file to compute SHA256 | Memory usage O(file size) | The MCP caller can supply hash/size; very large files do not belong in memory |
-| Non-UTF-8 paths / content | Paths go through `to_string_lossy`; `resolve` requires UTF-8 files | Identity may be lossy; resolve will fail | Avoid non-UTF-8 names in the store |
+| No fsync on append | `append_event` only `flush`es (the projection rebuild does `sync_all` its temp file) | Power loss may lose the last append | Accepted; Git commits provide another layer of durability |
+| Single-writer scope | A store-wide advisory lock serializes writers on **one machine**; no cross-device lock | Concurrent writes to the same store from multiple devices must converge via sync | Convention: "write locally, sync periodically" |
+| No multi-writer transactions | `events/` and `files.jsonl` are two separate appends | A crash may leave the projection briefly stale | `events/` is the source of truth; `mem compact` rebuilds the projection (self-healing) |
+| `compact` and concurrent appends | Holds the store-wide write lock for read → replay → rename | Concurrent appends on the same machine wait instead of being lost | Cross-device concurrency still needs sync; run `compact` as periodic maintenance |
+| Large files | `mem add` streams SHA-256 in 64 KiB chunks; the read path still loads a whole shard with `fs::read` | Write memory is bounded; query memory peaks around the largest shard | Month sharding bounds shard size; MCP callers supply size/hash themselves |
+| Non-UTF-8 content | `resolve` is byte-level and preserves invalid UTF-8 and CRLF verbatim | Such lines are kept but cannot be interpreted as records | Keep the store UTF-8 when possible; non-UTF-8 data is no longer a failure |
+| Non-UTF-8 paths | Paths go through `to_string_lossy` | Identity may be lossy | Avoid non-UTF-8 file names in the store |
 | No content storage | Only metadata is stored | File contents cannot be replayed from the store | File contents remain managed by Git/the project repository |
 | Events are append-only, never deleted | No archival mechanism | The Git repository grows over time | Archival/snapshots in the future |
 | Time order ≈ real order | Depends on device clocks | Clock skew is reflected in ordering | NTP assumption; `event_id` tie-break |
-| Regex search | `--fuzzy` is Rust regex | Not tokenized/semantic search; a bad regex reports an error | Extend as needed |
+| Regex search | `--fuzzy` is Rust regex with a 10 MiB compiled-program cap | Not tokenized/semantic search; a bad or oversized pattern reports an error | Extend as needed |
+| No `git pull --autostash` | Sync commits first and holds the store write lock, so the tree is clean before the pull | A dirty tree is never silently stashed | This is deliberate: a stash-pop conflict in the middle of a rebase is very hard to recover from |
+| Project names are restricted | One safe path component (no `/`, `\`, `.`/`..`, control characters; ≤200 bytes) | A project cannot be named like a path | Security boundary against directory traversal by agent-supplied arguments |
 | No authentication/encryption | Plaintext store + stdio MCP | The security boundary lies in the OS and Git layers | Private remote + external schemes such as git-crypt |
-| Symlinks not resolved | Lexical paths | Changes to the link target are not reflected in the identity | Avoid organizing recorded files with symlinks |
+| Symlinks are canonicalized only for existing paths | Existing prefixes are resolved, missing tails are lexical | A symlink created later can change the identity of a not-yet-existing path | Create/record files before linking them; avoid reorganizing store paths with symlinks |
 
 ## 9. Future work
 

@@ -4,7 +4,7 @@
 
 > 读者：要把 ACDM 接入 Claude Desktop、Cursor 或自研 MCP 客户端的开发者。本文覆盖 `mem-mcp` 的启动方式、stdio 上的 JSON-RPC 2.0 会话、8 个工具的参数/返回/边界行为和错误码；CLI 侧参考见 [CLI.md](CLI.md)，整体设计见 [ARCHITECTURE.md](ARCHITECTURE.md) 与 [DESIGN.md](DESIGN.md)。
 
-本文以 `mem-mcp/src/main.rs` 中 `tools/list` 返回的 `inputSchema` 与各 handler 的实际行为为**唯一权威**。文中所有报文与返回文本都在 v0.1.0 的实际二进制上通过管道喂 stdin 实测得到；为可读性，示例中的本机绝对路径替换为 `/path/to/...` 占位符，事件 ID、时间戳、hash 保持原样。实际响应是**单行 JSON**；文中保留原始单行报文的示例直接引用实测输出，少数结构示意（如 `tools/list` 的树形展开）会明确标注为示意。
+本文以 `mem-mcp/src/main.rs` 中 `tools/list` 返回的 `inputSchema` 与各 handler 的实际行为为**唯一权威**。文中报文与返回文本都在 v0.1.0 / v0.1.1 的实际二进制上通过管道喂 stdin 实测得到（0.1.1 行为变更处以 0.1.1 重新实测）；为可读性，示例中的本机绝对路径替换为 `/path/to/...` 占位符，事件 ID、时间戳、hash 保持原样。实际响应是**单行 JSON**；文中保留原始单行报文的示例直接引用实测输出，少数结构示意（如 `tools/list` 的树形展开）会明确标注为示意。
 
 ## 目录
 
@@ -42,7 +42,9 @@
 关键事实：
 
 - **传输层**：stdio 上的**换行分隔 JSON-RPC 2.0**。stdin 每行一个 JSON 对象；stdout 每行一个响应对象。不是 LSP 那种 `Content-Length` 分帧。
-- **协议版本**：`initialize` 固定返回 `protocolVersion: "2024-11-05"`，`serverInfo` 为 `{"name":"mem-mcp","version":"0.1.0"}`。
+- **单行上限**：一行请求最多 16 MiB；超限行被丢弃（保持输入流同步）并返回 `-32600`，server 继续服务。
+- **错误分两类**：协议问题返回 JSON-RPC error（`-32700` / `-32600` / `-32601` / `-32602`）；工具级业务失败返回**成功响应 + `result.isError = true`** 与可读的错误文本，Agent 可据此自我纠正并重试（见 [5. 错误码与语义](#5-错误码与语义)）。
+- **协议版本**：`initialize` 固定返回 `protocolVersion: "2024-11-05"`，`serverInfo` 为 `{"name":"mem-mcp","version":"0.1.1"}`。
 - **能力**：只声明 `capabilities.tools = {}`；没有 resources、prompts、logging、sampling 等能力。
 - **单线程串行**：主循环逐行读取 stdin，同步处理完一个请求、写回一个响应并 flush 后才读下一行；没有并发处理。
 - **启动即初始化 store**：启动时按与 CLI 相同的规则定位 store，并调用 `MemStore::init()`——目录结构或 `.mem` 缺失时自动创建（等价于 `mem init`）。
@@ -159,6 +161,7 @@ mem-mcp: unrecognized argument "--help"; usage: mem-mcp [--path <store-root>]
 - 响应中的 `id` 原样回显请求的 `id`（`null` 仅用于无法解析出请求对象的 Parse error）。
 - **没有 `id` 的报文按通知处理，不会产生响应，也不会执行该方法**（方法名以 `notifications/` 开头或等于 `initialized` 的报文在更早处就被静默丢弃）。
 - **不支持 JSON-RPC batch 数组**：整行必须是一个请求对象，数组会作为解析错误返回 `-32700`。
+- **单行请求上限 16 MiB**：超限行会被完整丢弃（含换行，保持后续输入流同步），服务器返回 `-32600` 并继续处理下一行。
 - 标准输入输出是协议通道：stdout 只写 JSON-RPC 响应；诊断信息写 stderr。
 
 ### 3.2 initialize
@@ -168,13 +171,13 @@ mem-mcp: unrecognized argument "--help"; usage: mem-mcp [--path <store-root>]
 请求（真实报文）：
 
 ```json
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"docs-client","version":"0.1.0"}}}
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"docs-client","version":"0.1.1"}}}
 ```
 
 响应（真实报文）：
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"tools":{}},"protocolVersion":"2024-11-05","serverInfo":{"name":"mem-mcp","version":"0.1.0"}}}
+{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"tools":{}},"protocolVersion":"2024-11-05","serverInfo":{"name":"mem-mcp","version":"0.1.1"}}}
 ```
 
 ### 3.3 notifications/initialized
@@ -183,12 +186,12 @@ mem-mcp: unrecognized argument "--help"; usage: mem-mcp [--path <store-root>]
 
 ```text
 # stdin（3 行）
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"docs-client","version":"0.1.0"}}}
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"docs-client","version":"0.1.1"}}}
 {"jsonrpc":"2.0","method":"notifications/initialized"}
 {"jsonrpc":"2.0","id":2,"method":"ping"}
 
 # stdout（2 行）
-{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"tools":{}},"protocolVersion":"2024-11-05","serverInfo":{"name":"mem-mcp","version":"0.1.0"}}}
+{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"tools":{}},"protocolVersion":"2024-11-05","serverInfo":{"name":"mem-mcp","version":"0.1.1"}}}
 {"jsonrpc":"2.0","id":2,"result":{}}
 ```
 
@@ -240,7 +243,8 @@ mem-mcp: unrecognized argument "--help"; usage: mem-mcp [--path <store-root>]
 
 - `params.name` 必填（字符串），`params.arguments` 可省略（省略时按 `{}` 处理）。
 - 成功响应形如 `{"jsonrpc":"2.0","id":20,"result":{"content":[{"text":"...","type":"text"}]}}`：`result.content` 是内容数组，当前每个工具只返回**一个** `text` 项。
-- 工具执行失败走 JSON-RPC `error`（不是 MCP 的 `result.isError` 字段）：`{"jsonrpc":"2.0","id":20,"error":{"code":-32603,"message":"..."}}`。
+- **工具参数不合法**（缺必填字段、类型错、`action` 不是三个枚举值之一等）→ JSON-RPC `error` `-32602`：`{"jsonrpc":"2.0","id":20,"error":{"code":-32602,"message":"Invalid arguments for <tool>: ..."}}`。
+- **工具执行期业务失败**（git 冲突、非法查询维度、不安全项目名、正则错误、同步失败等）→ **成功响应 + `result.isError = true`**：`{"jsonrpc":"2.0","id":20,"result":{"content":[{"type":"text","text":"..."}],"isError":true}}`，Agent 可读取错误文本后自我纠正。
 - 未知工具返回 `-32601`，且不会终止 server。
 
 真实示例（`mem_render`）：
@@ -386,7 +390,7 @@ Project demo
 | `agent` | string | 否 | `mcp-agent` | 记录者名称；空白字符串回退默认值 |
 | `files` | array | 否 | `[]` | 受影响的文件列表；省略表示本次事件没有文件变更 |
 | `files[].file_name` | string | **是** | — | 文件路径；**绝对路径会被规范化**为 store / git 仓库 / CWD 相对路径 |
-| `files[].action` | string | 否 | `Modified` | schema 声明枚举 `Created` / `Modified` / `Deleted`，但 handler **不做枚举校验** |
+| `files[].action` | string | 否 | `Modified` | 只接受 `Created` / `Modified` / `Deleted`（大小写敏感）；其它值返回 `-32602` |
 | `files[].size_bytes` | integer | 否 | `0` | 文件字节数 |
 | `files[].hash` | string | 否 | `""` | 调用方提供的 SHA256 十六进制摘要；服务端**不计算也不校验** |
 
@@ -453,9 +457,10 @@ Project demo
 - `project` 第一次被记录时，若 `projects/<project>/meta.json` 不存在，会**自动写入**最小元数据（`description` = `"Project <name>"`、`github_url` = null、`created_at` = 事件时间），与 CLI `add` 一致。
 - `files` 省略或为空数组时事件仍会写入（`recorded with 0 files`），且不会追加 `files.jsonl` 记录。
 - `file_name` 规范化规则与 CLI 相同：相对 store 根 → 相对 git 仓库根 → 相对 CWD → 绝对路径（MCP 侧**不会**像 CLI 那样打印绝对路径警告）。
-- `action` 不做枚举校验：传 `"Renamed"` 等任意字符串会原样写入 `files.jsonl`；`size_bytes` / `hash` 同样透传，不校验文件是否存在。
+- `action` 只接受 `Created` / `Modified` / `Deleted`（缺省 `Modified`）；传 `"Renamed"` 等其它值会返回 `-32602`（`Invalid arguments for mem_add_event: unknown variant ...`）；`size_bytes` / `hash` 仍然透传，不校验文件是否存在。
 - 事件 ID 由服务端生成（`YYYYMMDDHHMMSS_nanos9_pid5_counter4`，UTC）；`ts` 为固定宽度 UTC 纳秒。
-- 失败示例：缺 `project` / `summary` 时返回 `-32603`，message 形如 `Invalid arguments for mem_add_event: missing field \`project\``。
+- `project` 必须是单一安全路径组件（同 CLI 校验）；非法值（如 `../evil`）在写入前被拒绝，返回 `isError` 结果：`Failed to append event: invalid project name "../evil": ...`。
+- 参数错误示例：缺 `project` / `summary` 返回 `-32602`（`Invalid arguments for mem_add_event: missing field \`project\``）；`action` 非法同样返回 `-32602`。
 
 ### 4.3 mem_query
 
@@ -501,8 +506,8 @@ Project demo
   - file_id → `No event found for file_id '<value>'.`
   - filename → `No events found for filename '<value>'.`
   - fuzzy → `No events matched pattern '<value>'.`
-- `by` 非法 → `-32603`，message：`Invalid query dimension 'by': '<值>'. Allowed values: 'project', 'file_id', 'filename', 'fuzzy'.`
-- `fuzzy` 正则非法 → `-32603`，message：`Fuzzy search failed: regex parse error: ...`
+- `by` 非法 → **业务失败**（`isError`），文本：`Invalid query dimension 'by': '<值>'. Allowed values: 'project', 'file_id', 'filename', 'fuzzy'.`
+- `fuzzy` 正则非法 → **业务失败**（`isError`），文本：`Fuzzy search failed: regex parse error: ...`；正则编译程序上限 10 MiB，超限时文本为 `Fuzzy search failed: Compiled regex exceeds size limit of 10485760 bytes.`
 
 **真实返回文本（by=project）**
 
@@ -581,8 +586,8 @@ Files:
 **真实错误返回（by 非法 / fuzzy 正则非法）**
 
 ```json
-{"jsonrpc":"2.0","id":10,"error":{"code":-32603,"message":"Invalid query dimension 'by': 'commit'. Allowed values: 'project', 'file_id', 'filename', 'fuzzy'."}}
-{"jsonrpc":"2.0","id":5,"error":{"code":-32603,"message":"Fuzzy search failed: regex parse error:\n    [\n    ^\nerror: unclosed character class"}}
+{"jsonrpc":"2.0","id":10,"result":{"content":[{"text":"Invalid query dimension 'by': 'commit'. Allowed values: 'project', 'file_id', 'filename', 'fuzzy'.","type":"text"}],"isError":true}}
+{"jsonrpc":"2.0","id":5,"result":{"content":[{"text":"Fuzzy search failed: regex parse error:\n    [\n    ^\nerror: unclosed character class","type":"text"}],"isError":true}}
 ```
 
 **边界行为**
@@ -591,7 +596,7 @@ Files:
 - `by=filename` 只匹配**规范化后的相对 `file_name`**；绝对路径记录查不到。
 - `by=fuzzy` 是对事件原始 JSONL 行做 Rust `regex` 匹配（不是全文分词），命中的行必须能反序列化为 `Event`。
 - 与 CLI `query` 一样，每次调用都重建内存索引；没有分页参数，返回全部命中。
-- 多余的参数字段会被忽略；`by` / `value` 缺失走 `-32603`（`Invalid arguments for mem_query: missing field ...`）。
+- 多余的参数字段会被忽略；`by` / `value` 缺失走 `-32602`（`Invalid arguments for mem_query: missing field ...`），`by` 值不在枚举内则是 `isError` 业务失败。
 
 ### 4.4 mem_list_projects
 
@@ -625,7 +630,7 @@ Projects in memory store (<N>):
 
 ### 4.5 mem_compact
 
-压缩项目 `files.jsonl`：每个 `file_name` 只保留最新一条记录。
+从事件日志重建项目 `files.jsonl` 投影：每个 `file_name` 只保留最新一条记录，并修复缺失/截断的投影。
 
 **参数**
 
@@ -656,11 +661,11 @@ Projects in memory store (<N>):
 {"jsonrpc":"2.0","id":28,"result":{"content":[{"text":"Compacted project 'demo': before: 2 records, after: 2 records (reduced by 0 duplicate/old records).","type":"text"}]}}
 ```
 
-**边界行为**：与 CLI `compact` 同一实现（临时文件 + 原子 rename）；项目文件不存在时返回 0/0/0；失败时 `-32603`，message 形如 `Compaction failed for project '<p>': ...`。
+**边界行为**：与 CLI `compact` 同一实现（持 store 写锁从事件日志重放，临时文件 + 原子 rename）；项目既无投影又无事件时返回 0/0/0；失败（如项目名非法）返回 `isError`，文本形如 `Compaction failed for project '<p>': ...`。
 
 ### 4.6 mem_sync
 
-把 store 同步到远端 git 仓库：工作区有改动则提交 → `git pull --rebase --autostash` → `git push`。
+把 store 同步到远端 git 仓库（与 CLI `mem sync` 共用 `sync_store`）：全程持 store 写锁 → 工作区有改动则提交 → 有 upstream 时 `git pull --rebase`（无 autostash）→ `git push`。无 upstream 时跳过 pull；非冲突的 pull 失败会中止同步；冲突以 `isError` 返回。
 
 **参数**
 
@@ -682,7 +687,7 @@ Projects in memory store (<N>):
 **返回文本格式**：`Sync completed successfully: <step1>; <step2>; ...`，步骤可能包括：
 
 - `Working directory clean` 或 `Committed local changes ("<message>")`
-- `Pulled remote changes with rebase` 或 `pull note: <git 错误>`
+- `Pulled remote changes with rebase` 或 `No upstream configured; skipped pull`
 - `Pushed to remote successfully`
 
 **真实返回文本**
@@ -696,13 +701,14 @@ Projects in memory store (<N>):
 
 **边界行为**
 
-- store 不是 git 仓库或 `git` 不可用 → `-32603`，message：`Git status check failed: git command 'git status --porcelain' failed: ...`（真实例，`LC_ALL=C`）：
+- store 不是 git 仓库或 `git` 不可用 → `isError`，文本：`Sync failed: git command 'git status --porcelain' failed: ... Check the git remote/upstream configuration, then run mem_sync again.`（真实例，`LC_ALL=C`）：
   ```json
-  {"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"Git status check failed: git command 'git status --porcelain' failed: fatal: not a git repository (or any parent up to mount point /)\nStopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set)."}}
+  {"jsonrpc":"2.0","id":1,"result":{"content":[{"text":"Sync failed: git command 'git status --porcelain' failed: fatal: not a git repository (or any parent up to mount point /)\nStopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).. Check the git remote/upstream configuration, then run mem_sync again.","type":"text"}],"isError":true}}
   ```
-- 拉取时发现冲突：**直接返回 `-32603` 错误**（与 CLI 的"退出码 0 + stderr 警告"不同），message 要求调用方改用 `mem_resolve`：`Git conflict detected during pull --rebase: <git 错误>. Please call the \`mem_resolve\` tool to automatically deduplicate and merge the JSONL records.`
-- 非冲突的 pull 失败（如没有 upstream、网络/认证问题）不中断：steps 里会出现 `pull note: ...`，随后继续 push；push 失败才返回 `-32603`（`git push failed: ...`）。
-- `git add -A` / `git commit` 失败分别返回 `-32603`，message 以 `git add -A failed:` / `git commit failed:` 开头。
+- 无 remote / 无 upstream：跳过 pull，push 失败 → `isError`，文本以 `Sync failed: git command 'git push' failed: fatal: No configured push destination.` 开头。
+- 拉取时发现冲突：返回 `isError`（对应 CLI 的非零退出码），文本为 `Sync stopped on a git conflict: ... Resolve the JSONL conflicts with the \`mem_resolve\` tool, then retry (run mem_resolve then retry mem_sync).`
+- 非冲突的 pull 失败现在**中止同步并返回 `isError`**（不再忽略错误继续 push）。
+- `git add -A` / `git commit` / `git push` 失败同样以 `Sync failed: ...` 的 `isError` 返回。
 - 前置条件同 CLI：需要 git 仓库、配置好 remote 与 upstream、配置 git 用户身份。
 - `message` 空白字符串会被过滤，回退默认消息。
 
@@ -731,9 +737,9 @@ Projects in memory store (<N>):
 
 **边界行为**
 
-- 与 CLI `resolve` 同一实现：去重（后出现者胜出）、按时间/ID 排序、不可解析行逐字保留、原始行文本原样重发（未知字段不丢）；存在 `.git` 时 `git add` 被改写文件；只有 rebase 确实在进行时才 `git rebase --continue`。
+- 与 CLI `resolve` 同一实现：只删除精确形态的冲突标记、按字节处理（非 UTF-8/CRLF 逐字保留）、去重（后出现者胜出，`FileRecord` 保持因果顺序）、不可解析行逐字保留、原始行文本原样重发（未知字段不丢）；存在 `.git` 时 `git add` 被改写文件；只在 rebase 确实在进行时才 `git rebase --continue`，并在一次调用内循环推进多提交 rebase（上限 100 轮）；全程持 store 写锁。
 - 没有冲突不是错误：返回全 0 的成功文本。
-- 只处理 `.jsonl`；`meta.json` 等非 JSONL 冲突不会被处理，可能使 `git rebase --continue` 失败 → 返回 `-32603`，message 以 `Conflict resolution failed:` 开头。此时需要人工解决该文件后再继续 rebase（见 [CLI.md](CLI.md#37-resolve) 与 [TROUBLESHOOTING.md](TROUBLESHOOTING.md)）。
+- 只处理 `.jsonl`；`meta.json` 等非 JSONL 冲突不会被处理，可能使 `git rebase --continue` 失败 → 返回 `isError`，文本以 `Conflict resolution failed:` 开头。此时需要人工解决该文件后再继续 rebase（见 [CLI.md](CLI.md#37-resolve) 与 [TROUBLESHOOTING.md](TROUBLESHOOTING.md)）。
 
 ### 4.8 mem_render
 
@@ -770,54 +776,53 @@ Projects in memory store (<N>):
 - 与 CLI `render` 同一实现：README 含元数据、最新文件表、最近 10 条事件时间线（最新在前），每次覆盖。
 - `meta.json` 缺失时使用内存兜底元数据（`description` = `Project <name>`、`created_at` = 当前时间），**不会写回** `meta.json`。
 - 项目没有任何文件/事件时也能成功，README 里显示 `_No files tracked yet._` / `_No events recorded yet._`。
-- 失败（如目录不可写）返回 `-32603`：`Failed to render README for project '<p>': ...`。
+- 失败（如目录不可写、项目名非法）返回 `isError`：`Failed to render README for project '<p>': ...`。
 
 ## 5. 错误码与语义
 
-| 错误码 | 触发场景 | 示例 message |
-| --- | --- | --- |
-| `-32700` | 整行无法解析为合法请求对象（含 JSON 语法错误、缺 `jsonrpc`/`method` 字段、batch 数组） | `Parse error: EOF while parsing a value at line 1 column 34` |
-| `-32601` | 未知方法；或 `tools/call` 的 `params.name` 不是 8 个工具之一 | `Method not found: no/such/method`；`Unknown tool: mem_does_not_exist` |
-| `-32602` | `tools/call` 的外层 `params` 无法反序列化：缺 `name`、缺 `params` 等 | `Missing parameters for tools/call`；`Invalid tool call parameters: missing field \`name\`` |
-| `-32603` | 工具执行期间的**所有**错误：handler 参数缺失/类型错误、业务失败、git 失败、正则错误等 | `Invalid arguments for mem_render: missing field \`project\``；`Invalid query dimension 'by': ...`；`Git status check failed: ...` |
+| 层 | 返回形式 | 触发场景 | 示例 message |
+| --- | --- | --- | --- |
+| 协议错误 | JSON-RPC `error` | `-32700`：整行无法解析为合法请求对象（JSON 语法错误、缺 `jsonrpc`/`method` 字段、batch 数组） | `Parse error: EOF while parsing a value at line 1 column 34` |
+| 协议错误 | JSON-RPC `error` | `-32600`：`jsonrpc` 不是 `"2.0"`；或单行请求超过 16 MiB | `Invalid Request: expected jsonrpc "2.0", got "1.0"`；`Invalid Request: request line exceeds 16777216 bytes` |
+| 协议错误 | JSON-RPC `error` | `-32601`：未知方法；或 `tools/call` 的 `params.name` 不是 8 个工具之一 | `Method not found: no/such/method`；`Unknown tool: mem_does_not_exist` |
+| 协议错误 | JSON-RPC `error` | `-32602`：`tools/call` 外层参数或工具参数无法反序列化（缺字段、类型错、`action` 非法） | `Missing parameters for tools/call`；`Invalid arguments for mem_render: missing field \`project\`` |
+| 业务失败 | 成功响应 + `result.isError = true` | 工具执行期错误：git 冲突、同步失败、非法查询维度、不安全项目名、正则错误等 | `Invalid query dimension 'by': ...`；`Failed to append event: invalid project name ...` |
+| （保留） | — | `-32603` 保留给真正的服务端故障 | 当前版本不会返回 |
 
 **真实错误报文**
 
 ```text
-// -32700：无法解析的输入（id 为 null）
-{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error: EOF while parsing a value at line 1 column 34"}}
+// -32700: unparseable input (id is null)
+{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error: key must be a string at line 1 column 2"}}
 
-// -32601：未知方法
-{"jsonrpc":"2.0","id":5,"error":{"code":-32601,"message":"Method not found: no/such/method"}}
+// -32600: wrong jsonrpc version
+{"jsonrpc":"2.0","id":3,"error":{"code":-32600,"message":"Invalid Request: expected jsonrpc \"2.0\", got \"1.0\""}}
 
-// -32601：未知工具
-{"jsonrpc":"2.0","id":6,"error":{"code":-32601,"message":"Unknown tool: mem_does_not_exist"}}
+// -32601: unknown tool
+{"jsonrpc":"2.0","id":7,"error":{"code":-32601,"message":"Unknown tool: nope"}}
 
-// -32602：tools/call 缺 params
-{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"Missing parameters for tools/call"}}
+// -32602: tool arguments missing a required field
+{"jsonrpc":"2.0","id":4,"error":{"code":-32602,"message":"Invalid arguments for mem_compact: missing field `project`"}}
 
-// -32602：tools/call 的 params 不合法
-{"jsonrpc":"2.0","id":8,"error":{"code":-32602,"message":"Invalid tool call parameters: missing field `name`"}}
+// -32602: invalid action enum value
+{"jsonrpc":"2.0","id":5,"error":{"code":-32602,"message":"Invalid arguments for mem_add_event: unknown variant `Renamed`, expected one of `Created`, `Modified`, `Deleted`"}}
 
-// -32603：handler 参数缺失
-{"jsonrpc":"2.0","id":9,"error":{"code":-32603,"message":"Invalid arguments for mem_render: missing field `project`"}}
-
-// -32603：业务失败（非法查询维度）
-{"jsonrpc":"2.0","id":10,"error":{"code":-32603,"message":"Invalid query dimension 'by': 'commit'. Allowed values: 'project', 'file_id', 'filename', 'fuzzy'."}}
+// business failure: successful JSON-RPC response with result.isError = true
+{"jsonrpc":"2.0","id":6,"result":{"content":[{"type":"text","text":"Invalid query dimension 'by': 'bogus'. Allowed values: 'project', 'file_id', 'filename', 'fuzzy'."}],"isError":true}}
 ```
 
 **语义要点**
 
-- **错误不会终止 server**：未知方法、未知工具、坏 JSON 之后，server 继续处理后续请求。真实验证：发送未知工具得到 `-32601` 后紧接 `ping`，仍正常返回：
+- **错误不会终止 server**：未知方法、未知工具、坏 JSON、超长行之后，server 都继续处理后续请求。真实验证：发送未知工具得到 `-32601` 后紧接 `ping`，仍正常返回：
   ```json
   {"jsonrpc":"2.0","id":12,"result":{}}
   {"jsonrpc":"2.0","id":13,"result":{}}
   ```
   （分别是坏 JSON 之后的 ping、未知工具之后的 ping。）
-- 成功响应与错误响应互斥：成功不含 `error`，错误不含 `result`；没有 MCP 的 `isError` 字段。
-- 无法解析的行只影响该行：`-32700` 后循环继续（`id` 为 `null`）。
-- 工具执行错误使用 `-32603`，客户端应把 `error.message` 作为可展示的错误文本；不同工具的错误 message 前缀不同（见各工具小节）。
-- 只有 `tools/call` 外层的参数形状错误是 `-32602`；工具内部参数错误统一是 `-32603`。
+- 成功响应与错误响应互斥：成功不含 `error`，错误不含 `result`；**但成功响应可能带 `result.isError = true`**（业务失败），客户端应优先检查该字段，再读 `result.content[].text`。
+- 无法解析/超长/超限的行只影响该行：`-32700` / `-32600` 后循环继续（`id` 为 `null`）。
+- `tools/call` 的 `params` 形状错误与工具参数 schema 不匹配是 `-32602`；工具执行期的业务失败一律是 `result.isError = true`，不再使用 `-32603`。
+- 单行请求上限 16 MiB（`MAX_REQUEST_LINE_BYTES`），超限返回 `-32600` 并丢弃整行。
 
 ## 6. 与 CLI 共用 store 的推荐工作流
 
@@ -827,7 +832,7 @@ Agent 侧推荐节奏（`mem-mcp` 启动时不需要做任何额外初始化）�
 2. **改动后**：`mem_add_event` 记录摘要与文件变更（`file_name` 用相对路径最稳妥；绝对路径会被规范化）。
 3. **需要历史**：`mem_query`（`by=project` 看全量、`by=filename` 看某文件、`by=fuzzy` 找关键词）。
 4. **周期性维护**：`mem_render` 刷新项目 README；`mem_compact` 压缩 `files.jsonl`；`mem_sync` 提交并同步到远端。
-5. **冲突时**：`mem_sync` 返回冲突错误后，按错误提示调用 `mem_resolve`，再调用一次 `mem_sync`。
+5. **冲突时**：`mem_sync` 返回 `isError`（文本提示冲突）后，按提示调用 `mem_resolve`，再调用一次 `mem_sync`。
 
 示例会话序列（每一行都是一个请求；实际输出见对应工具小节）：
 
@@ -844,9 +849,9 @@ Agent 侧推荐节奏（`mem-mcp` 启动时不需要做任何额外初始化）�
 与 CLI 共用的注意事项：
 
 - **同一个 store**：CLI 的 `mem list` / `mem query` 能立即看到 MCP 写入的事件，反之亦然；两边是不同进程，靠 `fs2` 文件锁串行化追加写。
-- **并发写入**：多个 MCP 进程 / CLI 同时追加是安全的（文件锁），但 `mem_compact` 与同步/追加不是全局事务；避免在关键同步路径上并发跑 `compact`。
+- **并发写入**：多个 MCP 进程 / CLI 同时写是安全的（store 跨进程写锁串行化追加、`compact`、`resolve`、`sync`）；跨设备一致性仍靠显式 `mem_sync`。
 - **同步不自动**：写事件只落本地文件；跨设备可见需要显式调用 `mem_sync`（或 CLI `mem sync`）。
-- **命名一致**：`project` 直接映射为 `projects/<project>/` 目录名，与 CLI 侧保持一致；两边不要给同一项目起不同名字。
+- **命名一致**：`project` 直接映射为 `projects/<project>/` 目录名，必须是单一安全路径组件（非空、不含 `/`、`\`、控制字符、≤200 字节），与 CLI 侧保持一致；两边不要给同一项目起不同名字。
 - **文件身份一致**：两边都按同一套规则规范化 `file_name`，跨设备/跨入口才能互相匹配。
 
 ## 7. 限制
@@ -854,13 +859,14 @@ Agent 侧推荐节奏（`mem-mcp` 启动时不需要做任何额外初始化）�
 - **只有 tools**：不提供 resources、prompts、logging、sampling 等 MCP 能力；`capabilities` 中只有 `tools`。
 - **无鉴权**：stdio 本地进程，权限继承自启动它的客户端；**不要**把 `mem-mcp` 通过网络对外暴露。
 - **单进程串行**：一个请求处理完才读下一行；`mem_sync` / `mem_resolve` 这类可能耗时的 git 操作会阻塞后续请求。
-- **不做文件校验**：`mem_add_event` 不读取文件、不计算 SHA256，`size_bytes` / `hash` 完全由调用方提供，写入时不做校验；`action` 也不校验枚举值。
+- **单行上限 16 MiB**：超长请求行被丢弃并返回 `-32600`；fuzzy 正则编译程序上限 10 MiB。
+- **不做文件校验**：`mem_add_event` 不读取文件、不计算 SHA256，`size_bytes` / `hash` 完全由调用方提供，写入时不做校验；但 `action` 只接受 `Created` / `Modified` / `Deleted`。
 - **无分页**：`mem_query` / `mem_get_context` 一次性返回结果；大 store 下查询会较慢（每次重建内存索引）。
 - **上下文截断**：`mem_get_context` 只取最近 5 条事件，`mem_render` 时间线只取最近 10 条。
-- **同步前置条件**：`mem_sync` 要求 store 是 git 仓库、有可用 remote/upstream 与 git 用户身份；否则返回 `-32603`。
+- **同步前置条件**：`mem_sync` 要求 store 是 git 仓库、有可用 remote/upstream 与 git 用户身份；否则返回 `isError`。
 - **冲突解决只覆盖 JSONL**：`mem_resolve` 不处理 `meta.json` 等非 JSONL 文件的冲突（可能需要手工解决后 `git rebase --continue`）。
 - **协议版本固定**：固定返回 `2024-11-05`，不校验客户端版本、不支持批处理数组、不支持服务端主动通知。
-- **项目名未校验**：`project` 直接作为 `projects/` 下的目录名拼接，未做字符白名单校验；只适合可信的本地调用方。
+- **项目名已校验**：`project` 必须是单一安全路径组件（非空、非 `.`/`..`、不含 `/`、`\`、无控制字符、≤200 字节）；CLI 与 MCP 都会拒绝非法值。
 
 ## 8. 相关文档
 

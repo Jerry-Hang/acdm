@@ -2,7 +2,7 @@
 
 # Migration Guide
 
-> Audience: users upgrading an existing ACDM store to 0.1.0, or developers migrating from internal prerelease snapshots.
+> Audience: users upgrading an existing ACDM store to 0.1.1, or developers migrating from internal prerelease snapshots.
 > This document explains "which changes require action and which are already compatible on the read side", and provides a migration script that has been tested in practice.
 
 ## Data format and compatibility ground rules
@@ -15,6 +15,10 @@
   and file identities are always normalized relative paths.
 - **The event log stays append-only**: apart from `mem resolve` handling conflicts and the optional migration script below,
   normal writes never rewrite existing lines.
+- **0.1.1 requires no data migration**: the on-disk format is unchanged (`events/`, `files.jsonl`, `meta.json`, `.mem` are all identical).
+  0.1.1 hardens semantics (sync failures are surfaced, conflicts exit non-zero, `compact` rebuilds the projection from the event log,
+  reads no longer use mmap, project names are validated). After upgrading, it is **recommended to run `mem compact -p <project>` once per project**:
+  it rebuilds `files.jsonl` from the authoritative event log and heals a projection that an older crash or concurrent write left stale or truncated.
 
 ## Changes in 0.1.0 relative to internal prerelease snapshots
 
@@ -28,6 +32,17 @@
 | MCP `mem_resolve` response text gains the preserved line count | Adapt if you match the old text in full | Depends |
 | Removed `MemStore::scan_files` / `MemStore::read_latest_events` / `nodes/` | Code calling these APIs will fail to compile | Library users need to change, see below |
 | Reads tolerate corrupted lines | Stores that previously failed outright now skip bad lines and keep reading | Recommended to run a health check once |
+
+0.1.1 changes (semantics only; no data-format change):
+
+| Change | Impact | Action needed? |
+| --- | --- | --- |
+| `mem compact` rebuilds `files.jsonl` from the event log and holds the store write lock | Stale/torn projections are healed; concurrent appends are not lost | Recommended: run `mem compact -p <project>` once after upgrading |
+| Store-wide cross-process write lock; reads use plain `fs::read` instead of mmap | Local writers serialize; no more `SIGBUS` risk under concurrent truncation | No |
+| `sync` commits first, uses `git pull --rebase` without `--autostash`, skips the pull without an upstream, aborts on non-conflict pull failures, and **exits non-zero on conflicts** | Scripts that assumed a conflicted `sync` exits 0 must check the exit code now | Update automation |
+| MCP: `jsonrpc` validated (`-32600`), tool arguments validated (`-32602`), business errors returned as `result.isError = true`, 16 MiB request-line cap, `action` enum enforced | Clients/monitoring that match on `-32603` or on old text must be updated | Depends |
+| Project names validated as a single safe path component | Names containing `/`, `\`, `.`/`..`, control characters, or >200 bytes are rejected | Rename such projects (and their `projects/<name>/` directories) before upgrading |
+| `resolve` is byte-level, matches only exact Git markers, advances a multi-commit rebase in one call, and keeps `FileRecord` causal order | Non-UTF-8 content and marker-prefixed data lines are preserved; fewer manual steps | No |
 
 ## Upgrade steps (single machine)
 
@@ -46,7 +61,10 @@ cargo build --release
 /path/to/mem --path /path/to/store list
 /path/to/mem --path /path/to/store resolve     # clean up leftover conflict markers (if any)
 
-# 5) Sync once to push the local changes made during migration
+# 5) Recommended: rebuild each project's files.jsonl projection once (also heals stale projections)
+/path/to/mem --path /path/to/store compact -p <project>
+
+# 6) Sync once to push the local changes made during migration
 /path/to/mem --path /path/to/store sync
 ```
 
