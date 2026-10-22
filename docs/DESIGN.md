@@ -1,277 +1,279 @@
-# ACDM 设计说明
+**English** · [简体中文](zh-CN/DESIGN.md)
 
-> 读者：想了解 ACDM 为什么这样设计、这些选择付出什么代价的开发者与评审者。
-> 本文讨论「为什么」；具体实现（数据结构、读写路径、文件格式）见 [ARCHITECTURE.md](ARCHITECTURE.md)。
+# ACDM Design Notes
 
-## 1. 设计目标与非目标
+> Audience: developers and reviewers who want to understand why ACDM is designed this way and what these choices cost.
+> This document discusses the "why"; for implementation details (data structures, read/write paths, file formats), see [ARCHITECTURE.md](ARCHITECTURE.md).
 
-### 目标
+## 1. Design goals and non-goals
 
-1. **让多个 Agent 共享项目记忆**：同一项目的 Agent 在不同机器上记录的事件，同步后彼此可见。
-2. **无服务端**：不部署数据库、不跑守护进程；一个本地目录 + 一个 Git remote 就是全部基础设施。
-3. **离线优先**：断网时读写在本地照常工作，恢复网络后再同步。
-4. **可审查、可恢复**：数据是文本，能 diff、能人工检查；冲突有确定的自动解决策略，且不静默丢数据。
-5. **低门槛**：一条 `mem init --remote` 就能开始；人类用 CLI，Agent 用 MCP。
+### Goals
 
-### 非目标
+1. **Let multiple agents share project memory**: events recorded by agents of the same project on different machines become visible to each other after sync.
+2. **Serverless**: no database to deploy, no daemon to run; one local directory + one Git remote is the entire infrastructure.
+3. **Offline-first**: reads and writes keep working locally while the network is down; sync again once connectivity returns.
+4. **Auditable and recoverable**: data is text, so it can be diffed and inspected by humans; conflicts have a deterministic automatic resolution strategy and never silently lose data.
+5. **Low barrier to entry**: a single `mem init --remote` is enough to get started; humans use the CLI, agents use MCP.
 
-- 不做实时协作或强一致数据库；
-- 不做通用事件存储/查询引擎（没有 SQL、没有二级索引持久化）；
-- 不保存文件内容（只存路径、大小、SHA256）；
-- 不做多租户、鉴权或加密服务；
-- 不做语义检索/向量搜索（`--fuzzy` 只是正则）；
-- 不提供跨设备事务或因果排序。
+### Non-goals
 
-## 2. 为什么选 Git + append-only JSONL
+- No real-time collaboration or strongly consistent database;
+- No general-purpose event store/query engine (no SQL, no persistent secondary indexes);
+- No file contents stored (only path, size, SHA256);
+- No multi-tenancy, authentication, or encryption service;
+- No semantic retrieval/vector search (`--fuzzy` is only regex);
+- No cross-device transactions or causal ordering.
 
-核心问题是：**多台机器上的 Agent 如何共享一份会持续追加的记忆，并且今天就能用、不需要运维？**
+## 2. Why Git + append-only JSONL
 
-| 方案 | 优点 | 代价与风险 | 结论 |
+The core question: **how can agents on multiple machines share a continuously growing memory, usable today, without any operations work?**
+
+| Option | Pros | Costs and risks | Verdict |
 | --- | --- | --- | --- |
-| SQLite 单文件 | 查询强、事务完整、单机简单 | 二进制页级冲突几乎无法自动合并；跨设备需要额外的同步/锁方案；schema 迁移要工具链 | 冲突不可控，不选 |
-| 自建服务 + 云数据库（Postgres 等） | 强一致、并发好 | 必须有服务端与网络、要运维、离线不可用、引入账号体系 | 违背「无服务端、离线可用」，不选 |
-| Redis / KV 存储 | 快 | 内存型、持久化弱、缺少历史/版本语义 | 不适合长期记忆，不选 |
-| CRDT / 同步引擎（如 Automerge） | 自动合并、离线强 | 复杂度高、状态膨胀、需要引入库与维护合并语义；对「事件追加」属于过度设计 | 过重，不选 |
-| 云盘同步（Dropbox/Syncthing/OneDrive） | 零开发成本 | 冲突时产生冲突副本，没有结构化合并；不可审计、不可版本回溯 | 冲突不可控，不选 |
-| **Git + append-only JSONL（选中）** | 免费托管、天然版本历史、离线可用、diff 可审、行级合并、权限/备份成熟 | 需要手动解决冲突（已由 `mem resolve` 自动化）、仓库随历史增长、不实时 | 与「事件日志」的形态天然契合 |
+| SQLite single file | Strong queries, full transactions, simple on a single machine | Binary page-level conflicts are nearly impossible to merge automatically; cross-device use needs an extra sync/locking scheme; schema migrations need a toolchain | Conflicts are uncontrollable — rejected |
+| Self-hosted service + cloud database (Postgres, etc.) | Strong consistency, good concurrency | Requires a server and network, operations work, unusable offline, introduces an account system | Violates "serverless, offline-capable" — rejected |
+| Redis / KV store | Fast | In-memory, weak persistence, lacks history/version semantics | Unsuitable for long-term memory — rejected |
+| CRDT / sync engine (e.g. Automerge) | Automatic merging, strong offline | High complexity, state bloat, needs a library and maintenance of merge semantics; over-engineered for "event append" | Too heavy — rejected |
+| Cloud drive sync (Dropbox/Syncthing/OneDrive) | Zero development cost | Conflicts produce conflicted copies with no structured merge; not auditable, no version rollback | Conflicts are uncontrollable — rejected |
+| **Git + append-only JSONL (chosen)** | Free hosting, native version history, offline-capable, auditable diffs, line-level merging, mature permissions/backup | Manual conflict resolution needed (now automated by `mem resolve`), repository grows with history, not real-time | A natural fit for the shape of an "event log" |
 
-选择 Git 的另一个理由：**它已经是开发者的工作流**。跨设备同步、鉴权（SSH/HTTPS）、备份、历史查看、回滚，Git 都现成，ACDM 不必重新发明。
+Another reason for choosing Git: **it is already part of the developer workflow**. Cross-device sync, authentication (SSH/HTTPS), backup, history browsing, and rollback are all already provided by Git, so ACDM does not have to reinvent them.
 
-选择 append-only JSONL 的理由：
+Reasons for choosing append-only JSONL:
 
-| 性质 | 为什么重要 |
+| Property | Why it matters |
 | --- | --- |
-| 每行一条独立记录 | Git 的冲突范围被限制在「行」级别；冲突通常是重复行或交错追加，可确定性处理 |
-| 只追加、不就地修改 | 不需要跨设备锁；历史可回放；`git pull --rebase` 的冲突面很小 |
-| 文本可读、可 diff | 出问题能直接看文件；兼容旧数据、未知字段可原样保留 |
-| 按月分片 | 控制单文件大小与 Git 每次 diff 的成本 |
-| 无需 schema 迁移工具 | serde 的向前兼容（未知字段忽略）+ `resolve` 原样保留原始行 |
+| Each line is an independent record | Git's conflict scope is limited to the "line" level; conflicts are usually duplicate lines or interleaved appends, and can be handled deterministically |
+| Append-only, no in-place modification | No cross-device locks needed; history can be replayed; the conflict surface of `git pull --rebase` is small |
+| Text is readable and diffable | You can inspect files directly when something goes wrong; compatible with old data, unknown fields preserved as-is |
+| Monthly shards | Bounds single-file size and the cost of each Git diff |
+| No schema migration tool needed | serde's forward compatibility (unknown fields ignored) + `resolve` preserving original lines verbatim |
 
-代价（接受并文档化）：
+Costs (accepted and documented):
 
-- 没有索引文件 → 每次查询全量扫描（见第 8 节）；
-- 只能做行/记录级去重，不能做字段级语义合并；
-- 仓库体积随事件单调增长；
-- 依赖 Git 的合并行为，需要用户理解「同步前解决冲突」。
+- No index files → every query does a full scan (see section 8);
+- Only line/record-level deduplication, no field-level semantic merge;
+- Repository size grows monotonically with events;
+- Depends on Git's merge behavior; users need to understand "resolve conflicts before syncing".
 
-## 3. 一致性模型
+## 3. Consistency model
 
-### 3.1 单写者锁
+### 3.1 Single-writer lock
 
-同一台机器上，`append_event`、`meta.json` / `README.md` 覆盖写、`resolve` 写回都持有 `fs2` 排他锁（advisory lock）。这保证**同机多进程**（CLI 与 MCP 同时活跃）追加时不会互相截断。
+On one machine, `append_event`, the overwrite writes of `meta.json` / `README.md`, and the `resolve` write-back all hold an `fs2` exclusive lock (advisory lock). This guarantees that **multiple processes on the same machine** (CLI and MCP active at the same time) do not truncate each other's appends.
 
-锁只在本机生效：它不是分布式锁，跨设备写入靠 Git 同步后的冲突解决来收敛。
+The lock only works on the local machine: it is not a distributed lock; cross-device writes converge through conflict resolution after Git sync.
 
-### 3.2 跨设备弱一致
+### 3.2 Weak consistency across devices
 
-- 各设备有独立的本地 store 副本，**同步前强隔离**；
-- 只有 `mem sync`（commit → pull --rebase → push）成功后，设备之间才达成一致；
-- 任何时刻两台设备可能看到不同的历史，这是有意接受的弱一致。
+- Each device has its own local store copy, **strongly isolated until sync**;
+- Only after `mem sync` (commit → pull --rebase → push) succeeds do the devices reach agreement;
+- At any moment two devices may see different histories; this is deliberately accepted weak consistency.
 
-### 3.3 last-write-wins 的适用范围
+### 3.3 Scope of last-write-wins
 
-「后写覆盖」只在两个地方使用，且都限定在**同一个去重键**上：
+"Later write overwrites" is used in exactly two places, both limited to **the same deduplication key**:
 
-1. 冲突解决时，同一 `event_id` / `file_id` 的多行只保留最后出现的一条（见第 6 节）；
-2. `get_latest_files` 与 `compact` 中，同一 `file_name` 只保留最后一条文件记录。
+1. During conflict resolution, multiple lines with the same `event_id` / `file_id` keep only the last one (see section 6);
+2. In `get_latest_files` and `compact`, only the last file record for the same `file_name` is kept.
 
-它不是通用 CRDT：不同 `event_id` 的事件永远不会互相覆盖；同一文件在不同事件的记录会保留历史，只有「最新状态视图」取最后一条。
+It is not a general CRDT: events with different `event_id`s never overwrite each other; records of the same file in different events keep their history, and only the "latest-state view" takes the last one.
 
-### 3.4 时钟与排序
+### 3.4 Clocks and ordering
 
-- 事件时间戳 `ts` 由各设备本地时钟生成（`Utc::now()`），统一为 UTC、固定宽度纳秒；
-- 排序用 parse-aware 比较：解析成时间后比较，解析失败再退回字符串比较；同一时间戳用 `event_id` 做 tie-breaker；
-- **不校正时钟偏移**：如果一台设备的时钟快/慢，事件顺序会反映该时钟，而不是真实因果顺序；
-- 因此 ACDM 承诺的是「按记录时间近似排序」，不是因果一致的总序。对「项目记忆」这一用途，这个近似是可接受的。
+- The event timestamp `ts` is generated by each device's local clock (`Utc::now()`), uniformly UTC and fixed-width nanoseconds;
+- Ordering uses parse-aware comparison: parse into time and compare, falling back to string comparison when parsing fails; for equal timestamps, `event_id` acts as the tie-breaker;
+- **Clock skew is not corrected**: if one device's clock is fast/slow, event order reflects that clock rather than the real causal order;
+- Therefore ACDM promises "approximately ordered by recorded time", not a causally consistent total order. For the "project memory" use case, this approximation is acceptable.
 
-> 相关源码：[`now_rfc3339` / `parse_ts` / `ts_cmp` / `event_cmp`](../mem-core/src/util.rs)
+> Related source: [`now_rfc3339` / `parse_ts` / `ts_cmp` / `event_cmp`](../mem-core/src/util.rs)
 
-## 4. 标识设计
+## 4. Identity design
 
-### 4.1 格式
+### 4.1 Format
 
 ```
 YYYYMMDDHHMMSS_<nanos:09>_<pid%100000:05>_<counter%10000:04>
 ```
 
-| 设计点 | 选择 | 理由 |
+| Design point | Choice | Rationale |
 | --- | --- | --- |
-| 时间基准 | UTC | 跨时区设备写出的 ID 顺序一致；本地时间会让同一瞬间在不同设备上排序不同 |
-| 时间精度 | 纳秒 | 同秒突发可区分；两台设备同秒的概率也极低 |
-| 定宽 | 14 / 9 / 5 / 4 | 字典序 = 时间序（同前缀下），便于排序、比较与人工阅读 |
-| pid | `process::id() % 100_000` | 区分同机不同进程 |
-| 计数器 | 进程内 `AtomicU64 % 10_000` | 同进程同纳秒的突发去重 |
+| Time base | UTC | IDs written by devices in different time zones sort consistently; local time would sort the same instant differently on different devices |
+| Time precision | Nanoseconds | Same-second bursts are distinguishable; the probability of two devices hitting the same nanosecond is also extremely low |
+| Fixed width | 14 / 9 / 5 / 4 | Lexicographic order = chronological order (under the same prefix), convenient for sorting, comparing, and human reading |
+| pid | `process::id() % 100_000` | Distinguishes different processes on the same machine |
+| Counter | In-process `AtomicU64 % 10_000` | Deduplicates same-nanosecond bursts within one process |
 
-选择「可排序的复合 ID」而不是 UUID v4：UUID 随机、不可读、不可排序；ACDM 需要的是「时间序 + 可打印 + 无额外依赖」。代价是依赖设备时钟与 pid 语义（见 4.3）。
+Choosing a "sortable composite ID" instead of UUID v4: UUIDs are random, unreadable, and unsortable; ACDM needs "time-ordered + printable + no extra dependencies". The cost is dependence on the device clock and pid semantics (see 4.3).
 
-### 4.2 旧格式的缺陷（为什么必须改）
+### 4.2 Flaws of the old format (why it had to change)
 
-旧实现是「秒级时间戳 + pid + 计数（最多 100）」：
+The old implementation was "second-level timestamp + pid + counter (max 100)":
 
 ```
 YYYYMMDDHHMMSS_<pid(5)>_<counter%100>
 ```
 
-两台设备在同一秒内生成 ID 时，只要 pid 相同（非常常见：进程编号从 1 开始，容器/脚本场景高度重复）且计数器相同，就可能产生**完全相同的 ID**。ID 相同的事件在冲突解决时会被当作「同一条记录」去重 → **后写覆盖前写，静默丢数据**。
+When two devices generate IDs within the same second, as long as the pid is the same (very common: process numbers start at 1 and are heavily reused in containers/scripts) and the counter is the same, they can produce **exactly identical IDs**. Events with the same ID are treated as "the same record" and deduplicated during conflict resolution → **later writes overwrite earlier ones, silently losing data**.
 
-新格式用「纳秒 + pid + 计数器」三层区分：两台设备要碰撞，必须同时同纳秒、同 pid、同计数器，实践中几乎不可能发生。同时保留定宽与 UTC，维持可排序性。
+The new format distinguishes with three layers — "nanoseconds + pid + counter": for two devices to collide, they would have to share the same nanosecond, the same pid, and the same counter at the same time, which is practically impossible. Fixed width and UTC are preserved to maintain sortability.
 
-### 4.3 边界与代价
+### 4.3 Boundaries and costs
 
-- **时钟回拨**（NTP 校正、手动改时间）可能让新事件的 `ts` 早于旧事件；排序会仍然按解析时间工作，但「新事件总在最后」的直觉会被打破；
-- ID 内嵌时间与事件 `ts` 是两次独立取时，可能相差数百纳秒——两者都是真实时间，排序以 `ts` 为准；
-- pid 超过 5 位时取模（`% 100_000`），计数器超过 4 位也取模（`% 10_000`）；这只影响「同纳秒同进程」的极端突发，不影响跨设备唯一性目标。
+- **Clock rollback** (NTP correction, manual time change) may make a new event's `ts` earlier than an old one; ordering still works by parsed time, but the intuition that "new events always come last" is broken;
+- The time embedded in the ID and the event `ts` are two independent clock reads and may differ by hundreds of nanoseconds — both are real times, and ordering is based on `ts`;
+- When the pid exceeds 5 digits it is taken modulo (`% 100_000`), and the counter is also taken modulo beyond 4 digits (`% 10_000`); this only affects extreme same-nanosecond, same-process bursts, and does not affect the cross-device uniqueness goal.
 
-## 5. 文件身份设计
+## 5. File identity design
 
-### 5.1 为什么必须是相对路径
+### 5.1 Why it must be a relative path
 
-同一份代码在不同设备上的绝对路径不同（用户名、挂载点、`/home/a` vs `/Users/b`）。如果 `file_name` 记录绝对路径：
+The same code has different absolute paths on different devices (usernames, mount points, `/home/a` vs `/Users/b`). If `file_name` recorded absolute paths:
 
-- 跨设备永远匹配不上；
-- `query -n` / MCP `by=filename` 查不到别的设备记录的文件；
-- 「同一文件」的历史被拆成多条互不相关的身份。
+- They would never match across devices;
+- `query -n` / MCP `by=filename` could not find files recorded by other devices;
+- The history of "the same file" would be split into multiple unrelated identities.
 
-因此 `file_name` 必须是**相对于某个稳定锚点**的路径，且统一 `/` 分隔。
+Therefore `file_name` must be a path **relative to a stable anchor**, uniformly separated by `/`.
 
-### 5.2 为什么优先级是 store → git → CWD → 绝对
+### 5.2 Why the priority is store → git → CWD → absolute
 
-| 优先级 | 锚点 | 理由 |
+| Priority | Anchor | Rationale |
 | --- | --- | --- |
-| 1 | store 根 | 锚点随 store 一起同步，所有设备看到相同的相对结构；最稳定 |
-| 2 | 最近的 git 仓库根 | 根因：store 通常独立于项目仓库。文件在项目工作区里，锚定仓库根能得到跨设备一致的相对路径 |
-| 3 | CWD | 兜底：文件既不在 store 也不在 git 仓库，但相对当前目录至少比绝对路径更可能一致 |
-| 4 | 绝对路径 | 最后兜底。CLI 会打警告：这种记录在其它设备上无法匹配 |
+| 1 | store root | The anchor syncs together with the store, so all devices see the same relative structure; the most stable option |
+| 2 | nearest git repository root | Root cause: the store is usually separate from the project repository. Files live in the project workspace, and anchoring to the repository root yields a cross-device consistent relative path |
+| 3 | CWD | Fallback: the file is neither in the store nor in a git repository, but relative to the current directory it is at least more likely to be consistent than an absolute path |
+| 4 | absolute path | Last resort. The CLI prints a warning: such records cannot be matched on other devices |
 
-实现不要求文件存在（纯词法解析），所以记录「已删除」的文件也能得到一致身份；符号链接不解析，按字面路径判断。
+The implementation does not require the file to exist (pure lexical resolution), so records for "already deleted" files also get a consistent identity; symlinks are not resolved and are judged by their literal path.
 
-### 5.3 假设与边界
+### 5.3 Assumptions and boundaries
 
-- **假设**：各设备上的项目仓库/store 保持相同的相对目录布局（Git 天然保证这一点）；
-- **边界 1**：文件被移动或改名 → 身份改变，历史会分成两条 `file_name`；这是有意接受的（没有文件系统 inode 可跨设备使用）；
-- **边界 2**：大小写不敏感文件系统（macOS/Windows）上，`Src/A.rs` 与 `src/a.rs` 可能是同一文件但被记为两个身份；
-- **边界 3**：非 UTF-8 路径经 `to_string_lossy` 转换，可能有损；
-- **边界 4**：绝对路径兜底记录不参与跨设备匹配（见迁移说明 [MIGRATION.md](MIGRATION.md)）。
+- **Assumption**: project repositories/stores on each device keep the same relative directory layout (Git guarantees this by nature);
+- **Boundary 1**: a file that is moved or renamed → its identity changes, and the history splits into two `file_name`s; this is deliberately accepted (no filesystem inode is usable across devices);
+- **Boundary 2**: on case-insensitive filesystems (macOS/Windows), `Src/A.rs` and `src/a.rs` may be the same file but are recorded as two identities;
+- **Boundary 3**: non-UTF-8 paths go through `to_string_lossy` and may be lossy;
+- **Boundary 4**: absolute-path fallback records do not participate in cross-device matching (see the migration notes in [MIGRATION.md](MIGRATION.md)).
 
-> 相关源码：[`normalize_file_name`](../mem-core/src/util.rs)
+> Related source: [`normalize_file_name`](../mem-core/src/util.rs)
 
-## 6. 冲突解决语义
+## 6. Conflict resolution semantics
 
-`mem resolve` 的设计原则排序是：**保留 > 去重 > 排序**。任何「为了整洁而丢数据」的行为都被明确拒绝。
+The order of design principles for `mem resolve` is: **preserve > deduplicate > sort**. Any behavior that "loses data for the sake of tidiness" is explicitly rejected.
 
-### 6.1 为什么保留优先
+### 6.1 Why preservation comes first
 
-JSONL 里可能出现：
+JSONL may contain:
 
-- 被截断的末行（写入进程崩溃）；
-- 未来版本写入的新字段/新 schema；
-- 非记录类型的杂项行；
-- 人工编辑引入的内容。
+- truncated trailing lines (the writing process crashed);
+- new fields/new schemas written by future versions;
+- miscellaneous non-record lines;
+- content introduced by manual edits.
 
-这些行无法被当前版本完整理解，但它们可能是**唯一副本**。因此：
+These lines cannot be fully understood by the current version, but they may be **the only copy**. Therefore:
 
-| 情况 | 处理 | 理由 |
+| Case | Handling | Rationale |
 | --- | --- | --- |
-| 无法解析为当前记录类型 | 逐字保留（含空白），追加到文件末尾 | 宁可在文件里留一行看不懂的内容，也不能删掉用户数据 |
-| 未知字段 | 原样保留（重新输出原始行文本，而不是重新序列化） | 向前兼容：新版本写的字段经旧版本 merge 后不丢 |
-| 相同内容的不可解析行 | 折叠为一条 | 避免两侧相同截断行重复增长；内容不同的不折叠 |
-| 同一 `event_id` / `file_id` 的多行 | 后写覆盖（保留最后一条） | 事件/记录是原子的；同 ID 代表同一条记录，取较晚的一侧 |
-| 冲突标记行 | 丢弃 | 它们是 Git 的元数据，不是数据 |
+| Cannot be parsed as the current record type | Preserved verbatim (including whitespace), appended to the end of the file | Better to leave one unintelligible line in the file than to delete user data |
+| Unknown fields | Preserved as-is (re-emit the original line text rather than re-serialize it) | Forward compatibility: fields written by a new version are not lost after an old version merges them |
+| Unparseable lines with identical content | Collapsed into one | Avoids duplicate growth of identical truncated lines from both sides; lines with different content are not collapsed |
+| Multiple lines with the same `event_id` / `file_id` | Later write wins (keep the last one) | Events/records are atomic; the same ID means the same record, so take the later side |
+| Conflict marker lines | Discarded | They are Git metadata, not data |
 
-「保留」与「后写覆盖」的边界很清晰：**不同 ID → 全部保留；同 ID → 只保留一条**。
+The boundary between "preserve" and "later write wins" is clear: **different IDs → preserve all; same ID → keep only one**.
 
-### 6.2 为什么不可解析行放文件末尾
+### 6.2 Why unparseable lines go at the end of the file
 
-如果把它们插回原来的位置，可能打断「记录区」的连续性，也让后续读取更难判断。追加到末尾的代价是：这些行的位置与真实时间顺序无关——但既然无法解析，也就无所谓顺序；而可解析记录仍保持正确排序。
+Inserting them back into their original positions could break the continuity of the "record section" and make subsequent reads harder to interpret. The cost of appending them to the end is that their position is unrelated to the real chronological order — but since they cannot be parsed, order does not matter; parseable records still keep the correct ordering.
 
-### 6.3 为什么排序要归一化
+### 6.3 Why ordering is normalized
 
-冲突合并后，行序可能来自两侧交错的追加。为了让结果确定、可重复（同样输入 → 同样输出），resolver 会：
+After conflict merging, line order may come from interleaved appends on both sides. To make the result deterministic and repeatable (same input → same output), the resolver:
 
-- `Event` / `Generic`：按解析后的时间 + 键排序；
-- `FileRecord`：按 `file_id` 排序；
-- `Unknown`：不排序（只保留原始相对顺序）。
+- `Event` / `Generic`: sorts by parsed time + key;
+- `FileRecord`: sorts by `file_id`;
+- `Unknown`: not sorted (only the original relative order is kept).
 
-正常同步产生的冲突本就不多；归一化排序让「同一份输入永远得到同一份输出」，便于复查与测试。
+Normal syncs produce few conflicts anyway; normalized ordering makes "the same input always yield the same output", which simplifies review and testing.
 
-### 6.4 rebase 继续的判断
+### 6.4 Deciding whether to continue the rebase
 
-旧实现通过匹配 `git rebase --continue` 的英文报错来判断「是否有 rebase 在进行」，在非英文 locale 下会把正常路径变成硬失败。现在只检查 Git 的状态目录（`.git/rebase-merge` / `.git/rebase-apply`）是否存在——这是与语言无关的事实来源，过就是过、没有就是没有。
+The old implementation detected "is a rebase in progress" by matching the English error text of `git rebase --continue`, which turned a normal path into a hard failure under non-English locales. Now it only checks whether Git's state directories (`.git/rebase-merge` / `.git/rebase-apply`) exist — a language-independent source of truth: if they are there, a rebase is in progress; if not, there is none.
 
-### 6.5 代价
+### 6.5 Costs
 
-- 不是字段级合并：同一事件两侧内容不同时，theirs 整条胜出，ours 的内容被丢弃（只保留一条）；
-- 输出顺序可能与原始追加顺序不同；
-- 不可解析行集中在末尾，人工查看时需要知道这一点；
-- 解决冲突需要一次显式的 `mem resolve`，不是全自动（避免在无人值守时悄悄改动数据）。
+- Not a field-level merge: when the same event differs on both sides, the whole "theirs" entry wins and the "ours" content is discarded (only one is kept);
+- Output order may differ from the original append order;
+- Unparseable lines are concentrated at the end, which human reviewers need to know;
+- Resolving conflicts requires an explicit `mem resolve`; it is not fully automatic (to avoid silently changing data while unattended).
 
-## 7. 安全与隐私边界
+## 7. Security and privacy boundaries
 
-### 7.1 store 里到底存了什么
+### 7.1 What is actually stored in the store
 
-| 数据 | 是否入库 | 说明 |
+| Data | Stored? | Notes |
 | --- | --- | --- |
-| 文件路径（规范化后） | 是 | 可能暴露项目结构、模块划分、命名习惯 |
-| 文件大小、SHA256 | 是 | 不直接暴露内容，但可用于确认「某个已知文件」是否在项目中 |
-| 变更摘要 `summary` | 是 | 由人或 Agent 编写，可能包含代码细节、意图、甚至误入的敏感信息 |
-| 设备名、Agent 名、项目名 | 是 | 设备 hostname 可能暴露机器名 |
-| 文件内容 | **否** | 只存元数据，不存 blob |
-| 凭证/密钥 | 不应出现 | 但 ACDM 不会主动扫描或拦截 |
+| File path (normalized) | Yes | May expose project structure, module layout, and naming habits |
+| File size, SHA256 | Yes | Does not directly expose contents, but can be used to confirm whether "a known file" is in the project |
+| Change summary `summary` | Yes | Written by a human or agent; may contain code details, intent, or even sensitive information that slipped in |
+| Device name, agent name, project name | Yes | The device hostname may expose the machine name |
+| File contents | **No** | Only metadata, no blobs |
+| Credentials/keys | Should not appear | But ACDM does not actively scan for or block them |
 
-### 7.2 公开同步前的注意事项
+### 7.2 Precautions before syncing publicly
 
-- 同步到公共仓库前，先审查 `events/` 与 `projects/` 的内容：路径与摘要可能透露私有项目结构；
-- `mem sync` 会对 store 根执行 `git add -A`，**store 目录里的任何文件都会被提交**。务必让 store 目录只存放 ACDM 数据，不要把项目源码、`.env`、密钥等放在 store 根下；
-- Git 历史是不可变的：某条记录即使后来被删除/覆盖，仍可能留在历史提交里。若要公开，建议新建一个干净的 store 重新记录，而不是清理旧仓库；
-- SHA256 不会「泄露内容」，但可以对已知内容做指纹确认；对强保密场景，连 hash 与大小都应按敏感信息对待；
-- ACDM 本身没有鉴权/加密：`mem-mcp` 以本机用户身份通过 stdio 运行；store 以明文落盘；传输安全取决于 Git remote 的协议（SSH/HTTPS）。
+- Before syncing to a public repository, review the contents of `events/` and `projects/`: paths and summaries may reveal private project structure;
+- `mem sync` runs `git add -A` against the store root, **so any file in the store directory will be committed**. Make sure the store directory holds only ACDM data; do not put project source code, `.env`, keys, etc. under the store root;
+- Git history is immutable: even if a record is later deleted/overwritten, it may remain in historical commits. If you want to publish, prefer creating a fresh clean store and recording again rather than cleaning up the old repository;
+- SHA256 does not "leak contents", but it can be used to fingerprint known content; for strongly confidential scenarios, treat even hashes and sizes as sensitive information;
+- ACDM itself has no authentication/encryption: `mem-mcp` runs as the local user over stdio; the store is stored in plaintext on disk; transport security depends on the Git remote protocol (SSH/HTTPS).
 
-### 7.3 建议
+### 7.3 Recommendations
 
-- 默认使用**私有** remote；
-- 公开仓库只放清洗后的 store，或只公开代码而把 store 留在私有仓库；
-- 摘要里避免写入密钥、token、内网地址、客户信息；
-- 需要更强保护时，可在 Git 层叠加加密（如 git-crypt），ACDM 不阻止这种用法。
+- Use a **private** remote by default;
+- Publish only a sanitized store, or publish only the code while keeping the store in a private repository;
+- Avoid writing keys, tokens, internal addresses, or customer information into summaries;
+- When stronger protection is needed, layer encryption on top of Git (e.g. git-crypt); ACDM does not prevent this.
 
-## 8. 权衡与已知限制
+## 8. Trade-offs and known limitations
 
-| 限制 | 现状 | 影响 | 缓解/未来 |
+| Limitation | Current state | Impact | Mitigation/future |
 | --- | --- | --- | --- |
-| 索引每次重建 O(N) | 每次 `query` / `mem_query` 全量扫 events | 事件量大时查询变慢 | 未来做增量/持久化索引 |
-| 不 fsync | `append_event` 只 `flush` | 断电可能丢最后一条追加 | 接受；Git 提交提供另一层持久化 |
-| 单写者建议 | 同机 flock，跨设备无锁 | 多设备并发写同一 store 需靠 sync 收敛 | 约定「本地写、定期 sync」 |
-| 无多写者事务 | `events/` 与 `files.jsonl` 两次追加 | 崩溃可能造成两者短暂不一致 | events 是 source of truth，可用脚本重建 files 视图 |
-| `compact` 与并发写冲突 | tmp + rename 原子替换 | 期间并发追加的记录可能被覆盖 | 只在无写入时手动执行 `compact` |
-| 大文件按字节读 | CLI 为算 SHA256 读整个文件 | 内存占用 O(文件大小) | MCP 可由调用方提供 hash/size；超大文件不入记忆 |
-| 非 UTF-8 路径 / 内容 | 路径 `to_string_lossy`；`resolve` 要求 UTF-8 文件 | 身份可能有损；resolve 会失败 | 避免在 store 中使用非 UTF-8 名称 |
-| 无内容存储 | 只存元数据 | 无法从 store 回放文件内容 | 文件内容仍由 Git/项目仓库管理 |
-| 事件只增不删 | 无归档机制 | Git 仓库长期增长 | 未来提供归档/快照 |
-| 时间序 ≈ 真实序 | 依赖设备时钟 | 时钟偏差会反映到排序 | NTP 假设；`event_id` tie-break |
-| 正则搜索 | `--fuzzy` 是 Rust regex | 不是分词/语义搜索；坏正则会报错 | 按需扩展 |
-| 无鉴权/加密 | 明文 store + stdio MCP | 安全边界在操作系统与 Git 层 | 私有 remote + git-crypt 等外部方案 |
-| 符号链接不解析 | 词法路径 | 链接目标变化不会反映到身份 | 避免用 symlink 组织被记录文件 |
+| Index rebuilt O(N) every time | Every `query` / `mem_query` scans all events | Queries become slower as the event count grows | Incremental/persistent index in the future |
+| No fsync | `append_event` only `flush`es | Power loss may lose the last append | Accepted; Git commits provide another layer of durability |
+| Single-writer recommendation | flock on the same machine, no cross-device locks | Concurrent writes to the same store from multiple devices must converge via sync | Convention: "write locally, sync periodically" |
+| No multi-writer transactions | Two separate appends to `events/` and `files.jsonl` | A crash may leave them briefly inconsistent | events is the source of truth; the files view can be rebuilt by script |
+| `compact` vs concurrent writes | tmp + rename atomic replacement | Records appended concurrently during compaction may be overwritten | Run `compact` manually only when there are no writes |
+| Large files read byte by byte | The CLI reads the whole file to compute SHA256 | Memory usage O(file size) | The MCP caller can supply hash/size; very large files do not belong in memory |
+| Non-UTF-8 paths / content | Paths go through `to_string_lossy`; `resolve` requires UTF-8 files | Identity may be lossy; resolve will fail | Avoid non-UTF-8 names in the store |
+| No content storage | Only metadata is stored | File contents cannot be replayed from the store | File contents remain managed by Git/the project repository |
+| Events are append-only, never deleted | No archival mechanism | The Git repository grows over time | Archival/snapshots in the future |
+| Time order ≈ real order | Depends on device clocks | Clock skew is reflected in ordering | NTP assumption; `event_id` tie-break |
+| Regex search | `--fuzzy` is Rust regex | Not tokenized/semantic search; a bad regex reports an error | Extend as needed |
+| No authentication/encryption | Plaintext store + stdio MCP | The security boundary lies in the OS and Git layers | Private remote + external schemes such as git-crypt |
+| Symlinks not resolved | Lexical paths | Changes to the link target are not reflected in the identity | Avoid organizing recorded files with symlinks |
 
-## 9. 未来工作
+## 9. Future work
 
-按「收益 / 成本」排序的候选方向：
+Candidate directions ordered by "benefit / cost":
 
-1. **增量索引**：持久化 `EventPointer`，按分片 `(size, mtime)` 缓存；把查询从 O(全量) 降到 O(增量)。
-2. **事件归档/快照**：把老月份事件压缩为项目级快照，控制 Git 仓库体积。
-3. **更细的合并语义**：目前同 ID 整体后写覆盖；可在明确需要时引入字段级合并。
-4. **内容寻址（可选）**：以 SHA256 存 blob，支持「从记忆回放文件内容」；与「不存内容」的默认边界要区分清楚。
-5. **更多 MCP 工具**：跨项目搜索、批量追加、`mem_query` 的时间范围过滤、diff 视图。
-6. **冲突预检**：`mem sync --dry-run` / `mem resolve --check`，在真正 rebase 前提示冲突范围。
-7. **加密**：内置 store 级加密或在文档中标准化 git-crypt 用法。
-8. **跨平台验证**：Windows/macOS 的路径大小写、非 UTF-8 行为需要 CI 覆盖。
-9. **导入/导出**：从其它记忆格式（Markdown/笔记）批量导入事件。
+1. **Incremental index**: persist `EventPointer`, with per-shard `(size, mtime)` caching; reduce queries from O(everything) to O(delta).
+2. **Event archival/snapshots**: compress old months of events into project-level snapshots to bound the Git repository size.
+3. **Finer merge semantics**: currently the whole record with the same ID is last-write-wins; field-level merging can be introduced when clearly needed.
+4. **Content addressing (optional)**: store blobs by SHA256, supporting "replaying file contents from memory"; the boundary with the "no content storage" default must be drawn clearly.
+5. **More MCP tools**: cross-project search, batch appends, time-range filtering for `mem_query`, diff views.
+6. **Conflict preflight**: `mem sync --dry-run` / `mem resolve --check`, to surface the conflict scope before an actual rebase.
+7. **Encryption**: built-in store-level encryption or a standardized git-crypt usage documented in the docs.
+8. **Cross-platform validation**: path case sensitivity and non-UTF-8 behavior on Windows/macOS need CI coverage.
+9. **Import/export**: batch-import events from other memory formats (Markdown/notes).
 
-> 这些方向都不改变当前的核心约束：Git 仍是唯一传输层；本地 store 仍是 append-only JSONL 的事实来源。
+> None of these directions changes the current core constraints: Git remains the only transport layer; the local store remains the append-only JSONL source of truth.
 
-## 10. 相关阅读
+## 10. Further reading
 
-- [ARCHITECTURE.md](ARCHITECTURE.md) —— 组件、读写路径、存储格式、并发与同步细节；
-- [CLI.md](CLI.md) —— `mem` 命令参考；
-- [MCP.md](MCP.md) —— MCP 工具与客户端配置；
-- [MIGRATION.md](MIGRATION.md) —— 旧格式数据迁移；
-- [TROUBLESHOOTING.md](TROUBLESHOOTING.md) —— 常见问题排查；
-- [../CHANGELOG.md](../CHANGELOG.md) —— 版本变更记录。
+- [ARCHITECTURE.md](ARCHITECTURE.md) — components, read/write paths, storage format, concurrency and sync details;
+- [CLI.md](CLI.md) — `mem` command reference;
+- [MCP.md](MCP.md) — MCP tools and client configuration;
+- [MIGRATION.md](MIGRATION.md) — migrating data from the old format;
+- [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — troubleshooting common issues;
+- [../CHANGELOG.md](../CHANGELOG.md) — version change history.

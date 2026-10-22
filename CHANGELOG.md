@@ -29,8 +29,11 @@
   - 文件身份规范化为 store / git 仓库 / CWD 相对路径，同一文件在各设备得到同一标识
   - 时间戳统一为定宽 UTC 纳秒格式 `YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ`
   - store 定位规则在 CLI 与 MCP 之间统一：`--path` > `$ACDM_STORE` > 向上找 `.mem`/`events/` > CWD
-- **文档与工程**：中文 README、`docs/` 五份专题文档、GitHub Actions CI
-  （fmt / clippy `-D warnings` / test / release build）、MIT License、`rustfmt.toml`。
+- **文档**：中英双语。英文为默认展示（`README.md` 与 `docs/` 下六份专题文档），中文在
+  `README.zh-CN.md` 与 `docs/zh-CN/`；每篇顶部都有语言切换行，两版本章节、代码块与链接保持
+  一一对应（含可实测的迁移脚本）。
+- **工程**：GitHub Actions CI（fmt / clippy `-D warnings` / test / release build）、
+  MIT License、`rustfmt.toml`。
 - **测试**：55 个测试（30 core 单元 + 9 CLI 集成 + 6 MCP 单元 + 10 MCP 集成），
   含真实 rebase 冲突、locale、跨月排序、字节级冲突保留等回归用例。
 

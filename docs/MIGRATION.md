@@ -1,106 +1,108 @@
-# 迁移指南
+**English** · [简体中文](zh-CN/MIGRATION.md)
 
-> 读者：正在把已有 ACDM store 升级到 0.1.0 的用户，或从内部预发布快照迁移的开发者。
-> 本文件说明「哪些变化需要动手、哪些读取端已经兼容」，并给出经过实测的迁移脚本。
+# Migration Guide
 
-## 数据格式与兼容性总则
+> Audience: users upgrading an existing ACDM store to 0.1.0, or developers migrating from internal prerelease snapshots.
+> This document explains "which changes require action and which are already compatible on the read side", and provides a migration script that has been tested in practice.
 
-- **store 目录结构未变**：`events/`、`projects/`、`.mem`（0.1.0 新增）、`.gitignore`。
-  `.mem` 是标记文件，内容形如 `{"format": 1, "created_at": "..."}`，用于从子目录发现 store。
-- **读端向后兼容**：历史数据里的两种旧时间戳格式（纳秒 + `+00:00`、秒级 `Z`）都能解析，
-  时间排序按「解析后的时间」比较；无法解析的行会被跳过（读取）或逐字保留（`mem resolve`）。
-- **写端格式统一**：新写入的时间戳一律是定宽 UTC 纳秒 `YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ`，
-  文件标识一律是规范化相对路径。
-- **事件日志保持 append-only**：除了 `mem resolve` 处理冲突、以及下文的可选迁移脚本，
-  正常写入不会重写既有行。
+## Data format and compatibility ground rules
 
-## 0.1.0 相对内部预发布快照的变化
+- **The store directory structure is unchanged**: `events/`, `projects/`, `.mem` (new in 0.1.0), `.gitignore`.
+  `.mem` is a marker file whose content looks like `{"format": 1, "created_at": "..."}`, used to discover the store from subdirectories.
+- **The read side is backward compatible**: both old timestamp formats in historical data (nanoseconds + `+00:00`, seconds-level `Z`) can be parsed,
+  time ordering compares by "parsed time"; unparseable lines are skipped (reads) or preserved verbatim (`mem resolve`).
+- **The write side uses a unified format**: newly written timestamps are always fixed-width UTC nanoseconds `YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ`,
+  and file identities are always normalized relative paths.
+- **The event log stays append-only**: apart from `mem resolve` handling conflicts and the optional migration script below,
+  normal writes never rewrite existing lines.
 
-| 变化 | 影响 | 是否需要动作 |
+## Changes in 0.1.0 relative to internal prerelease snapshots
+
+| Change | Impact | Action needed? |
 | --- | --- | --- |
-| 时间戳格式统一为 30 字符 UTC `Z` | 读取端兼容旧格式，排序正确 | 否 |
-| ID 格式改为 `YYYYMMDDHHMMSS_nanos9_pid5_counter4`（UTC） | 新旧 ID 可共存；按 `ts` 排序，不依赖 ID | 仅当下游脚本解析 ID 结构时需要 |
-| `file_name` 规范化为相对路径 | 旧数据里的绝对路径不会自动改写 | 可选，见下文「迁移 B」 |
-| `mem resolve` 输出新增 `Lines preserved` | 若脚本解析了该命令的 stdout 需适配 | 视情况 |
-| MCP `mem_add_event.files[].action` 改为可选（缺省 `Modified`） | 旧客户端传 action 仍正常 | 否 |
-| MCP `mem_resolve` 返回文本追加 preserved 行数 | 若按旧文本全量匹配需适配 | 视情况 |
-| 移除 `MemStore::scan_files` / `MemStore::read_latest_events` / `nodes/` | 调用这些 API 的代码会编译失败 | 库使用者需要改，见下文 |
-| 读取容忍损坏行 | 以前直接报错的 store 现在会跳过坏行继续读 | 建议跑一次健康检查 |
+| Timestamp format unified to 30-character UTC `Z` | The read side is compatible with old formats, and ordering is correct | No |
+| ID format changed to `YYYYMMDDHHMMSS_nanos9_pid5_counter4` (UTC) | Old and new IDs can coexist; ordering is by `ts`, not by ID | Only if downstream scripts parse the ID structure |
+| `file_name` normalized to relative paths | Absolute paths in old data are not rewritten automatically | Optional, see "Migration B" below |
+| `mem resolve` output gains `Lines preserved` | Adapt if a script parses that command's stdout | Depends |
+| MCP `mem_add_event.files[].action` made optional (defaults to `Modified`) | Old clients that pass action still work | No |
+| MCP `mem_resolve` response text gains the preserved line count | Adapt if you match the old text in full | Depends |
+| Removed `MemStore::scan_files` / `MemStore::read_latest_events` / `nodes/` | Code calling these APIs will fail to compile | Library users need to change, see below |
+| Reads tolerate corrupted lines | Stores that previously failed outright now skip bad lines and keep reading | Recommended to run a health check once |
 
-## 升级步骤（单机）
+## Upgrade steps (single machine)
 
 ```bash
-# 1) 备份：整个 store 目录（含 .git）
+# 1) Back up: the entire store directory (including .git)
 cp -a /path/to/store /path/to/store.bak-$(date +%Y%m%d)
 
-# 2) 确认没有进行中的 rebase / 未解决冲突
+# 2) Confirm there is no rebase in progress / no unresolved conflicts
 git -C /path/to/store status --short
 ls /path/to/store/.git/rebase-merge /path/to/store/.git/rebase-apply 2>/dev/null
 
-# 3) 升级二进制（cargo build --release 后替换 PATH 中的 mem / mem-mcp）
+# 3) Upgrade the binaries (after cargo build --release, replace mem / mem-mcp in PATH)
 cargo build --release
 
-# 4) 冒烟检查
+# 4) Smoke check
 /path/to/mem --path /path/to/store list
-/path/to/mem --path /path/to/store resolve     # 清理历史遗留的冲突标记（若有）
+/path/to/mem --path /path/to/store resolve     # clean up leftover conflict markers (if any)
 
-# 5) 同步一次，把迁移过程中的本地改动推上去
+# 5) Sync once to push the local changes made during migration
 /path/to/mem --path /path/to/store sync
 ```
 
-多设备升级顺序：**先升级一台 → 完成一次 `sync` → 再升级其他设备**。旧版本仍能读取新格式
-（它把时间戳当字符串存），但旧版本会继续写出旧时间戳格式与未规范化的路径，尽量缩短混用窗口。
+Multi-device upgrade order: **upgrade one device first → complete one `sync` → then upgrade the other devices**. Old versions can still read the new format
+(they store the timestamp as a string), but old versions will keep writing the old timestamp format and non-normalized paths, so keep the mixed-version window as short as possible.
 
-## 迁移 A：时间戳格式（通常不需要）
+## Migration A: timestamp format (usually unnecessary)
 
-不需要做任何事。读取端已按解析后的时间排序，旧格式不会导致排序错误。
+Nothing needs to be done. The read side already orders by parsed time, and the old format does not cause ordering errors.
 
-只有在「必须让整份 JSONL 的字符串序等于时间序」的特殊场景（例如外部工具直接按字符串比较
-`ts`）才考虑重写；重写会破坏 append-only 语义与哈希类审计，**不建议**。
+Only consider rewriting in the special scenario where "the string order of the whole JSONL must equal the time order" (for example, external tools compare
+`ts` as strings directly); rewriting breaks append-only semantics and hash-based auditing, and is **not recommended**.
 
-## 迁移 B：把绝对路径 `file_name` 改为相对路径（可选）
+## Migration B: rewrite absolute-path `file_name` to relative paths (optional)
 
-**何时需要**：旧版本按「用户传入的路径原样」记录 `file_name`。如果你曾经传入绝对路径
-（例如 `/home/alice/repo/src/main.rs`），那么：
+**When it is needed**: old versions recorded `file_name` "exactly as the user passed the path". If you have ever passed absolute paths
+(for example `/home/alice/repo/src/main.rs`), then:
 
-- `mem query -n src/main.rs` 查不到这些旧记录；
-- 同一文件在不同设备上会被当作不同文件，`mem list -p` 会多出条目、`mem render` 的文件表出现重复。
+- `mem query -n src/main.rs` cannot find these old records;
+- The same file is treated as different files on different devices; `mem list -p` shows extra entries, and the file table produced by `mem render` contains duplicates.
 
-**先备份，再 dry-run，最后执行**。脚本只改 `file_name` 字段，保留未知字段与无法解析的行，
-未改动的行保持字节不变，采用「临时文件 + 原子 rename」写回。
+**Back up first, then dry-run, then execute**. The script only changes the `file_name` field, preserves unknown fields and unparseable lines,
+keeps unchanged lines byte-for-byte intact, and writes back using a "temporary file + atomic rename".
 
 ```bash
-# 预览（不写盘），退出码 0 = 全部可迁移；2 = 有绝对路径没匹配到任何前缀
+# Preview (no writes); exit code 0 = everything is migratable, 2 = some absolute paths matched no prefix
 python3 migrate_absolute_paths.py --store /path/to/store \
     --strip-prefix /home/alice/repo --dry-run
 
-# 执行
+# Execute
 python3 migrate_absolute_paths.py --store /path/to/store \
     --strip-prefix /home/alice/repo
 
-# 迁移后验证
+# Verify after migration
 /path/to/mem --path /path/to/store query -n src/main.rs
 /path/to/mem --path /path/to/store list -p <project>
-/path/to/mem --path /path/to/store compact -p <project>   # 会保留每个 file_name 的最新记录
+/path/to/mem --path /path/to/store compact -p <project>   # keeps the latest record for each file_name
 /path/to/mem --path /path/to/store sync
 ```
 
-需要多个前缀（例如不同项目目录）时重复 `--strip-prefix`：
+When multiple prefixes are needed (e.g. different project directories), repeat `--strip-prefix`:
 
 ```bash
 python3 migrate_absolute_paths.py --store /path/to/store \
     --strip-prefix /home/alice/repo --strip-prefix /srv/work/repo
 ```
 
-注意：
+Notes:
 
-- 同一文件在旧数据里若同时存在「绝对路径记录」和「相对路径记录」，迁移后它们会归并为同一个
-  `file_name`，历史条目仍在，`mem compact` 会收敛为最新一条。
-- 脚本会同时改写 `events/*.jsonl` 里的 `event.files[].file_name` 与
-  `projects/*/files.jsonl` 里的记录（查询索引读的是事件，文件表读的是后者，两者都要改）。
-- `mem resolve` 依赖 `file_id` / `event_id` 去重，迁移不改这两个字段，冲突解决不受影响。
+- If a file has both "absolute-path records" and "relative-path records" in the old data, after migration they are merged into the same
+  `file_name`; the history entries are still there, and `mem compact` converges to the latest one.
+- The script rewrites both `event.files[].file_name` in `events/*.jsonl` and
+  the records in `projects/*/files.jsonl` (queries read the index from events, the file table reads the latter — both must be changed).
+- `mem resolve` deduplicates by `file_id` / `event_id`; the migration does not change these two fields, so conflict resolution is unaffected.
 
-完整脚本（复制为 `migrate_absolute_paths.py`）：
+Full script (copy as `migrate_absolute_paths.py`):
 
 ```python
 #!/usr/bin/env python3
@@ -271,27 +273,27 @@ if __name__ == "__main__":
     sys.exit(main())
 ```
 
-## 代码迁移（直接使用 `mem-core` 库的调用方）
+## Code migration (callers using the `mem-core` library directly)
 
-| 旧用法 | 新用法 |
+| Old usage | New usage |
 | --- | --- |
-| `MemStore::read_latest_events(n)` | `MemStore::read_latest_events_for_project(project, n)`（跨月正确；全局最新事件可用 `read_all_events` + 自行筛选） |
-| `MemStore::scan_files(dir)` | 已删除；用 `ignore::WalkBuilder` 自行遍历 |
-| `MemStore::nodes_dir()` | 已删除；设备信息在每条事件的 `device` 字段中 |
-| `render_project_readme` 需要先有 `meta.json` | 缺少元数据时会自动兜底生成 |
-| `ResolveReport { resolved_files, total_conflicts_resolved, deduplicated_items }` | 结构体新增 `lines_preserved` 字段；用 `..Default::default()` 或逐字段构造时补上 |
-| 自行拼接 `Event.ts` | 改用 `mem_core::now_rfc3339()`；比较时间用 `mem_core::ts_cmp()` / `sort_events()` |
-| 自行拼接设备名 / 哈希 | `mem_core::default_device_name()` / `mem_core::compute_sha256()` |
-| 自行实现 store 向上查找 | `mem_core::resolve_store_root(None)`；写 `file_name` 用 `mem_core::normalize_file_name(path, &store.root)` |
+| `MemStore::read_latest_events(n)` | `MemStore::read_latest_events_for_project(project, n)` (correct across months; for globally latest events use `read_all_events` + your own filtering) |
+| `MemStore::scan_files(dir)` | Removed; use `ignore::WalkBuilder` to traverse yourself |
+| `MemStore::nodes_dir()` | Removed; device information is in each event's `device` field |
+| `render_project_readme` requires a pre-existing `meta.json` | Missing metadata is now backfilled automatically |
+| `ResolveReport { resolved_files, total_conflicts_resolved, deduplicated_items }` | The struct gains a `lines_preserved` field; add it when using `..Default::default()` or constructing field by field |
+| Building `Event.ts` by hand | Use `mem_core::now_rfc3339()`; compare times with `mem_core::ts_cmp()` / `sort_events()` |
+| Building device names / hashes by hand | `mem_core::default_device_name()` / `mem_core::compute_sha256()` |
+| Implementing store upward search by hand | `mem_core::resolve_store_root(None)`; to write `file_name` use `mem_core::normalize_file_name(path, &store.root)` |
 
-## 回滚
+## Rollback
 
-- **代码**：`git checkout <之前的提交>` 并重新构建即可。
-- **数据**：优先恢复升级前的备份（`store.bak-*`）。旧版本能读取新格式数据，但按字符串比较时间戳
-  排序可能不准确，所以回滚后如果还要长期使用旧版本，建议同时恢复数据备份。
-- 迁移脚本没有自动回滚开关；执行前必须有备份。
+- **Code**: `git checkout <previous commit>` and rebuild.
+- **Data**: prefer restoring the pre-upgrade backup (`store.bak-*`). Old versions can read the new-format data, but ordering by string comparison of timestamps
+  may be inaccurate, so if you plan to keep using the old version for a long time after rollback, also restore the data backup.
+- The migration script has no automatic rollback switch; a backup is mandatory before running it.
 
-## 数据格式版本策略
+## Data format version policy
 
-- `.mem` 的 `format` 字段当前为 `1`。未来若发生不兼容的数据格式变更，会提升该值并在此文档给出
-  迁移步骤；读端会先检查该标记再决定是否升级数据。
+- The `format` field of `.mem` is currently `1`. If an incompatible data format change happens in the future, this value will be bumped and the
+  migration steps will be documented here; the read side checks the marker first and then decides whether to upgrade the data.

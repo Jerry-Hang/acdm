@@ -1,17 +1,19 @@
-# `mem` CLI 完整参考
+**English** · [简体中文](zh-CN/CLI.md)
 
-> 读者：需要日常使用或脚本化调用 `mem` 的开发者与 AI Agent 操作者。本文覆盖全部 8 个子命令的参数、输出格式、退出码与真实边界行为；Agent 侧的 MCP 入口见 [MCP.md](MCP.md)，架构与设计动机见 [ARCHITECTURE.md](ARCHITECTURE.md) 与 [DESIGN.md](DESIGN.md)。
+# `mem` CLI Complete Reference
 
-本文以 `mem-cli/src/main.rs` 的 clap 定义为**唯一权威**（参数名、必填性、默认值均以源码为准）。文中所有示例输出都在 v0.1.0 的实际二进制上运行得到；为可读性，示例中的 store 绝对路径统一替换为 `/path/to/store` 占位符，事件 ID、时间戳、SHA256 与其余文本保持原样。示例中执行 git 提交前均已配置 git 用户身份；涉及 git 错误信息的地方以 `LC_ALL=C` 运行，因此错误文本是英文（git 错误消息随 locale 变化）。
+> Audience: developers and AI-agent operators who use or script the `mem` CLI day to day. This document covers the arguments, output formats, exit codes, and real boundary behavior of all 8 subcommands; for the MCP entry point used by agents see [MCP.md](MCP.md), and for architecture and design rationale see [ARCHITECTURE.md](ARCHITECTURE.md) and [DESIGN.md](DESIGN.md).
 
-## 目录
+The clap definition in `mem-cli/src/main.rs` is the **single source of truth** for this document (argument names, requiredness, and defaults all follow the source). Every example output below was produced by running the actual v0.1.0 binary; for readability, store absolute paths in the examples are replaced with the `/path/to/store` placeholder, while event IDs, timestamps, SHA256 values, and all other text are kept verbatim. Git user identity was configured before any commit shown here; commands that surface git errors were run with `LC_ALL=C`, so the error text is English (git error messages vary with locale).
 
-- [1. 概览](#1-概览)
-  - [1.1 构建与安装](#11-构建与安装)
-  - [1.2 全局参数与 store 定位](#12-全局参数与-store-定位)
-  - [1.3 store 目录结构](#13-store-目录结构)
-- [2. 退出码与错误行为](#2-退出码与错误行为)
-- [3. 子命令](#3-子命令)
+## Contents
+
+- [1. Overview](#1-overview)
+  - [1.1 Build and installation](#11-build-and-installation)
+  - [1.2 Global option and store discovery](#12-global-option-and-store-discovery)
+  - [1.3 Store layout](#13-store-layout)
+- [2. Exit codes and error behavior](#2-exit-codes-and-error-behavior)
+- [3. Subcommands](#3-subcommands)
   - [3.1 init](#31-init)
   - [3.2 add](#32-add)
   - [3.3 query](#33-query)
@@ -20,72 +22,72 @@
   - [3.6 sync](#36-sync)
   - [3.7 resolve](#37-resolve)
   - [3.8 render](#38-render)
-- [4. 环境变量](#4-环境变量)
-- [5. 常见工作流](#5-常见工作流)
-- [6. 相关文档](#6-相关文档)
+- [4. Environment variables](#4-environment-variables)
+- [5. Common workflows](#5-common-workflows)
+- [6. Related documentation](#6-related-documentation)
 
-## 1. 概览
+## 1. Overview
 
-`mem` 是 ACDM（Agent Cross-Device Memory System）的命令行入口。ACDM 用一个由 Git 同步的 append-only JSONL store 记录「哪个 Agent、在哪台设备上、对哪些文件做了什么改动」，从而让多台机器上的多个 Agent 共享同一份项目记忆。`mem` 负责人工操作与脚本调用；`mem-mcp` 把同一套核心能力暴露成 MCP 工具（见 [MCP.md](MCP.md)）。两者读写的是**同一个 store**，可以混用。
+`mem` is the command-line entry point of ACDM (Agent Cross-Device Memory System). ACDM uses a Git-synchronized, append-only JSONL store to record "which agent changed which files on which device", so that multiple agents on multiple machines share one project memory. `mem` serves manual operation and scripting; `mem-mcp` exposes the same core capabilities as MCP tools (see [MCP.md](MCP.md)). Both read and write **the same store**, and the two can be mixed freely.
 
-### 1.1 构建与安装
+### 1.1 Build and installation
 
-需要 Rust stable（edition 2021）；只有 `sync` 与 `resolve` 的 git 操作需要本机有 `git`。
+Rust stable (edition 2021) is required; only the git operations in `sync` and `resolve` need `git` on the machine.
 
 ```bash
-# 构建 release 二进制（workspace 会同时构建 mem 与 mem-mcp）
+# Build the release binaries (the workspace builds both mem and mem-mcp)
 cargo build --release
-# 产物：
+# Artifacts:
 #   target/release/mem
 #   target/release/mem-mcp
 ```
 
-把 `target/release/mem` 放进 `PATH`（或直接用绝对路径调用）即可。下文示例假设 `mem` 已在 `PATH` 中。
+Put `target/release/mem` on your `PATH` (or invoke it by absolute path). The examples below assume `mem` is on `PATH`.
 
-### 1.2 全局参数与 store 定位
+### 1.2 Global option and store discovery
 
-所有子命令共享一个全局参数：
+All subcommands share one global option:
 
-| 参数 | 必填 | 默认 | 说明 |
+| Option | Required | Default | Description |
 | --- | --- | --- | --- |
-| `--path <DIR>` | 否 | 见下方定位规则 | 指定 store 根目录；`mem --path <DIR> <子命令>` 与 `mem <子命令> --path <DIR>` 等价 |
+| `--path <DIR>` | No | See the discovery rules below | Store root directory; `mem --path <DIR> <subcommand>` and `mem <subcommand> --path <DIR>` are equivalent |
 
-store 定位优先级从高到低（`mem` 与 `mem-mcp` 完全一致，实现在 `mem-core/src/util.rs::resolve_store_root`）：
+Store discovery priority, highest first (`mem` and `mem-mcp` behave identically; implemented in `mem-core/src/util.rs::resolve_store_root`):
 
-1. 显式 `--path <DIR>`；
-2. 环境变量 `ACDM_STORE`；
-3. 从当前工作目录（CWD）向上逐级查找**最近的** store 根：某目录存在 `.mem` 标记文件，或存在 `events/` 目录；
-4. 兜底：CWD 本身。
+1. explicit `--path <DIR>`;
+2. the `ACDM_STORE` environment variable;
+3. walk up from the current working directory (CWD) looking for the **nearest** store root: a directory that contains a `.mem` marker file or an `events/` directory;
+4. fallback: the CWD itself.
 
-`init` 是唯一例外：它**不做向上搜索**，只使用显式的 `--path`（子命令级 `--path` 优先于全局 `--path`）或 CWD 作为**要初始化**的目标目录。
+`init` is the only exception: it **does not search upwards** and uses only an explicit `--path` (a subcommand-level `--path` wins over the global `--path`) or the CWD as the target directory to **initialize**.
 
 ```bash
-# 全局参数写在子命令之后同样有效
+# A global option also works when placed after the subcommand
 mem list --path /path/to/store
 
-# init 上的子命令级 --path 优先于全局 --path：
-# 实际初始化的是 ./actual，而不是 ./ignored，也不会创建 ./ignored
+# A subcommand-level --path on init wins over the global --path:
+# ./actual is initialized, not ./ignored, and ./ignored is never created
 mem --path ./ignored init --path ./actual
 ```
 
-### 1.3 store 目录结构
+### 1.3 Store layout
 
-`mem init` 创建的结构：
+Layout created by `mem init`:
 
 ```text
 <store root>/
-├── .mem                 # JSON 标记文件，标识 store 根
-├── .gitignore           # 默认忽略规则（仅当不存在时创建）
+├── .mem                 # JSON marker file that identifies the store root
+├── .gitignore           # default ignore rules (created only when missing)
 ├── events/
-│   └── YYYY-MM.jsonl    # 事件日志：每月一个文件，只追加
+│   └── YYYY-MM.jsonl    # event log: one file per month, append-only
 └── projects/
     └── <project>/
-        ├── files.jsonl  # 该项目的文件记录：只追加，可被 compact 重写
-        ├── meta.json    # 项目元数据（首次 add 时自动创建，可手工编辑）
-        └── README.md    # mem render 生成的项目说明
+        ├── files.jsonl  # this project's file records: append-only, can be rewritten by compact
+        ├── meta.json    # project metadata (auto-created on first add, editable by hand)
+        └── README.md    # project description generated by mem render
 ```
 
-`.mem` 是一个 JSON 文件，内容形如：
+`.mem` is a JSON file that looks like this:
 
 ```json
 {
@@ -94,7 +96,7 @@ mem --path ./ignored init --path ./actual
 }
 ```
 
-`init` 写入的默认 `.gitignore` 内容：
+Default `.gitignore` content written by `init`:
 
 ```gitignore
 target/
@@ -105,18 +107,18 @@ target/
 .DS_Store
 ```
 
-## 2. 退出码与错误行为
+## 2. Exit codes and error behavior
 
-| 退出码 | 含义 | 输出位置与形式 |
+| Exit code | Meaning | Output location and form |
 | --- | --- | --- |
-| `0` | 成功 | 正常结果写 stdout |
-| `1` | 运行时错误 | stderr 打印 `Error: <原因>`（多行错误会续行）；可能在 `Error:` 之前先有 `Warning:` 警告 |
-| `2` | 命令行参数解析错误（clap 约定） | stderr 打印 `error: ...` 与 `Usage:` / `For more information, try '--help'.` |
+| `0` | Success | Normal results go to stdout |
+| `1` | Runtime error | stderr prints `Error: <reason>` (multi-line errors continue on following lines); a `Warning:` may appear before `Error:` |
+| `2` | Command-line argument parsing error (clap convention) | stderr prints `error: ...` plus `Usage:` / `For more information, try '--help'.` |
 
-要点：
+Key points:
 
-- 运行时错误统一走 `run() -> Result`，由 `main` 打印 `Error: ...` 后 `std::process::exit(1)`；成功路径退出码为 0。
-- `query` 没有给出任何过滤条件时也是**运行时错误**（退出码 1），错误文本为两行：
+- Runtime errors all flow through `run() -> Result`; `main` prints `Error: ...` and calls `std::process::exit(1)`. The success path exits with code 0.
+- `query` with no filter at all is also a **runtime error** (exit code 1), with a two-line message:
 
 ```text
 $ mem --path ./memory query
@@ -125,7 +127,7 @@ Please specify at least one filter: --project (-p), --file-id, --filename (-n), 
 [exit code 1]
 ```
 
-- 极少数命令会**先向 stdout 输出标题，再在 stderr 报错**（例如 `query --fuzzy` 的正则非法），脚本解析时需要注意两个流：
+- A very small number of commands **print a heading to stdout first and then report an error on stderr** (for example, an invalid regex for `query --fuzzy`); scripts must handle the two streams separately:
 
 ```text
 $ mem --path ./memory query --fuzzy '['
@@ -137,7 +139,7 @@ error: unclosed character class
 [exit code 1]
 ```
 
-- 参数解析错误退出码为 2，例如：
+- Argument parsing errors exit with code 2, for example:
 
 ```text
 $ mem nope
@@ -159,48 +161,48 @@ For more information, try '--help'.
 [exit code 2]
 ```
 
-- **唯一的例外**：`sync` 检测到 Git 冲突时以退出码 0 结束，只在 stderr 提示运行 `mem resolve`（见 [3.6 sync](#36-sync)）。
+- **The one exception**: `sync` exits with code 0 when it detects a Git conflict, and only tells you on stderr to run `mem resolve` (see [3.6 sync](#36-sync)).
 
-## 3. 子命令
+## 3. Subcommands
 
 ### 3.1 init
 
-初始化一个新的 ACDM store。
+Initialize a new ACDM store.
 
-**用法**
+**Usage**
 
 ```text
 mem init [OPTIONS]
 ```
 
-**参数**
+**Arguments**
 
-| 短选项 | 长选项 | 必填 | 默认 | 说明 |
+| Short option | Long option | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| — | `--remote <URL>` | 否 | 无 | 同时执行 `git init` 并添加 `origin` 远端；URL 不校验连通性、不推送 |
-| — | `--path <DIR>` | 否 | CWD | 要初始化的目录；优先于全局 `--path` |
-| `-h` | `--help` | 否 | — | 打印帮助 |
+| — | `--remote <URL>` | No | None | Also runs `git init` and adds an `origin` remote; the URL is not connectivity-checked and nothing is pushed |
+| — | `--path <DIR>` | No | CWD | Directory to initialize; overrides the global `--path` |
+| `-h` | `--help` | No | — | Print help |
 
-**行为**
+**Behavior**
 
-1. 创建 `<DIR>/events/`、`<DIR>/projects/`；
-2. 若 `<DIR>/.mem` 不存在则写入标记文件（`format: 1` + 创建时间）；
-3. 若 `<DIR>/.gitignore` 不存在则写入默认忽略规则；
-4. 若给了 `--remote`：再执行 `git init` 与 `git remote add origin <URL>`。
+1. Create `<DIR>/events/` and `<DIR>/projects/`;
+2. if `<DIR>/.mem` does not exist, write the marker file (`format: 1` plus creation time);
+3. if `<DIR>/.gitignore` does not exist, write the default ignore rules;
+4. if `--remote` is given: also run `git init` and `git remote add origin <URL>`.
 
-重复执行 `init` 是幂等的：已存在的 `.mem` 与 `.gitignore` 不会被覆盖，输出仍然成功。`init` 不会配置 git 用户身份，`sync` 前需自行配置（见 [3.6 sync](#36-sync)）。
+Running `init` repeatedly is idempotent: an existing `.mem` and `.gitignore` are not overwritten, and the command still reports success. `init` does not configure git user identity; configure it yourself before `sync` (see [3.6 sync](#36-sync)).
 
-**示例**
+**Example**
 
 ```bash
-# 纯本地 store
+# Local-only store
 mem init --path ./memory
 
-# 同时配置 Git remote：会 git init 并添加 origin
+# Also configure a Git remote: runs git init and adds origin
 mem init --path ./memory --remote git@github.com:you/acdm-memory.git
 ```
 
-**真实输出**
+**Real output**
 
 ```text
 $ mem init --path ./memory
@@ -218,7 +220,7 @@ Created directory structure:
   └── .mem          (Store marker file; lets the CLI/MCP find the store from any subdirectory)
 ```
 
-`--remote` 执行后的 git 状态（示例在独立目录中验证）：
+Git state after `--remote` (verified in a separate directory):
 
 ```text
 $ git -C ./memory remote -v
@@ -226,47 +228,47 @@ origin	git@github.com:you/acdm-memory.git (fetch)
 origin	git@github.com:you/acdm-memory.git (push)
 ```
 
-**注意事项**
+**Notes**
 
-- `init` 不向上搜索已有 store；要初始化子目录必须显式给 `--path`。
-- `--remote` 只添加远端，不验证 URL、不设置分支跟踪、不推送；首次同步前需要本地已有提交并设置 upstream（见 [3.6 sync](#36-sync)）。
-- 若仓库已存在 `origin`，再次 `--remote` 会因 `git remote add` 失败而打印 `Error: ...` 并以退出码 1 结束。
+- `init` does not search upwards for an existing store; to initialize a subdirectory you must pass `--path` explicitly.
+- `--remote` only adds a remote: it does not validate the URL, set branch tracking, or push. Before the first sync, the local repository needs at least one commit and an upstream branch (see [3.6 sync](#36-sync)).
+- If `origin` already exists, running `--remote` again fails in `git remote add`, prints `Error: ...`, and exits with code 1.
 
 ### 3.2 add
 
-把一个事件（摘要 + 一组文件记录）追加到项目记忆。
+Append one event (a summary plus a set of file records) to project memory.
 
-**用法**
+**Usage**
 
 ```text
 mem add [OPTIONS] --project <PROJECT> --summary <SUMMARY> <FILES>...
 ```
 
-**参数**
+**Arguments**
 
-| 短选项 | 长选项 | 必填 | 默认 | 说明 |
+| Short option | Long option | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `-p` | `--project <PROJECT>` | **是** | — | 项目名（对应 `projects/<name>/`） |
-| `-s` | `--summary <SUMMARY>` | **是** | — | 本次改动摘要 |
-| `-d` | `--device <DEVICE>` | 否 | 本机 hostname | 设备名；取不到 hostname 时依次回退 `$HOSTNAME`、`$COMPUTERNAME`、`localhost` |
-| `-a` | `--agent <AGENT>` | 否 | `human` | 记录者名称 |
-| — | `<FILES>...` | **是**（≥1 个） | — | 文件路径（相对 CWD 或绝对路径） |
-| — | `--path <DIR>` | 否 | 自动定位 | 全局参数：store 根目录 |
-| `-h` | `--help` | 否 | — | 打印帮助 |
+| `-p` | `--project <PROJECT>` | **Yes** | — | Project name (maps to `projects/<name>/`) |
+| `-s` | `--summary <SUMMARY>` | **Yes** | — | Summary of this change |
+| `-d` | `--device <DEVICE>` | No | Local hostname | Device name; when hostname is unavailable it falls back to `$HOSTNAME`, then `$COMPUTERNAME`, then `localhost` |
+| `-a` | `--agent <AGENT>` | No | `human` | Recorder name |
+| — | `<FILES>...` | **Yes** (at least 1) | — | File paths (relative to the CWD, or absolute) |
+| — | `--path <DIR>` | No | Auto-discovered | Global option: store root directory |
+| `-h` | `--help` | No | — | Print help |
 
-**行为**
+**Behavior**
 
-1. 读取该项目 `projects/<project>/files.jsonl` 中现有的 `file_name` 集合（每个文件名只取最新记录）。
-2. 对每个 `<FILES>`：
-   - 规范化文件身份 `file_name`：优先相对 store 根；文件在 store 外时相对最近的 git 仓库根；再退回相对 CWD；都无法相对化时保留**绝对路径**，并向 stderr 打印警告；
-   - 文件存在：读取内容，`size_bytes` = 字节数，`hash` = 内容的 SHA256 十六进制；若 `file_name` 已在该项目的已知文件名中则为 `Modified`，否则为 `Created`；
-   - 文件不存在：记为 `Deleted`，`size_bytes = 0`，`hash = ""`；
-   - 为每条记录生成独立的 `file_id`。
-3. 生成事件：`event_id` 形如 `YYYYMMDDHHMMSS_nanos9_pid5_counter4`（UTC）；`ts` 为固定宽度 UTC 纳秒 `YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ`。
-4. 若 `projects/<project>/meta.json` 读取失败（不存在），自动写入最小元数据：`description` 为 `"Project <name>"`、`github_url` 为 `null`、`created_at` 等于本次事件时间。
-5. 追加事件行到 `events/YYYY-MM.jsonl`，并把本次的每条 `FileRecord` 追加到 `projects/<project>/files.jsonl`（追加时持有排他文件锁）。
+1. Read the set of existing `file_name` values from the project's `projects/<project>/files.jsonl` (only the latest record per filename).
+2. For each `<FILES>` entry:
+   - normalize the file identity `file_name`: prefer relative to the store root; when the file is outside the store, relative to the nearest git repository root; then fall back to relative to the CWD; if none of these applies, keep the **absolute path** and print a warning to stderr;
+   - file exists: read its contents, set `size_bytes` to the byte count and `hash` to the SHA256 hex digest of the contents; if `file_name` is already a known filename in this project the action is `Modified`, otherwise `Created`;
+   - file does not exist: record `Deleted` with `size_bytes = 0` and `hash = ""`;
+   - generate an independent `file_id` for each record.
+3. Generate the event: `event_id` has the form `YYYYMMDDHHMMSS_nanos9_pid5_counter4` (UTC); `ts` is the fixed-width UTC timestamp with nanoseconds, `YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ`.
+4. If `projects/<project>/meta.json` cannot be read (does not exist), automatically write minimal metadata: `description` is `"Project <name>"`, `github_url` is `null`, and `created_at` equals this event's time.
+5. Append the event line to `events/YYYY-MM.jsonl`, and append each of this event's `FileRecord` entries to `projects/<project>/files.jsonl` (holding an exclusive file lock while appending).
 
-**真实输出（Created）**
+**Real output (Created)**
 
 ```text
 $ mem --path ./memory add -p demo -s "add hello" -d laptop -a claude project/src/hello.txt
@@ -280,10 +282,10 @@ Successfully recorded event: 20261022130617_173540407_23160_0001
     • [Created] src/hello.txt (12 bytes, sha256: a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447)
 ```
 
-**真实输出（Modified、Deleted、多文件）**
+**Real output (Modified, Deleted, multiple files)**
 
 ```text
-# 修改 project/src/hello.txt 后再次记录：同一 file_name 已知 → Modified
+# After modifying project/src/hello.txt, record it again: the same file_name is known → Modified
 $ mem --path ./memory add -p demo -s "update hello" -d laptop -a claude project/src/hello.txt
 Successfully recorded event: 20261022130617_174846583_23161_0001
   Project:   demo
@@ -294,7 +296,7 @@ Successfully recorded event: 20261022130617_174846583_23161_0001
   Files (1):
     • [Modified] src/hello.txt (15 bytes, sha256: a56bd9a88d97584151e7626675654fc5678c5c9d75be0091100a829262cead2c)
 
-# 文件不存在 → Deleted（size 0，hash 为空，输出中显示为 "-"）
+# File does not exist → Deleted (size 0, empty hash, shown as "-" in the output)
 $ mem --path ./memory add -p demo -s "remove obsolete" -d laptop -a claude project/src/removed.txt
 Successfully recorded event: 20261022130617_177477279_23163_0001
   Project:   demo
@@ -305,7 +307,7 @@ Successfully recorded event: 20261022130617_177477279_23163_0001
   Files (1):
     • [Deleted] src/removed.txt (0 bytes, sha256: -)
 
-# 另一示例目录（文件位于独立 git 仓库）：files 可一次传多个
+# Another example directory (the file lives in a separate git repository): files can be passed in one go
 $ mem --path ./memory add -p demo -s "add two files" -d desktop -a codex repo/src/a.txt repo/src/b.txt
 Successfully recorded event: 20261022130629_791248624_23233_0002
   Project:   demo
@@ -318,7 +320,7 @@ Successfully recorded event: 20261022130629_791248624_23233_0002
     • [Created] src/b.txt (2 bytes, sha256: 0263829989b6fd954f72baaf2fc64bc2e2f01d692d4de72986ea808f6e99813f)
 ```
 
-`meta.json` 自动创建的实际内容：
+Actual contents of the automatically created `meta.json`:
 
 ```json
 {
@@ -329,9 +331,9 @@ Successfully recorded event: 20261022130629_791248624_23233_0002
 }
 ```
 
-**路径规范化与 stderr 警告（真实输出）**
+**Path normalization and the stderr warning (real output)**
 
-文件既不在 store 内、也不在任何 git 仓库内、也无法相对 CWD 时，会记录绝对路径并警告（下面在代码仓库的 `project/` 目录内执行，store 位于 `../memory`）：
+When a file is outside the store, outside any git repository, and cannot be made relative to the CWD, its absolute path is recorded and a warning is printed (the command below runs inside the code repository's `project/` directory, with the store at `../memory`):
 
 ```text
 $ mem --path ../memory add -p demo -s "track loose file" -d laptop -a claude ../elsewhere/loose.txt
@@ -347,41 +349,41 @@ Successfully recorded event: 20261022130629_780024199_23222_0001                
     • [Created] /path/to/loose.txt (14 bytes, sha256: 21f822c8aa1e6d8acf623ebf3f340aea89570a5d4f49a42d77d807d12053364f)
 ```
 
-**注意事项**
+**Notes**
 
-- `<FILES>` 是必填的位置参数，至少传一个；路径可以是相对 CWD，也可以是绝对路径。
-- `Created` / `Modified` 只根据 `file_name` 是否已出现在该项目的 `files.jsonl`（含历史记录，去重后）来判断；不比较内容 hash，因此对同一文件即使内容没变，第二次记录也会是 `Modified`。
-- 文件不存在也会产生一条 `Deleted` 记录，路径仍然按同样规则规范化。
-- 记录的绝对路径不会跨设备匹配，只适合临时本地记录；跨设备场景请让文件位于 store 内或某个 git 仓库内（见 [MIGRATION.md](MIGRATION.md) 的旧绝对路径记录说明）。
-- 文件内容本身不入库，只保存路径、大小和 SHA256。
-- 事件行先写 `events/`，再写 `projects/<p>/files.jsonl`，两者不是一个原子事务；正常结束时一致。
+- `<FILES>` is a required positional argument (at least one); each path may be relative to the CWD or absolute.
+- `Created` / `Modified` is decided **solely** by whether `file_name` already appears in this project's `files.jsonl` (including historical records, after deduplication); content hashes are not compared, so even if a file's contents did not change, recording it a second time yields `Modified`.
+- A nonexistent file still produces a `Deleted` record, and its path is normalized by the same rules.
+- A recorded absolute path will not match across devices and is only suitable for temporary local records; for cross-device scenarios, keep the file inside the store or inside some git repository (see the notes on legacy absolute-path records in [MIGRATION.md](MIGRATION.md)).
+- File contents themselves are never stored; only path, size, and SHA256 are kept.
+- The event line is written to `events/` first, then to `projects/<p>/files.jsonl`; the two writes are not one atomic transaction, though they are consistent after a normal exit.
 
 ### 3.3 query
 
-查询已记录的事件与文件记录。
+Query recorded events and file records.
 
-**用法**
+**Usage**
 
 ```text
 mem query [OPTIONS]
 ```
 
-**参数**
+**Arguments**
 
-| 短选项 | 长选项 | 必填 | 默认 | 说明 |
+| Short option | Long option | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `-p` | `--project <PROJECT>` | 否 | — | 列出该项目全部事件 |
-| — | `--file-id <FILE_ID>` | 否 | — | 按 `file_id` 精确查询单条文件记录及其父事件 |
-| `-n` | `--filename <FILENAME>` | 否 | — | 按 `file_name` **精确匹配**事件（完整相对路径，不做子串匹配） |
-| — | `--fuzzy <REGEX>` | 否 | — | 对事件原始 JSON 行做 Rust 正则模糊搜索 |
-| — | `--path <DIR>` | 否 | 自动定位 | 全局参数：store 根目录 |
-| `-h` | `--help` | 否 | — | 打印帮助 |
+| `-p` | `--project <PROJECT>` | No | — | List all events for that project |
+| — | `--file-id <FILE_ID>` | No | — | Look up a single file record by `file_id`, together with its parent event |
+| `-n` | `--filename <FILENAME>` | No | — | **Exact-match** events by `file_name` (full relative path; no substring matching) |
+| — | `--fuzzy <REGEX>` | No | — | Rust regex fuzzy search over the raw event JSON lines |
+| — | `--path <DIR>` | No | Auto-discovered | Global option: store root directory |
+| `-h` | `--help` | No | — | Print help |
 
-**参数约束**：四个过滤条件全部可选，但**至少要给一个**，否则报错退出 1。可以同时给多个：按 `--project` → `--file-id` → `--filename` → `--fuzzy` 的固定顺序依次输出（每段之间空一行）。
+**Argument constraint**: all four filters are optional, but **at least one** must be given; otherwise the command errors out with exit code 1. Multiple filters may be combined: output is emitted in the fixed order `--project` → `--file-id` → `--filename` → `--fuzzy` (with a blank line between sections).
 
-**索引机制（一句话）**：`query` 先用 `MemIndex` 扫描全部 `events/*.jsonl`，为每个事件记录「文件路径 + 行首字节偏移」；查询命中后按偏移回到原文件读取该行，因此没有持久化索引，每次查询都会重建内存索引。
+**Index mechanism (in one sentence)**: `query` first scans every `events/*.jsonl` with `MemIndex` and records "file path + byte offset of the line start" for each event; on a hit it seeks back by offset and reads that line, so there is no persistent index and an in-memory index is rebuilt on every query.
 
-**真实输出（按项目）**
+**Real output (by project)**
 
 ```text
 $ mem --path ./memory query -p demo
@@ -412,7 +414,7 @@ Event: 20261022130617_177477279_23163_0001 | 2026-10-22T13:06:17.177476127Z
     • [Deleted] src/removed.txt (ID: 20261022130617_177470336_23163_0000, 0 bytes, hash: -)
 ```
 
-**真实输出（按 file_id）**
+**Real output (by file_id)**
 
 ```text
 $ mem --path ./memory query --file-id 20261022130617_174840512_23161_0000
@@ -433,7 +435,7 @@ Parent Event:
   Summary:     update hello
 ```
 
-**真实输出（按文件名 / 正则）**
+**Real output (by filename / regex)**
 
 ```text
 $ mem --path ./memory query -n src/hello.txt
@@ -467,7 +469,7 @@ Event: 20261022130617_177477279_23163_0001 | 2026-10-22T13:06:17.177476127Z
     • [Deleted] src/removed.txt (ID: 20261022130617_177470336_23163_0000, 0 bytes, hash: -)
 ```
 
-**未命中时的输出（真实输出）**
+**Output when nothing matches (real output)**
 
 ```text
 $ mem --path ./memory query -p nope
@@ -482,7 +484,7 @@ $ mem --path ./memory query -n src/nope.rs
 --- Events containing filename 'src/nope.rs' ---
 No events found containing filename 'src/nope.rs'.
 
-# 精确匹配：只给文件名的子串不会命中
+# Exact match: a bare filename substring does not match
 $ mem --path ./memory query -n hello.txt
 --- Events containing filename 'hello.txt' ---
 No events found containing filename 'hello.txt'.
@@ -492,38 +494,38 @@ $ mem --path ./memory query --fuzzy 'zzz-not-present'
 No events matched pattern 'zzz-not-present'.
 ```
 
-**注意事项**
+**Notes**
 
-- `--file-id` 匹配的是 `FileRecord.file_id`（每条文件记录都有独立 ID），输出会带上父事件的完整信息。
-- `-n/--filename` 匹配的是**规范化后的相对 `file_name`**（如 `src/hello.txt`），且是**整串精确匹配**、不是子串搜索（查 `hello.txt` 不会命中 `src/hello.txt`）；不是系统绝对路径；历史数据中的绝对路径记录用相对名查不到（见 [MIGRATION.md](MIGRATION.md)）。
-- `--fuzzy` 是对事件原始 JSONL 行做 Rust `regex` 匹配，不是全文分词；正则非法时先打印搜索标题，再在 stderr 报 `Error: regex parse error: ...` 并以退出码 1 结束。
-- 过滤条件可以组合，输出顺序固定为 project → file_id → filename → fuzzy。
-- 每次查询都会重新扫描事件文件建立索引；store 很大时查询会变慢，这属于当前实现的已知特征，不是常驻服务。
+- `--file-id` matches `FileRecord.file_id` (every file record has its own ID); the output includes the full details of the parent event.
+- `-n/--filename` matches the **normalized relative `file_name`** (e.g. `src/hello.txt`) and is a **whole-string exact match**, not a substring search (querying `hello.txt` will not match `src/hello.txt`); it is not a system absolute path. Legacy records that store absolute paths cannot be found by relative name (see [MIGRATION.md](MIGRATION.md)).
+- `--fuzzy` runs a Rust `regex` match against the raw JSONL line of each event; it is not full-text tokenization. With an invalid regex it prints the search heading first, then reports `Error: regex parse error: ...` on stderr and exits with code 1.
+- Filters can be combined; output order is fixed as project → file_id → filename → fuzzy.
+- Every query rescans the event files to build the index; queries get slower as the store grows. This is a known characteristic of the current implementation, not a resident service.
 
 ### 3.4 list
 
-列出 store 中的项目，或某个项目当前的文件状态（每个 `file_name` 只取最新记录）。
+List the projects in a store, or the current file state of one project (only the latest record per `file_name`).
 
-**用法**
+**Usage**
 
 ```text
 mem list [OPTIONS]
 ```
 
-**参数**
+**Arguments**
 
-| 短选项 | 长选项 | 必填 | 默认 | 说明 |
+| Short option | Long option | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `-p` | `--project <PROJECT>` | 否 | — | 给出时列出该项目的文件表；省略时列出项目表 |
-| — | `--path <DIR>` | 否 | 自动定位 | 全局参数：store 根目录 |
-| `-h` | `--help` | 否 | — | 打印帮助 |
+| `-p` | `--project <PROJECT>` | No | — | When given, list that project's file table; when omitted, list the project table |
+| — | `--path <DIR>` | No | Auto-discovered | Global option: store root directory |
+| `-h` | `--help` | No | — | Print help |
 
-**两种输出**
+**Two output modes**
 
-- **无 `-p`（项目表）**：列 `PROJECT`（宽 24）、`FILES`（宽 8，去重后的文件数）、`CREATED AT`（宽 32，取 `meta.json` 的 `created_at`）、`DESCRIPTION`（取 `meta.json` 的 `description`）；表头下分隔线固定 96 个 `-`；项目名按字典序升序。缺 `meta.json` 时 `CREATED AT` 与 `DESCRIPTION` 显示 `-`。
-- **有 `-p`（文件表）**：列 `FILE NAME`（宽 32）、`ACTION`（宽 10）、`SIZE (BYTES)`（宽 14）、`FILE ID`（宽 37）、`HASH (SHA256)`（hash 前 16 个十六进制字符 + `...`，空 hash 显示 `-`）；分隔线固定 125 个 `-`；行按 `file_name` 字典序升序。
+- **Without `-p` (project table)**: columns `PROJECT` (width 24), `FILES` (width 8, number of distinct files after deduplication), `CREATED AT` (width 32, taken from `meta.json`'s `created_at`), `DESCRIPTION` (taken from `meta.json`'s `description`); the separator line under the header is exactly 96 `-` characters; projects are sorted by name in ascending lexicographic order. When `meta.json` is missing, `CREATED AT` and `DESCRIPTION` show `-`.
+- **With `-p` (file table)**: columns `FILE NAME` (width 32), `ACTION` (width 10), `SIZE (BYTES)` (width 14), `FILE ID` (width 37), `HASH (SHA256)` (first 16 hex characters of the hash + `...`; an empty hash shows `-`); the separator line is exactly 125 `-` characters; rows are sorted by `file_name` in ascending lexicographic order.
 
-**真实输出（项目表）**
+**Real output (project table)**
 
 ```text
 $ mem --path ./memory list
@@ -532,7 +534,7 @@ PROJECT                  FILES    CREATED AT                       DESCRIPTION
 demo                     3        2026-10-22T13:06:17.173539195Z   Project demo
 ```
 
-**真实输出（文件表）**
+**Real output (file table)**
 
 ```text
 $ mem --path ./memory list -p demo
@@ -543,7 +545,7 @@ src/removed.txt                  Deleted    0              20261022130617_177470
 src/util.txt                     Created    12             20261022130617_176154452_23162_0000   f957b19529906961...
 ```
 
-**空 store / 项目无文件（真实输出）**
+**Empty store / project without files (real output)**
 
 ```text
 $ mem --path ./memory list
@@ -553,40 +555,40 @@ $ mem --path ./memory list -p ghost
 No files recorded for project 'ghost'.
 ```
 
-**注意事项**
+**Notes**
 
-- 两处表格的列宽是固定宽度格式化，超长值**不会截断**，会挤占右侧列导致对齐错位；脚本解析时不要把空格位置当作稳定分隔符。
-- `FILES` 是「去重后的文件名数量」，不是历史记录条数；即使 `compact` 之前，同一文件的多条历史也只计 1。
-- 文件表只展示每个 `file_name` 的最新一条记录（`files.jsonl` 中最后出现者优先）。
+- Both tables are formatted with fixed column widths; overlong values are **not truncated** and push the columns to their right out of alignment, so scripts must not treat space positions as stable separators.
+- `FILES` is "the number of distinct filenames after deduplication", not the number of historical records; even before `compact`, multiple historical records for one file count as 1.
+- The file table shows only the latest record per `file_name` (the last occurrence in `files.jsonl` wins).
 
 ### 3.5 compact
 
-压缩项目文件记录：`files.jsonl` 中每个 `file_name` 只保留最新一条记录。
+Compact project file records: keep only the latest record per `file_name` in `files.jsonl`.
 
-**用法**
+**Usage**
 
 ```text
 mem compact [OPTIONS] --project <PROJECT>
 ```
 
-**参数**
+**Arguments**
 
-| 短选项 | 长选项 | 必填 | 默认 | 说明 |
+| Short option | Long option | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `-p` | `--project <PROJECT>` | **是** | — | 要压缩的项目名 |
-| — | `--path <DIR>` | 否 | 自动定位 | 全局参数：store 根目录 |
-| `-h` | `--help` | 否 | — | 打印帮助 |
+| `-p` | `--project <PROJECT>` | **Yes** | — | Project to compact |
+| — | `--path <DIR>` | No | Auto-discovered | Global option: store root directory |
+| `-h` | `--help` | No | — | Print help |
 
-**行为**
+**Behavior**
 
-1. 读取 `projects/<project>/files.jsonl` 的全部记录（文件不存在时视为 0 条，直接返回 0/0，不创建目录）；
-2. 以 `file_name` 为键，保留**最后出现**的一条记录（即最新写入的一条）；
-3. 把结果写到同目录的临时文件 `files.jsonl.tmp`，再原子 `rename` 覆盖原文件；
-4. 输出压缩前后的记录数与剪除数。
+1. Read all records from `projects/<project>/files.jsonl` (when the file does not exist it is treated as 0 records and the command returns 0/0 without creating any directory);
+2. keep the **last occurrence** of each `file_name` (that is, the most recently written record);
+3. write the result to a temporary file `files.jsonl.tmp` in the same directory, then atomically `rename` it over the original file;
+4. print the record counts before and after compaction and the number pruned.
 
-**真实输出**
+**Real output**
 
-先记录：`src/hello.txt` 两条（Created + Modified）、`src/util.txt` 一条、`src/removed.txt` 一条，共 4 条记录：
+The setup recorded: two records for `src/hello.txt` (Created + Modified), one for `src/util.txt`, and one for `src/removed.txt` — 4 records in total:
 
 ```text
 $ mem --path ./memory compact -p demo
@@ -597,7 +599,7 @@ Compaction completed for project 'demo':
   Records pruned: 1
 ```
 
-压缩后 `mem list -p demo` 的三行（与压缩前相同，因为 `list` 本来就只显示最新记录）：
+The three `mem list -p demo` rows after compaction (identical to before compaction, because `list` already shows only the latest records):
 
 ```text
 $ mem --path ./memory list -p demo
@@ -608,41 +610,41 @@ src/removed.txt                  Deleted    0              20261022130617_177470
 src/util.txt                     Created    12             20261022130617_176154452_23162_0000   f957b19529906961...
 ```
 
-**注意事项**
+**Notes**
 
-- `compact` 只重写 `projects/<project>/files.jsonl`，**不会改动 `events/`**；`query` 的历史事件仍然完整可查。
-- 重写后文件内记录按 `file_name` 字典序排列（内部使用 `BTreeMap`），不再是原始追加顺序。
-- 剪除数 = `records_before - records_after`（由 CLI 计算并打印）。
-- 写临时文件后原子 rename，进程中断最多留下 `files.jsonl.tmp`（已被 store 的 `.gitignore` `*.tmp` 覆盖）；避免在同步关键路径上与追加写并发跑 `compact`。
+- `compact` rewrites only `projects/<project>/files.jsonl` and **never touches `events/`**; historical events remain fully queryable via `query`.
+- After the rewrite, records in the file are ordered by `file_name` (internally a `BTreeMap`), not in the original append order.
+- The number pruned is `records_before - records_after` (computed and printed by the CLI).
+- The temp-write-plus-atomic-rename means an interrupted process leaves at most a `files.jsonl.tmp` behind (already covered by the store `.gitignore`'s `*.tmp`); avoid running `compact` concurrently with appends on a critical sync path.
 
 ### 3.6 sync
 
-把本地 store 的改动提交、变基拉取远端更新、再推送回远端。
+Commit local store changes, pull remote updates with rebase, then push back to the remote.
 
-**用法**
+**Usage**
 
 ```text
 mem sync [OPTIONS]
 ```
 
-**参数**
+**Arguments**
 
-| 短选项 | 长选项 | 必填 | 默认 | 说明 |
+| Short option | Long option | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| — | `--path <DIR>` | 否 | 自动定位 | 全局参数：store 根目录 |
-| `-h` | `--help` | 否 | — | 打印帮助 |
+| — | `--path <DIR>` | No | Auto-discovered | Global option: store root directory |
+| `-h` | `--help` | No | — | Print help |
 
-**行为（严格按执行顺序）**
+**Behavior (strictly in execution order)**
 
-1. 在 store 根执行 `git status --porcelain`；不是 git 仓库或 git 不可用 → `Error: ...` 退出 1。
-2. 工作区**不干净**：`git add -A`，再 `git commit -m "Auto-sync from <device> at <ts>"`。其中 `<device>` 取本机 hostname（同 `add` 的规则），`<ts>` 是固定宽度 UTC 纳秒时间戳。
-3. `git pull --rebase --autostash`。
-4. 若 pull 失败：
-   - 若检测到冲突（未合并文件、porcelain 冲突码，或已跟踪文件里出现 `<<<<<<<`）：向 **stderr** 打印两行警告，然后**以退出码 0 返回**（不执行 push）。此时工作区保留冲突标记，等待 `mem resolve`；
-   - 若失败但不是冲突（常见原因：当前分支没有 upstream、网络/认证问题；程序自己的提示文字写作 `possibly no remote changes`）：stderr 打印一行 `⚠️  git pull --rebase returned an error ...`，**继续执行 push**。
-5. `git push`；失败则 `Error: ...` 退出 1；成功打印 `✅ Sync successful: repository is up-to-date and pushed to remote.`
+1. Run `git status --porcelain` at the store root; if this is not a git repository or git is unavailable → `Error: ...`, exit 1.
+2. If the working tree is **not clean**: `git add -A`, then `git commit -m "Auto-sync from <device> at <ts>"`, where `<device>` is the local hostname (same rules as `add`) and `<ts>` is the fixed-width UTC nanosecond timestamp.
+3. `git pull --rebase --autostash`.
+4. If pull fails:
+   - if a conflict is detected (unmerged files, porcelain conflict codes, or `<<<<<<<` appearing in a tracked file): print a two-line warning to **stderr**, then **return with exit code 0** (no push is performed). The working tree keeps the conflict markers, waiting for `mem resolve`;
+   - if the failure is not a conflict (common causes: the current branch has no upstream, network/authentication problems; the program's own wording reads `possibly no remote changes`): print one line `⚠️  git pull --rebase returned an error ...` to stderr and **continue with push**.
+5. `git push`; on failure `Error: ...`, exit 1; on success print `✅ Sync successful: repository is up-to-date and pushed to remote.`
 
-**真实输出（脏工作区，remote + upstream 已配置）**
+**Real output (dirty working tree, remote + upstream configured)**
 
 ```text
 $ mem --path ./store sync
@@ -653,9 +655,9 @@ Pushing changes to remote...
 ✅ Sync successful: repository is up-to-date and pushed to remote.
 ```
 
-（示例环境取不到 `hostname`，设备名回退为 `localhost`；正常主机上这里是实际 hostname。）
+(The example environment could not resolve `hostname`, so the device name fell back to `localhost`; on a normal host this is the actual hostname.)
 
-**真实输出（干净工作区）**
+**Real output (clean working tree)**
 
 ```text
 $ mem --path ./store sync
@@ -666,9 +668,9 @@ Pushing changes to remote...
 ✅ Sync successful: repository is up-to-date and pushed to remote.
 ```
 
-**真实输出（拉取时发生冲突：退出码 0，stdout + stderr）**
+**Real output (conflict during pull: exit code 0, stdout + stderr)**
 
-两台设备各自向同一个 `events/2026-10.jsonl` 追加事件，A 先同步，B 再同步：
+Two devices each append events to the same `events/2026-10.jsonl`; A syncs first, then B syncs:
 
 ```text
 $ mem --path ./store-b sync
@@ -676,24 +678,24 @@ Checking Git repository status at: /path/to/store-b
 Repository is dirty. Staging and committing changes: "Auto-sync from localhost at 2026-10-22T13:07:02.640933631Z"
 Pulling remote changes with rebase...
 
-# stderr：
+# stderr:
 ⚠️  Warning: Git conflicts detected during pull --rebase!
 Please run `mem resolve` to automatically resolve JSONL conflict markers.
 [exit code 0]
 ```
 
-依次执行 `mem resolve` 与再次 `mem sync` 后的真实输出见 [3.7 resolve](#37-resolve) 的「两台设备 rebase 冲突后的真实恢复流程」。
+The real output after running `mem resolve` and then `mem sync` again appears in [3.7 resolve](#37-resolve) under "Real output (recovering from a genuine two-device rebase conflict)".
 
-**真实输出（无 remote / 无 upstream：git 操作失败）**
+**Real output (no remote / no upstream: git operation fails)**
 
 ```text
-# store 是 git 仓库，但没有任何 remote，也没有 upstream
+# The store is a git repository, but has neither a remote nor an upstream
 $ LC_ALL=C mem --path ./store sync
 Checking Git repository status at: /path/to/store
 Repository working directory is clean.
 Pulling remote changes with rebase...
 Pushing changes to remote...
-# stderr：
+# stderr:
 ⚠️  git pull --rebase returned an error (possibly no remote changes). Continuing...
 Error: git command 'git push' failed: fatal: No configured push destination.
 Either specify the URL from the command-line or configure a remote repository using
@@ -714,58 +716,58 @@ and then push using the group name
 [exit code 1]
 ```
 
-**真实输出（不是 git 仓库）**
+**Real output (not a git repository)**
 
 ```text
 $ LC_ALL=C mem --path ./store sync
 Checking Git repository status at: /path/to/store
-# stderr：
+# stderr:
 Error: git command 'git status --porcelain' failed: fatal: not a git repository (or any parent up to mount point /)
 Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).
 [exit code 1]
 ```
 
-**注意事项**
+**Notes**
 
-- 前置条件：store 根是 git 仓库；已配置可用的 remote 与当前分支的 upstream（`git push -u origin HEAD` 或 `git clone` 可建立）；已配置 git 用户身份（`user.name` / `user.email`）——工作区需要提交而身份未配置时，提交会失败并退出 1。
-- 冲突时命令**不会**自动合并，也**不会** abort rebase；它只是把冲突状态留给 `mem resolve`。因此冲突场景下 `sync` 的退出码是 0，脚本需要一个显式检查（例如 `git status` / 检查 `events/*.jsonl` 是否包含 `<<<<<<<`）。
-- 提交信息固定为 `Auto-sync from <device> at <ts>`；`sync` 不提供自定义消息参数（MCP 的 `mem_sync` 支持可选 `message`，见 [MCP.md](MCP.md)）。
-- git 的错误文本受 locale 影响，示例使用 `LC_ALL=C`；内容本身是 git 原始输出。
-- `sync` 不调用任何冲突解决逻辑（不会自动执行 `resolve`），也不创建 remote；远端配置只由 `mem init --remote` 或手工 git 命令完成。
+- Prerequisites: the store root is a git repository; a usable remote and an upstream for the current branch are configured (`git push -u origin HEAD` or `git clone` establishes one); git user identity is configured (`user.name` / `user.email`) — if the working tree needs a commit and identity is missing, the commit fails and the command exits 1.
+- On conflict the command **does not** auto-merge and **does not** abort the rebase; it leaves the conflict state to `mem resolve`. Therefore in the conflict scenario `sync` exits with code 0, and scripts need an explicit check (for example `git status` or checking whether any `events/*.jsonl` contains `<<<<<<<`).
+- The commit message is fixed to `Auto-sync from <device> at <ts>`; `sync` offers no custom-message argument (MCP's `mem_sync` supports an optional `message`, see [MCP.md](MCP.md)).
+- Git's error text depends on locale; the examples use `LC_ALL=C`, and the content itself is raw git output.
+- `sync` does not invoke any conflict-resolution logic (it never runs `resolve` automatically), nor does it create a remote; remotes are configured only by `mem init --remote` or manual git commands.
 
 ### 3.7 resolve
 
-扫描 store 下所有 `.jsonl` 文件中的 Git 冲突标记，自动去重、排序并继续 rebase。
+Scan all `.jsonl` files in the store for Git conflict markers, deduplicate and sort records, and continue the rebase.
 
-**用法**
+**Usage**
 
 ```text
 mem resolve [OPTIONS]
 ```
 
-**参数**
+**Arguments**
 
-| 短选项 | 长选项 | 必填 | 默认 | 说明 |
+| Short option | Long option | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| — | `--path <DIR>` | 否 | 自动定位 | 全局参数：store 根目录 |
-| `-h` | `--help` | 否 | — | 打印帮助 |
+| — | `--path <DIR>` | No | Auto-discovered | Global option: store root directory |
+| `-h` | `--help` | No | — | Print help |
 
-**行为**
+**Behavior**
 
-1. 递归扫描 store 下所有 `*.jsonl`（`hidden(false)`：隐藏文件也会扫描；store 是 git 仓库时 `.gitignore` 过滤生效）；只处理包含 `<<<<<<<` 的文件。
-2. 去掉 `<<<<<<<`、`=======`、`>>>>>>>`、`|||||||` 冲突标记行。
-3. 按文件内容识别记录类型（`Event` / `FileRecord` / 其他 JSON / 无法识别），分别处理：
-   - 合法记录按去重键（`event_id` / `file_id`）去重，**后出现者胜出**；
-   - 事件记录按时间戳解析后排序（兼容旧格式），时间戳相同再用 `event_id` 排序；文件记录按 `file_id` 排序；其他合法 JSON 记录按 `ts`（若有）再去重键排序；
-   - **无法解析为对应记录类型的行逐字保留**（含原始前后空白），放到文件末尾；完全相同的保留行去重；
-   - 合法记录**原样重发原始行文本**，因此未知字段、字段顺序、格式都不会丢失。
-4. 写回解析后的文件（持排他锁）。
-5. store 根存在 `.git` 时，对每个被改写的文件执行 `git add -- <相对路径>`。
-6. 只有当 `.git/rebase-merge` 或 `.git/rebase-apply` 存在（确实有 rebase 在进行）时，才执行 `git rebase --continue`（用 `GIT_EDITOR=true` 避免编辑器阻塞）。检测不依赖 git 的本地化错误文本。
+1. Recursively scan every `*.jsonl` under the store (`hidden(false)`: hidden files are scanned too; `.gitignore` filtering applies when the store is a git repository); process only files that contain `<<<<<<<`.
+2. Drop the `<<<<<<<`, `=======`, `>>>>>>>`, and `|||||||` conflict-marker lines.
+3. Detect the record kind from the file contents (`Event` / `FileRecord` / other JSON / unrecognized) and handle each accordingly:
+   - valid records are deduplicated by key (`event_id` / `file_id`), and **the later occurrence wins**;
+   - event records are sorted by parsed timestamp (old formats are supported), with `event_id` as the tie-breaker; file records are sorted by `file_id`; other valid JSON records are sorted by `ts` (when present) and then by deduplication key;
+   - **lines that cannot be parsed as the corresponding record kind are preserved verbatim** (including their original leading/trailing whitespace) and placed at the end of the file; identical preserved lines are deduplicated;
+   - valid records are **re-emitted with their original raw line text**, so unknown fields, field order, and formatting are never lost.
+4. Write the resolved file back (holding an exclusive lock).
+5. When the store root contains `.git`, run `git add -- <relative path>` for every rewritten file.
+6. Only when `.git/rebase-merge` or `.git/rebase-apply` exists (a rebase is genuinely in progress) run `git rebase --continue` (with `GIT_EDITOR=true` to avoid blocking on an editor). Detection does not rely on git's localized error text.
 
-**真实输出（非 git 目录中的手工冲突文件：含 1 条无法解析的截断行）**
+**Real output (hand-crafted conflict file outside a git directory: one unparseable truncated line)**
 
-冲突文件内容（`events/2026-10.jsonl`）：
+Conflicted file contents (`events/2026-10.jsonl`):
 
 ```json
 {"event_id":"20261022010000_000000001_00001_0000","ts":"2026-10-22T01:00:00Z","device":"laptop-a","agent":"claude","project":"demo","summary":"first event","files":[]}
@@ -777,7 +779,7 @@ mem resolve [OPTIONS]
   {"event_id":"20261022030000_000000003_00001_0002","ts":"2026-10-22T03:00:00Z","summary":"TRUNCATED
 ```
 
-运行结果：
+Result of running:
 
 ```text
 $ mem --path . resolve
@@ -791,7 +793,7 @@ Conflict Resolution Report:
     • /path/to/store/events/2026-10.jsonl
 ```
 
-解析后的文件内容（重复的 `event_id` 保留后出现者 `from branch`；截断行逐字保留在末尾）：
+Resolved file contents (the duplicate `event_id` keeps the later occurrence `from branch`; the truncated line is preserved verbatim at the end):
 
 ```json
 {"event_id":"20261022010000_000000001_00001_0000","ts":"2026-10-22T01:00:00Z","device":"laptop-a","agent":"claude","project":"demo","summary":"first event","files":[]}
@@ -799,7 +801,7 @@ Conflict Resolution Report:
   {"event_id":"20261022030000_000000003_00001_0002","ts":"2026-10-22T03:00:00Z","summary":"TRUNCATED
 ```
 
-再执行一次（幂等，没有冲突文件）：
+Running it again (idempotent, no conflicted files):
 
 ```text
 $ mem --path . resolve
@@ -811,9 +813,9 @@ Conflict Resolution Report:
   Lines preserved:     0
 ```
 
-**真实输出（两台设备 rebase 冲突后的真实恢复流程）**
+**Real output (recovering from a genuine two-device rebase conflict)**
 
-B 设备 `mem sync` 出现冲突警告（见 [3.6 sync](#36-sync)）后：
+After device B's `mem sync` shows the conflict warning (see [3.6 sync](#36-sync)):
 
 ```text
 $ mem --path ./store-b resolve
@@ -835,42 +837,42 @@ Pushing changes to remote...
 ✅ Sync successful: repository is up-to-date and pushed to remote.
 ```
 
-之后另一台设备 `git pull --rebase` 即可看到双方事件。
+Afterwards another device can run `git pull --rebase` and will see both sides' events.
 
-**注意事项**
+**Notes**
 
-- `resolve` 只处理 `.jsonl` 文件。**非 JSONL 的冲突不会处理**，例如 `projects/<p>/meta.json`（两台设备同时为同一新项目写入元数据时可能冲突）；这类冲突必须先手工解决并 `git add`。若步骤 6 的 `git rebase --continue` 因这些文件失败，命令会打印一条可操作的错误，列出仍未解决的路径，并提示 `git add <file>` 后重试；故障排查参见 [TROUBLESHOOTING.md](TROUBLESHOOTING.md)。
-- 不在 git 仓库中也能运行：只是清理冲突标记，不会 `git add`、不会继续 rebase。
-- `Files updated` 中显示的是绝对路径。
-- 保留行永远不会被静默丢弃；历史合法记录也不会被重写（除冲突标记、去重与排序外，行文本保持原样）。
-- 去重是「后出现者胜出」：rebase 场景中通常意味着 `theirs` 分支的记录覆盖 `ours` 中同 ID 的记录。
+- `resolve` handles only `.jsonl` files. **Non-JSONL conflicts are not handled**, for example `projects/<p>/meta.json` (which can conflict when two devices write metadata for the same new project at the same time); such conflicts must be resolved manually and `git add`ed first. If step 6's `git rebase --continue` fails because of these files, the command prints an actionable error that lists the still-unresolved paths and tells you to `git add <file>` and retry; see [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for troubleshooting.
+- It also works outside a git repository: it merely strips conflict markers, without `git add` and without continuing a rebase.
+- `Files updated` shows absolute paths.
+- Preserved lines are never silently discarded; valid historical records are never rewritten either (apart from conflict markers, deduplication, and sorting, the line text stays as-is).
+- Deduplication is "the later occurrence wins": in a rebase scenario this usually means the record from the `theirs` branch replaces the same-ID record from `ours`.
 
 ### 3.8 render
 
-生成或更新项目的 `README.md`（`projects/<project>/README.md`）。
+Generate or update a project's `README.md` (`projects/<project>/README.md`).
 
-**用法**
+**Usage**
 
 ```text
 mem render [OPTIONS] --project <PROJECT>
 ```
 
-**参数**
+**Arguments**
 
-| 短选项 | 长选项 | 必填 | 默认 | 说明 |
+| Short option | Long option | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `-p` | `--project <PROJECT>` | **是** | — | 要渲染的项目名 |
-| — | `--path <DIR>` | 否 | 自动定位 | 全局参数：store 根目录 |
-| `-h` | `--help` | 否 | — | 打印帮助 |
+| `-p` | `--project <PROJECT>` | **Yes** | — | Project name to render |
+| — | `--path <DIR>` | No | Auto-discovered | Global option: store root directory |
+| `-h` | `--help` | No | — | Print help |
 
-**行为**
+**Behavior**
 
-1. 读取 `projects/<project>/meta.json`；**读取失败时**使用内存中的兜底元数据（`name` = 项目名、`description` = `"Project <name>"`、`github_url` = null、`created_at` = 当前时间），**不会写回 `meta.json`**；
-2. 取该项目每个 `file_name` 的最新记录生成文件表；
-3. 取该项目最近 10 条事件生成时间线（最新在前）；
-4. 用排他锁写 `projects/<project>/README.md`（目录不存在则创建），每次覆盖。
+1. Read `projects/<project>/meta.json`; **if reading fails**, use in-memory fallback metadata (`name` = project name, `description` = `"Project <name>"`, `github_url` = null, `created_at` = current time) and **do not write `meta.json` back**;
+2. take the latest record per `file_name` for that project to build the file table;
+3. take the project's 10 most recent events to build the timeline (newest first);
+4. write `projects/<project>/README.md` under an exclusive lock (creating the directory if needed), overwriting it every time.
 
-生成的 README 结构：
+Generated README structure:
 
 ```markdown
 # <project>
@@ -879,7 +881,7 @@ mem render [OPTIONS] --project <PROJECT>
 
 ### Metadata
 - **Created At:** <created_at>
-- **GitHub:** <github_url>        # 仅当 meta.github_url 存在
+- **GitHub:** <github_url>        # only when meta.github_url exists
 
 ## Tracked Files
 
@@ -889,10 +891,10 @@ mem render [OPTIONS] --project <PROJECT>
 
 ## Recent Activity Timeline
 
-- **<ts>** [`<agent>` on `<device>`]: <summary>   # 最近 10 条，最新在前
+- **<ts>** [`<agent>` on `<device>`]: <summary>   # the 10 most recent, newest first
 ```
 
-**真实输出**
+**Real output**
 
 ```text
 $ mem --path ./memory render -p demo
@@ -900,7 +902,7 @@ Rendering README.md for project 'demo'...
 Successfully generated README at: /path/to/store/projects/demo/README.md
 ```
 
-生成的 `projects/demo/README.md`（真实内容）：
+Generated `projects/demo/README.md` (actual contents):
 
 ```markdown
 # demo
@@ -926,7 +928,7 @@ Project demo
 - **2026-10-22T13:06:17.173539195Z** [`claude` on `laptop`]: add hello
 ```
 
-**meta 缺失时的兜底（真实输出）**
+**Fallback when meta is missing (real output)**
 
 ```text
 $ mem --path ./memory render -p ghost
@@ -934,7 +936,7 @@ Rendering README.md for project 'ghost'...
 Successfully generated README at: /path/to/store/projects/ghost/README.md
 ```
 
-生成的 `projects/ghost/README.md`（meta 缺失时的兜底内容）：
+Generated `projects/ghost/README.md` (fallback contents when meta is missing):
 
 ```markdown
 # ghost
@@ -953,7 +955,7 @@ _No files tracked yet._
 _No events recorded yet._
 ```
 
-`render` 之后项目目录里只有 `README.md`，没有 `meta.json`；因此 `list` 中的创建时间与描述仍为 `-`：
+After `render` the project directory contains only `README.md`, with no `meta.json`; therefore the creation time and description shown by `list` are still `-`:
 
 ```text
 $ ls projects/ghost/
@@ -965,24 +967,24 @@ PROJECT                  FILES    CREATED AT                       DESCRIPTION
 ghost                    0        -                                -
 ```
 
-**注意事项**
+**Notes**
 
-- `render` 是纯生成操作：每次覆盖 `projects/<project>/README.md`，不会修改 `files.jsonl` / `meta.json` / `events/`。
-- `meta.json` 缺失时只影响本次渲染，不会补写；之后任意一次 `mem add`（或 MCP 的 `mem_add_event`）才会自动补 `meta.json`，`list` 的 `CREATED AT` / `DESCRIPTION` 也才会从 `-` 变成真实值。
-- 空 hash 在表格中渲染为两个反引号（`` `` ），这是当前格式的真实输出。
-- 时间线最多 10 条，按时间升序读取后反转为最新在前。
+- `render` is a pure generation operation: it overwrites `projects/<project>/README.md` every time and never modifies `files.jsonl` / `meta.json` / `events/`.
+- A missing `meta.json` only affects that render run and is not backfilled; only a subsequent `mem add` (or MCP's `mem_add_event`) auto-creates `meta.json`, at which point `CREATED AT` / `DESCRIPTION` in `list` change from `-` to real values.
+- An empty hash renders as two backticks (`` `` ) in the table; this is the actual output of the current format.
+- The timeline is capped at 10 entries; events are read in ascending time order and then reversed to newest-first.
 
-## 4. 环境变量
+## 4. Environment variables
 
-| 变量 | 影响 | 说明 |
+| Variable | Effect | Description |
 | --- | --- | --- |
-| `ACDM_STORE` | store 定位 | 未给 `--path` 时作为 store 根；优先级低于 `--path`、高于向上搜索。`init` 不使用它（`init` 只看 `--path` 或 CWD） |
-| `HOSTNAME` / `COMPUTERNAME` | 默认设备名 | `add` / `sync` 取 device 的兜底来源：先尝试 `hostname` 命令，再依次读这两个环境变量，最后 `localhost` |
-| `PATH` | `sync` / `resolve` | 需要能找到 `git` 可执行文件 |
-| git 相关变量（`GIT_AUTHOR_NAME`、`GIT_COMMITTER_*`、`GIT_EDITOR` 等） | git 提交行为 | `sync` 的提交、`resolve` 的 `rebase --continue` 都会继承环境；`resolve` 内部固定把 `GIT_EDITOR` 设为 `true` |
-| `LC_ALL` / `LANG` | 报错语言 | git 子进程的 stderr 本地化；示例使用 `LC_ALL=C` 以得到英文错误 |
+| `ACDM_STORE` | Store discovery | Used as the store root when no `--path` is given; lower priority than `--path`, higher than upward search. `init` does not use it (`init` only looks at `--path` or the CWD) |
+| `HOSTNAME` / `COMPUTERNAME` | Default device name | Fallback sources for the device name in `add` / `sync`: first try the `hostname` command, then read these two variables in order, and finally fall back to `localhost` |
+| `PATH` | `sync` / `resolve` | The `git` executable must be findable |
+| git-related variables (`GIT_AUTHOR_NAME`, `GIT_COMMITTER_*`, `GIT_EDITOR`, and so on) | git commit behavior | Both `sync`'s commit and `resolve`'s `rebase --continue` inherit the environment; `resolve` hard-codes `GIT_EDITOR` to `true` internally |
+| `LC_ALL` / `LANG` | Error-message language | Localizes the git subprocess's stderr; the examples use `LC_ALL=C` to get English errors |
 
-`ACDM_STORE` 示例（真实输出）：
+`ACDM_STORE` example (real output):
 
 ```text
 $ ACDM_STORE=/path/to/store mem list
@@ -991,104 +993,104 @@ PROJECT                  FILES    CREATED AT                       DESCRIPTION
 demo                     4        2026-10-22T13:06:17.173539195Z   Project demo
 ```
 
-## 5. 常见工作流
+## 5. Common workflows
 
-### 5.1 单机日常
+### 5.1 Everyday single-machine use
 
 ```bash
-# 1) 初始化（一次）
+# 1) Initialize (once)
 mem init --path ./memory
 
-# 2) 记录改动
+# 2) Record changes
 mem --path ./memory add -p ACDM -s "实现增量索引" -d laptop -a claude src/index.rs src/storage.rs
 
-# 3) 查询/浏览
+# 3) Query / browse
 mem --path ./memory query -p ACDM
 mem --path ./memory query -n src/index.rs
 mem --path ./memory list
 mem --path ./memory list -p ACDM
 
-# 4) 生成项目说明
+# 4) Generate the project description
 mem --path ./memory render -p ACDM
 
-# 5) 定期压缩文件记录（可选）
+# 5) Periodically compact file records (optional)
 mem --path ./memory compact -p ACDM
 ```
 
-### 5.2 跨设备同步
+### 5.2 Cross-device sync
 
 ```bash
-# 设备 A：初始化 store 并配置远端
+# Device A: initialize the store and configure the remote
 mem init --path ./memory --remote git@github.com:you/acdm-memory.git
 cd ./memory
 git add -A && git commit -m "initial store"
 git push -u origin HEAD
 cd ..
 
-# 设备 B：克隆同一个 store
+# Device B: clone the same store
 git clone git@github.com:you/acdm-memory.git ./memory
 
-# 两台设备都通过 add / sync 工作（git 用户身份需先配置）
+# Both devices work through add / sync (git user identity must be configured first)
 mem --path ./memory add -p ACDM -s "change on A" -d laptop-a -a claude src/index.rs
 mem --path ./memory sync
 
-# 常见冲突处理（见 5.3）
-mem --path ./memory sync        # 若 stderr 提示冲突
+# Common conflict handling (see 5.3)
+mem --path ./memory sync        # if stderr reports a conflict
 mem --path ./memory resolve
 mem --path ./memory sync
 ```
 
-### 5.3 冲突恢复
+### 5.3 Conflict recovery
 
 ```bash
-# 1) sync 提示冲突后，先看看到底哪些文件冲突
+# 1) After sync reports a conflict, first see which files actually conflict
 mem --path ./memory sync
 git -C ./memory status --porcelain
 
-# 2) 自动解决 JSONL 冲突（会去重、排序、保留不可解析行）
+# 2) Resolve JSONL conflicts automatically (deduplicates, sorts, preserves unparseable lines)
 mem --path ./memory resolve
 
-# 3) 如果还有非 JSONL 文件冲突（例如 meta.json），手工解决后 git add
-#    然后继续 rebase；否则 resolve 的 rebase --continue 会失败
+# 3) If non-JSONL files are still conflicted (e.g. meta.json), resolve them by hand and git add them
+#    then continue the rebase; otherwise resolve's rebase --continue will fail
 git -C ./memory add projects/<project>/meta.json
 git -C ./memory rebase --continue
 
-# 4) 再同步
+# 4) Sync again
 mem --path ./memory sync
 ```
 
-### 5.4 从零接入已有项目
+### 5.4 Adopting an existing project from scratch
 
-推荐把 store 作为一个**独立的 Git 仓库**（与代码仓库分开），记录代码仓库里的文件：
+It is recommended to keep the store as a **standalone Git repository** (separate from the code repository) and record files from the code repository:
 
 ```bash
-# 1) 在任意位置建立 store（它是独立的同步单元）
+# 1) Create the store anywhere (it is an independent sync unit)
 mem init --path ~/acdm-memory --remote git@github.com:you/acdm-memory.git
 
-# 2) 在代码仓库里照常开发，用 add 记录改动
-#    文件在 store 外时，file_name 会规范化为「相对于最近 git 仓库根」的路径，
-#    因此不同设备/不同挂载点下保持同一身份
+# 2) Develop in the code repository as usual, recording changes with add
+#    When a file is outside the store, file_name is normalized to a path relative to the nearest git repository root,
+#    so it keeps the same identity across devices and mount points
 cd ~/src/my-project
 mem --path ~/acdm-memory add -p my-project -s "add parser" -d laptop -a claude src/parser.rs
 
-# 3) 查询与渲染
+# 3) Query and render
 mem --path ~/acdm-memory query -p my-project
 mem --path ~/acdm-memory render -p my-project
 ```
 
-如果想设置 `meta.json` 里的 `github_url` / `description`，可手工编辑 `projects/<project>/meta.json` 后再 `render`。
+If you want to set `github_url` / `description` in `meta.json`, edit `projects/<project>/meta.json` by hand and then run `render`.
 
-### 5.5 脚本调用
+### 5.5 Scripting
 
-- 用退出码判断结果：`0` 成功；`1` 运行时错误；`2` 参数错误。注意 `sync` 冲突时也返回 0（需要额外检查）。
-- 命令输出面向人类阅读，**没有 `--json` 之类的机器可读输出模式**；脚本若需结构化数据，建议直接读 store 内的 `events/*.jsonl` 与 `projects/<p>/files.jsonl`（格式见 [README.md](../README.md#数据结构)）。
-- 错误信息走 stderr，正常结果走 stdout；解析时分开处理（例如 `query --fuzzy` 非法正则会先输出 stdout 标题再在 stderr 报错）。
+- Use exit codes to determine the outcome: `0` success; `1` runtime error; `2` argument error. Note that `sync` also returns 0 on conflict (an extra check is required).
+- Command output is written for humans; there is **no machine-readable output mode such as `--json`**. If a script needs structured data, read the store's `events/*.jsonl` and `projects/<p>/files.jsonl` directly (format described in [README.md](../README.md)).
+- Errors go to stderr and normal results to stdout; handle the two streams separately (for example, an invalid `query --fuzzy` regex prints its stdout heading before reporting the error on stderr).
 
-## 6. 相关文档
+## 6. Related documentation
 
-- [MCP.md](MCP.md) —— `mem-mcp` 的 JSON-RPC 协议、8 个工具与客户端配置
-- [ARCHITECTURE.md](ARCHITECTURE.md) —— 组件分层、读写路径、同步与并发
-- [DESIGN.md](DESIGN.md) —— 为什么这样设计（Git + JSONL 取舍、一致性模型、冲突语义）
-- [MIGRATION.md](MIGRATION.md) —— 旧时间戳格式、旧绝对路径记录等历史数据问题
-- [TROUBLESHOOTING.md](TROUBLESHOOTING.md) —— 常见故障与恢复步骤
-- [README.md](../README.md) —— 项目总览、数据格式与快速开始
+- [MCP.md](MCP.md) — the JSON-RPC protocol, 8 tools, and client configuration for `mem-mcp`
+- [ARCHITECTURE.md](ARCHITECTURE.md) — component layers, read/write paths, sync, and concurrency
+- [DESIGN.md](DESIGN.md) — why it is designed this way (Git + JSONL trade-offs, consistency model, conflict semantics)
+- [MIGRATION.md](MIGRATION.md) — historical data issues such as legacy timestamp formats and legacy absolute-path records
+- [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — common failures and recovery steps
+- [README.md](../README.md) — project overview, data format, and quick start
