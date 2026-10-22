@@ -1,10 +1,11 @@
 use crate::models::{Event, FileRecord, ProjectMeta};
+use crate::util;
 use fs2::FileExt;
 use ignore::WalkBuilder;
 use std::error::Error;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::io::Write;
+use std::path::PathBuf;
 
 pub struct MemStore {
     pub root: PathBuf,
@@ -27,15 +28,25 @@ impl MemStore {
         self.projects_dir().join(project)
     }
 
-    pub fn nodes_dir(&self) -> PathBuf {
-        self.root.join("nodes")
-    }
-
-    /// Initialize directories and create default .gitignore if not present.
+    /// Initialize directories, the store marker file and a default `.gitignore`.
+    ///
+    /// The `.mem` marker makes the store discoverable from any subdirectory by
+    /// both the CLI and the MCP server (see [`crate::util::find_store_root`]).
     pub fn init(&self) -> Result<(), Box<dyn Error>> {
         fs::create_dir_all(self.events_dir())?;
         fs::create_dir_all(self.projects_dir())?;
-        fs::create_dir_all(self.nodes_dir())?;
+
+        let marker_path = self.root.join(util::STORE_MARKER);
+        if !marker_path.exists() {
+            let marker = serde_json::json!({
+                "format": 1,
+                "created_at": util::now_rfc3339(),
+            });
+            fs::write(
+                &marker_path,
+                format!("{}\n", serde_json::to_string_pretty(&marker)?),
+            )?;
+        }
 
         let gitignore_path = self.root.join(".gitignore");
         if !gitignore_path.exists() {
@@ -47,6 +58,7 @@ impl MemStore {
             writeln!(file, "target/")?;
             writeln!(file, "*.swp")?;
             writeln!(file, "*.tmp")?;
+            writeln!(file, "*.tmp.*")?;
             writeln!(file, "*~")?;
             writeln!(file, ".DS_Store")?;
             file.flush()?;
@@ -63,7 +75,8 @@ impl MemStore {
         Ok(())
     }
 
-    /// Append an event to events/YYYY-MM.jsonl and append its FileRecords to projects/<name>/files.jsonl.
+    /// Append an event to `events/YYYY-MM.jsonl` and append its `FileRecord`s to
+    /// `projects/<name>/files.jsonl`.
     pub fn append_event(&self, event: &Event) -> Result<(), Box<dyn Error>> {
         let ym = if event.ts.len() >= 7 && event.ts.as_bytes()[4] == b'-' {
             &event.ts[..7]
@@ -124,8 +137,12 @@ impl MemStore {
             if line.is_empty() {
                 continue;
             }
-            let event: Event = serde_json::from_slice(line)?;
-            events.push(event);
+            // Skip unparseable lines instead of failing the whole read: a single
+            // truncated write, or a line preserved verbatim by `mem resolve`,
+            // must not make the store unreadable.
+            if let Ok(event) = serde_json::from_slice::<Event>(line) {
+                events.push(event);
+            }
         }
         Ok(events)
     }
@@ -158,20 +175,57 @@ impl MemStore {
                 if line.is_empty() {
                     continue;
                 }
-                let event: Event = serde_json::from_slice(line)?;
-                all_events.push(event);
+                if let Ok(event) = serde_json::from_slice::<Event>(line) {
+                    all_events.push(event);
+                }
             }
         }
         Ok(all_events)
     }
 
-    /// Read tail of the most recent events file using File::seek(SeekFrom::End) + BufReader::read_line.
-    /// Never uses mmap for tail reads.
-    pub fn read_latest_events(&self, n: usize) -> Result<Vec<Event>, Box<dyn Error>> {
+    /// Read the `n` most recent events of a project, newest last.
+    ///
+    /// Months are visited newest-first so an older month is never preferred over
+    /// a newer one; within a month events are sorted with the parse-aware
+    /// comparator so mixed legacy timestamp formats stay chronologically correct.
+    pub fn read_latest_events_for_project(
+        &self,
+        project: &str,
+        n: usize,
+    ) -> Result<Vec<Event>, Box<dyn Error>> {
         if n == 0 {
             return Ok(Vec::new());
         }
 
+        let mut latest = Vec::with_capacity(n);
+        for path in self.month_files()?.into_iter().rev() {
+            let year_month = match path.file_stem().and_then(|s| s.to_str()) {
+                Some(value) => value.to_string(),
+                None => continue,
+            };
+            let mut events: Vec<Event> = self
+                .read_events_for_month(&year_month)?
+                .into_iter()
+                .filter(|event| event.project == project)
+                .collect();
+            util::sort_events(&mut events);
+            for event in events.into_iter().rev() {
+                latest.push(event);
+                if latest.len() == n {
+                    break;
+                }
+            }
+            if latest.len() == n {
+                break;
+            }
+        }
+
+        latest.reverse();
+        Ok(latest)
+    }
+
+    /// List `events/*.jsonl` files in ascending order (oldest month first).
+    pub fn month_files(&self) -> Result<Vec<PathBuf>, Box<dyn Error>> {
         let events_dir = self.events_dir();
         if !events_dir.exists() {
             return Ok(Vec::new());
@@ -181,79 +235,15 @@ impl MemStore {
         for entry in fs::read_dir(&events_dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+            if path.extension().and_then(|s| s.to_str()) == Some("jsonl") && is_month_shard(&path) {
                 files.push(path);
             }
         }
         files.sort();
-
-        let latest_file_path = match files.last() {
-            Some(p) => p,
-            None => return Ok(Vec::new()),
-        };
-
-        let mut file = File::open(latest_file_path)?;
-        let file_len = file.metadata()?.len();
-        if file_len == 0 {
-            return Ok(Vec::new());
-        }
-
-        // Determine if file ends with newline
-        let mut last_byte = [0u8; 1];
-        file.seek(SeekFrom::End(-1))?;
-        file.read_exact(&mut last_byte)?;
-        let ends_with_nl = last_byte[0] == b'\n';
-        let target_newlines = if ends_with_nl { n + 1 } else { n };
-
-        const CHUNK_SIZE: u64 = 8192;
-        let mut pos = file_len;
-        let mut newlines_found = 0usize;
-        let mut start_pos = 0u64;
-
-        while pos > 0 {
-            let to_read = CHUNK_SIZE.min(pos);
-            pos -= to_read;
-            file.seek(SeekFrom::Start(pos))?;
-            let mut buf = vec![0u8; to_read as usize];
-            file.read_exact(&mut buf)?;
-
-            for (i, &b) in buf.iter().enumerate().rev() {
-                if b == b'\n' {
-                    newlines_found += 1;
-                    if newlines_found == target_newlines {
-                        start_pos = pos + i as u64 + 1;
-                        break;
-                    }
-                }
-            }
-            if newlines_found >= target_newlines {
-                break;
-            }
-        }
-
-        file.seek(SeekFrom::Start(start_pos))?;
-        let mut reader = BufReader::new(file);
-        let mut line = String::new();
-        let mut events = Vec::new();
-
-        while reader.read_line(&mut line)? > 0 {
-            let trimmed = line.trim();
-            if !trimmed.is_empty() {
-                if let Ok(event) = serde_json::from_str::<Event>(trimmed) {
-                    events.push(event);
-                }
-            }
-            line.clear();
-        }
-
-        if events.len() > n {
-            events = events.split_off(events.len() - n);
-        }
-
-        Ok(events)
+        Ok(files)
     }
 
-    /// Read all records from projects/<project>/files.jsonl.
+    /// Read all records from `projects/<project>/files.jsonl`.
     pub fn read_project_files(&self, project: &str) -> Result<Vec<FileRecord>, Box<dyn Error>> {
         let path = self.project_dir(project).join("files.jsonl");
         if !path.exists() {
@@ -271,8 +261,9 @@ impl MemStore {
             if line.is_empty() {
                 continue;
             }
-            let rec: FileRecord = serde_json::from_slice(line)?;
-            records.push(rec);
+            if let Ok(record) = serde_json::from_slice::<FileRecord>(line) {
+                records.push(record);
+            }
         }
         Ok(records)
     }
@@ -287,7 +278,7 @@ impl MemStore {
         Ok(map.into_values().collect())
     }
 
-    /// Read projects/<project>/meta.json.
+    /// Read `projects/<project>/meta.json`.
     pub fn read_project_meta(&self, project: &str) -> Result<ProjectMeta, Box<dyn Error>> {
         let path = self.project_dir(project).join("meta.json");
         let file = File::open(&path)?;
@@ -295,8 +286,12 @@ impl MemStore {
         Ok(meta)
     }
 
-    /// Write projects/<project>/meta.json (overwrite).
-    pub fn write_project_meta(&self, project: &str, meta: &ProjectMeta) -> Result<(), Box<dyn Error>> {
+    /// Write `projects/<project>/meta.json` (overwrite).
+    pub fn write_project_meta(
+        &self,
+        project: &str,
+        meta: &ProjectMeta,
+    ) -> Result<(), Box<dyn Error>> {
         let proj_dir = self.project_dir(project);
         fs::create_dir_all(&proj_dir)?;
         let path = proj_dir.join("meta.json");
@@ -334,7 +329,7 @@ impl MemStore {
             if entry.path() == projects_dir {
                 continue;
             }
-            if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+            if entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 if let Some(name) = entry.file_name().to_str() {
                     projects.push(name.to_string());
                 }
@@ -343,18 +338,22 @@ impl MemStore {
         projects.sort();
         Ok(projects)
     }
+}
 
-    /// Scan files in directory respecting .gitignore entries via ignore crate.
-    pub fn scan_files(&self, dir: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
-        let mut files = Vec::new();
-        for result in WalkBuilder::new(dir).hidden(false).build() {
-            let entry = result?;
-            if entry.file_type().map_or(false, |ft| ft.is_file()) {
-                files.push(entry.into_path());
-            }
-        }
-        Ok(files)
-    }
+/// Whether a file is a `YYYY-MM.jsonl` month shard.
+///
+/// Month shards are ordered lexicographically, so a stray `default.jsonl` (the
+/// legacy fallback for events with an unparseable timestamp) would otherwise be
+/// treated as the newest month by latest-event queries.
+fn is_month_shard(path: &std::path::Path) -> bool {
+    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return false;
+    };
+    let bytes = stem.as_bytes();
+    bytes.len() == 7
+        && bytes[4] == b'-'
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[5..].iter().all(u8::is_ascii_digit)
 }
 
 #[cfg(test)]
@@ -392,8 +391,9 @@ mod tests {
         let (_tmp, store) = create_temp_store();
         assert!(store.events_dir().exists());
         assert!(store.projects_dir().exists());
-        assert!(store.nodes_dir().exists());
         assert!(store.root.join(".gitignore").exists());
+        // The marker file is what makes the store discoverable from subdirectories.
+        assert!(store.root.join(crate::util::STORE_MARKER).is_file());
     }
 
     #[test]
@@ -443,12 +443,20 @@ mod tests {
         let all_events = store.read_all_events().unwrap();
         assert_eq!(all_events.len(), 2);
 
-        let latest_1 = store.read_latest_events(1).unwrap();
+        let latest_1 = store.read_latest_events_for_project("demo", 1).unwrap();
         assert_eq!(latest_1.len(), 1);
         assert_eq!(latest_1[0].event_id, "eid_2");
 
-        let latest_5 = store.read_latest_events(5).unwrap();
+        let latest_5 = store.read_latest_events_for_project("demo", 5).unwrap();
         assert_eq!(latest_5.len(), 2);
+        assert_eq!(latest_5[0].event_id, "eid_1");
+        assert_eq!(latest_5[1].event_id, "eid_2");
+
+        // Another project's events must not leak in.
+        assert!(store
+            .read_latest_events_for_project("other", 5)
+            .unwrap()
+            .is_empty());
 
         let proj_files = store.read_project_files("demo").unwrap();
         assert_eq!(proj_files.len(), 2);
@@ -457,6 +465,116 @@ mod tests {
         assert_eq!(latest_files.len(), 1);
         assert_eq!(latest_files[0].action, "Modified");
         assert_eq!(latest_files[0].size_bytes, 120);
+    }
+
+    fn make_event(event_id: &str, ts: &str, project: &str) -> Event {
+        Event {
+            event_id: event_id.to_string(),
+            ts: ts.to_string(),
+            device: "laptop".to_string(),
+            agent: "agent-1".to_string(),
+            project: project.to_string(),
+            summary: format!("event {}", event_id),
+            files: Vec::new(),
+        }
+    }
+
+    /// The old tail reader only looked at the newest month file, so it silently
+    /// missed older months. Latest-events lookups must span months.
+    #[test]
+    fn test_read_latest_events_spans_months() {
+        let (_tmp, store) = create_temp_store();
+        store
+            .append_event(&make_event("eid_sep", "2026-09-30T23:00:00Z", "demo"))
+            .unwrap();
+        store
+            .append_event(&make_event("eid_oct1", "2026-10-01T01:00:00Z", "demo"))
+            .unwrap();
+        store
+            .append_event(&make_event("eid_oct2", "2026-10-02T01:00:00Z", "demo"))
+            .unwrap();
+
+        let latest = store.read_latest_events_for_project("demo", 3).unwrap();
+        let ids: Vec<&str> = latest.iter().map(|e| e.event_id.as_str()).collect();
+        assert_eq!(ids, vec!["eid_sep", "eid_oct1", "eid_oct2"]);
+
+        // Within a month, mixed legacy timestamp formats must still sort correctly.
+        let mixed = store.read_latest_events_for_project("demo", 2).unwrap();
+        assert_eq!(mixed.len(), 2);
+        assert_eq!(mixed[1].event_id, "eid_oct2");
+    }
+
+    /// A single corrupt/truncated line must not make the whole store unreadable.
+    #[test]
+    fn test_reads_tolerate_corrupt_lines() {
+        let (_tmp, store) = create_temp_store();
+        store
+            .append_event(&make_event("eid_ok", "2026-10-02T01:00:00Z", "demo"))
+            .unwrap();
+
+        let events_path = store.events_dir().join("2026-10.jsonl");
+        let mut content = fs::read_to_string(&events_path).unwrap();
+        content.push_str("{\"event_id\":\"broken\",\"ts\":\"2026-10-02T02:00:00Z\"\n");
+        fs::write(&events_path, content).unwrap();
+
+        let all = store.read_all_events().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].event_id, "eid_ok");
+
+        let month = store.read_events_for_month("2026-10").unwrap();
+        assert_eq!(month.len(), 1);
+
+        let latest = store.read_latest_events_for_project("demo", 5).unwrap();
+        assert_eq!(latest.len(), 1);
+    }
+
+    #[test]
+    fn test_month_files_lists_jsonl_only() {
+        let (_tmp, store) = create_temp_store();
+        store
+            .append_event(&make_event("eid_a", "2026-09-30T23:00:00Z", "demo"))
+            .unwrap();
+        store
+            .append_event(&make_event("eid_b", "2026-10-01T01:00:00Z", "demo"))
+            .unwrap();
+        fs::write(store.events_dir().join("notes.txt"), "ignored").unwrap();
+
+        let files = store.month_files().unwrap();
+        assert_eq!(files.len(), 2);
+        assert!(files[0].to_string_lossy().ends_with("2026-09.jsonl"));
+        assert!(files[1].to_string_lossy().ends_with("2026-10.jsonl"));
+    }
+
+    /// A legacy `default.jsonl` fallback shard must not be mistaken for the
+    /// newest month (month files are ordered lexicographically).
+    #[test]
+    fn test_month_files_ignores_non_month_shards() {
+        let (_tmp, store) = create_temp_store();
+        store
+            .append_event(&make_event("eid_a", "2026-09-30T23:00:00Z", "demo"))
+            .unwrap();
+        store
+            .append_event(&make_event("eid_b", "2026-10-01T01:00:00Z", "demo"))
+            .unwrap();
+        // A legacy fallback shard for events without a parseable timestamp.
+        let fallback = make_event("eid_default", "", "demo");
+        fs::write(
+            store.events_dir().join("default.jsonl"),
+            format!("{}\n", serde_json::to_string(&fallback).unwrap()),
+        )
+        .unwrap();
+
+        let files = store.month_files().unwrap();
+        assert_eq!(
+            files.len(),
+            2,
+            "only YYYY-MM shards are month files: {:?}",
+            files
+        );
+
+        let latest = store.read_latest_events_for_project("demo", 5).unwrap();
+        let ids: Vec<&str> = latest.iter().map(|e| e.event_id.as_str()).collect();
+        assert_eq!(ids, vec!["eid_a", "eid_b"]);
     }
 
     #[test]

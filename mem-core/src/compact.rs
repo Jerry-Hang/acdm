@@ -16,7 +16,10 @@ pub struct CompactReport {
 
 /// Compact a project's files.jsonl by keeping only the latest record per file_name.
 /// Writes to a temporary file and atomically renames it over the original.
-pub fn compact_project_files(store: &MemStore, project: &str) -> Result<CompactReport, Box<dyn Error>> {
+pub fn compact_project_files(
+    store: &MemStore,
+    project: &str,
+) -> Result<CompactReport, Box<dyn Error>> {
     let proj_dir = store.project_dir(project);
     let files_path = proj_dir.join("files.jsonl");
 
@@ -41,8 +44,11 @@ pub fn compact_project_files(store: &MemStore, project: &str) -> Result<CompactR
     let compacted: Vec<FileRecord> = map.into_values().collect();
     let records_after = compacted.len();
 
-    // 3. Write to temporary file in the same directory for atomic rename
-    let temp_path = proj_dir.join(format!("files.jsonl.tmp.{}", std::process::id()));
+    // 3. Write to a temporary file in the same directory for atomic rename.
+    //    The name is intentionally `files.jsonl.tmp` (no pid suffix) so the
+    //    store's own `.gitignore` `*.tmp` pattern covers it if a run is killed
+    //    before the rename.
+    let temp_path = proj_dir.join("files.jsonl.tmp");
     {
         let mut temp_file = OpenOptions::new()
             .create(true)
@@ -59,8 +65,11 @@ pub fn compact_project_files(store: &MemStore, project: &str) -> Result<CompactR
         temp_file.unlock()?;
     }
 
-    // 4. Atomically rename temp file over original
-    fs::rename(&temp_path, &files_path)?;
+    // 4. Atomically rename temp file over original, cleaning up on failure.
+    if let Err(error) = fs::rename(&temp_path, &files_path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error.into());
+    }
 
     Ok(CompactReport {
         project: project.to_string(),
@@ -81,7 +90,11 @@ mod tests {
 
     impl TestDir {
         fn new() -> Self {
-            let unique = format!("acdm_compact_test_{}_{}", std::process::id(), crate::generate_id());
+            let unique = format!(
+                "acdm_compact_test_{}_{}",
+                std::process::id(),
+                crate::generate_id()
+            );
             let path = std::env::temp_dir().join(unique);
             fs::create_dir_all(&path).unwrap();
             Self { path }

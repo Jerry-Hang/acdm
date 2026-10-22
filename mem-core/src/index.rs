@@ -169,7 +169,11 @@ mod tests {
 
     impl TestDir {
         fn new() -> Self {
-            let unique = format!("acdm_index_test_{}_{}", std::process::id(), crate::generate_id());
+            let unique = format!(
+                "acdm_index_test_{}_{}",
+                std::process::id(),
+                crate::generate_id()
+            );
             let path = std::env::temp_dir().join(unique);
             fs::create_dir_all(&path).unwrap();
             Self { path }
