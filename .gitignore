@@ -1,0 +1,14 @@
+target/
+*.swp
+*.tmp
+*~
+.DS_Store
+
+# Credentials & secrets
+*.env
+.env.*
+*secret*
+*credential*
+*.pem
+*.key
+.ssh/

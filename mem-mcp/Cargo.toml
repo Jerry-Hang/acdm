@@ -1,0 +1,14 @@
+[package]
+name = "mem-mcp"
+version = "0.1.0"
+edition = "2021"
+description = "MCP Server (stdio) for Agent Cross-Device Memory System"
+
+[[bin]]
+name = "mem-mcp"
+path = "src/main.rs"
+
+[dependencies]
+mem-core = { path = "../mem-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
