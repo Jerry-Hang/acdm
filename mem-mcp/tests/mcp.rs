@@ -8,7 +8,7 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Output, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -727,5 +727,370 @@ fn test_render_then_add_event_creates_project_metadata() {
         meta.contains("\"name\": \"ghost\""),
         "meta.json must describe the project: {}",
         meta
+    );
+}
+
+// ----------------- Review fixes: protocol consistency, sync errors, input caps -----------------
+
+/// Review finding #1: a traversal-like project name must be rejected as a tool
+/// business error (isError) and must never create directories.
+#[test]
+fn project_name_traversal_is_rejected() {
+    let env = TestEnv::new("traversal");
+    let mut server = McpServer::start(&env.store, &env.cwd);
+    server.initialize();
+
+    for project in ["../escape", "a/b"] {
+        let response = server.call_tool(
+            "mem_add_event",
+            json!({"project": project, "summary": "must fail"}),
+        );
+        assert!(
+            response.get("error").is_none(),
+            "invalid project is a tool business error, not a JSON-RPC error: {}",
+            response
+        );
+        assert_eq!(
+            response["result"]["isError"],
+            json!(true),
+            "invalid project {:?} must set isError: {}",
+            project,
+            response
+        );
+        assert!(
+            tool_text(&response).contains("invalid project name"),
+            "the error must name the invalid project, got: {}",
+            tool_text(&response)
+        );
+    }
+
+    assert!(
+        !env.base.join("escape").exists(),
+        "`../escape` must not create a directory next to the store"
+    );
+    assert!(
+        !env.store.join("escape").exists(),
+        "`../escape` must not escape projects/ inside the store"
+    );
+    assert!(
+        !env.store.join("projects").join("a").exists(),
+        "`a/b` must not create nested project directories"
+    );
+}
+
+/// Review finding #15: `jsonrpc` must be validated as `"2.0"` (-32600), even when
+/// the field is missing; the connection must keep working afterwards.
+#[test]
+fn invalid_jsonrpc_version_returns_32600() {
+    let env = TestEnv::new("jsonrpc-version");
+    let mut server = McpServer::start(&env.store, &env.cwd);
+    server.initialize();
+
+    server.send_raw(&json!({"jsonrpc": "1.0", "id": 77, "method": "ping"}).to_string());
+    let response = server.read_response();
+    assert_eq!(
+        error_code(&response),
+        -32600,
+        "a wrong jsonrpc version must be Invalid Request: {}",
+        response
+    );
+    assert_eq!(response["id"], json!(77));
+
+    // A missing version field is an Invalid Request, not a JSON parse error.
+    server.send_raw(&json!({"id": 78, "method": "ping"}).to_string());
+    let response = server.read_response();
+    assert_eq!(
+        error_code(&response),
+        -32600,
+        "a missing jsonrpc version must be Invalid Request: {}",
+        response
+    );
+    assert_eq!(response["id"], json!(78));
+
+    let pong = server.send_request("ping", None);
+    assert_eq!(
+        pong["result"],
+        json!({}),
+        "the server must still answer valid requests"
+    );
+}
+
+/// Review finding #15: tool business errors are `isError` results inside a
+/// successful response (so the agent can self-correct), not -32603 errors.
+#[test]
+fn business_errors_use_is_error_result() {
+    let env = TestEnv::new("business-error");
+    let mut server = McpServer::start(&env.store, &env.cwd);
+    server.initialize();
+
+    let response = server.call_tool("mem_query", json!({"by": "bogus", "value": "anything"}));
+    assert!(
+        response.get("error").is_none(),
+        "business errors must not be JSON-RPC errors: {}",
+        response
+    );
+    assert_eq!(
+        response["result"]["isError"],
+        json!(true),
+        "an invalid query dimension must be an isError result: {}",
+        response
+    );
+    assert!(
+        tool_text(&response).contains("Invalid query dimension"),
+        "the isError text must explain the problem: {}",
+        tool_text(&response)
+    );
+
+    // Unknown tools remain protocol errors.
+    let response = server.call_tool("mem_does_not_exist", json!({}));
+    assert_eq!(
+        error_code(&response),
+        -32601,
+        "unknown tools must stay -32601: {}",
+        response
+    );
+}
+
+/// Review finding #15: schema violations (missing/wrong/enum-invalid arguments)
+/// must be Invalid params (-32602), not internal errors.
+#[test]
+fn invalid_tool_arguments_return_32602() {
+    let env = TestEnv::new("invalid-args");
+    let mut server = McpServer::start(&env.store, &env.cwd);
+    server.initialize();
+
+    // Missing a required field.
+    let response = server.call_tool("mem_compact", json!({}));
+    assert_eq!(
+        error_code(&response),
+        -32602,
+        "a missing `project` must be Invalid params: {}",
+        response
+    );
+
+    // Unknown/incorrectly-cased action enum value.
+    let response = server.call_tool(
+        "mem_add_event",
+        json!({
+            "project": "demo",
+            "summary": "bad action",
+            "files": [{"file_name": "x.txt", "action": "Renamed"}],
+        }),
+    );
+    assert_eq!(
+        error_code(&response),
+        -32602,
+        "an unknown files[].action must be Invalid params: {}",
+        response
+    );
+    assert!(
+        store_events(&env.store).is_empty(),
+        "invalid arguments must not record an event"
+    );
+
+    // Wrong argument type.
+    let response = server.call_tool("mem_sync", json!({"message": 42}));
+    assert_eq!(
+        error_code(&response),
+        -32602,
+        "a wrong argument type must be Invalid params: {}",
+        response
+    );
+}
+
+/// Review finding #5: a sync failure (here: no remote to push to) is surfaced as
+/// an isError tool result instead of a silent success.
+#[test]
+fn mem_sync_without_remote_reports_is_error() {
+    let env = TestEnv::new("sync-no-remote");
+    let mut server = McpServer::start(&env.store, &env.cwd);
+    server.initialize();
+
+    let init = Command::new("git")
+        .current_dir(&env.store)
+        .args(["init", "--quiet"])
+        .output()
+        .expect("run git init");
+    assert!(init.status.success(), "git init failed");
+    for args in [
+        ["config", "user.email", "test@acdm.local"],
+        ["config", "user.name", "ACDM Test"],
+    ] {
+        let output = Command::new("git")
+            .current_dir(&env.store)
+            .args(args)
+            .output()
+            .expect("run git config");
+        assert!(output.status.success(), "git config failed");
+    }
+
+    let response = server.call_tool("mem_sync", json!({}));
+    assert!(
+        response.get("error").is_none(),
+        "a sync failure is a tool business error: {}",
+        response
+    );
+    assert_eq!(
+        response["result"]["isError"],
+        json!(true),
+        "a sync without a remote must be an isError result: {}",
+        response
+    );
+    let text = tool_text(&response);
+    assert!(
+        text.to_lowercase().contains("failed") || text.to_lowercase().contains("push"),
+        "the isError text must explain the sync failure: {}",
+        text
+    );
+}
+
+/// Review finding #9: a single oversized input line must not exhaust memory; the
+/// server answers -32600 and then keeps serving.
+#[test]
+fn oversized_request_line_is_rejected_and_server_recovers() {
+    let env = TestEnv::new("oversized");
+    let mut server = McpServer::start(&env.store, &env.cwd);
+    server.initialize();
+
+    let oversized = "x".repeat(16 * 1024 * 1024 + 1);
+    server.send_raw(&oversized);
+    let response = server.read_response();
+    assert_eq!(
+        error_code(&response),
+        -32600,
+        "an oversized line must be Invalid Request: {}",
+        response
+    );
+    assert!(
+        response["id"].is_null(),
+        "an oversized line has no usable request id: {}",
+        response
+    );
+
+    let pong = server.send_request("ping", None);
+    assert_eq!(
+        pong["result"],
+        json!({}),
+        "the server must recover after discarding the oversized line"
+    );
+}
+
+/// Run `git` in `cwd` and return its output.
+fn git(cwd: &Path, args: &[&str]) -> Output {
+    Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .expect("failed to run git")
+}
+
+fn assert_git_ok(output: &Output) {
+    assert!(
+        output.status.success(),
+        "git command failed: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn git_stdout(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// Review finding #5: a pull conflict must become an isError tool result whose
+/// text tells the agent to run `mem_resolve` and retry (never a silent success).
+#[test]
+fn mem_sync_conflict_reports_is_error_and_mentions_resolve() {
+    let env = TestEnv::new("sync-conflict");
+
+    let bare = env.base.join("origin.git");
+    assert_git_ok(&git(
+        &env.base,
+        &["init", "--bare", bare.to_str().expect("UTF-8 path")],
+    ));
+
+    // Seed the remote with a store-like repository.
+    let seed = env.base.join("seed");
+    fs::create_dir_all(seed.join("events")).expect("create seed events dir");
+    fs::write(
+        seed.join("events").join("2026-10.jsonl"),
+        "{\"event_id\":\"base\"}\n",
+    )
+    .expect("write seed event log");
+    assert_git_ok(&git(&seed, &["init", "--quiet"]));
+    assert_git_ok(&git(&seed, &["config", "user.email", "test@acdm.local"]));
+    assert_git_ok(&git(&seed, &["config", "user.name", "ACDM Test"]));
+    assert_git_ok(&git(&seed, &["add", "-A"]));
+    assert_git_ok(&git(&seed, &["commit", "-qm", "seed store"]));
+    assert_git_ok(&git(
+        &seed,
+        &[
+            "remote",
+            "add",
+            "origin",
+            bare.to_str().expect("UTF-8 path"),
+        ],
+    ));
+    let branch = git_stdout(&git(&seed, &["rev-parse", "--abbrev-ref", "HEAD"]));
+    assert_git_ok(&git(&seed, &["push", "-q", "-u", "origin", &branch]));
+
+    // The server's store is clone A; clone B pushes a conflicting change first.
+    let clone_b = env.base.join("clone-b");
+    for repo in [&env.store, &clone_b] {
+        assert_git_ok(&git(
+            &env.base,
+            &[
+                "clone",
+                "-q",
+                bare.to_str().expect("UTF-8 path"),
+                repo.to_str().expect("UTF-8 path"),
+            ],
+        ));
+        assert_git_ok(&git(repo, &["config", "user.email", "test@acdm.local"]));
+        assert_git_ok(&git(repo, &["config", "user.name", "ACDM Test"]));
+    }
+    fs::write(
+        clone_b.join("events").join("2026-10.jsonl"),
+        "{\"event_id\":\"remote\"}\n",
+    )
+    .expect("write clone B event log");
+    assert_git_ok(&git(&clone_b, &["add", "-A"]));
+    assert_git_ok(&git(&clone_b, &["commit", "-qm", "remote change"]));
+    assert_git_ok(&git(&clone_b, &["push", "-q"]));
+
+    fs::write(
+        env.store.join("events").join("2026-10.jsonl"),
+        "{\"event_id\":\"local\"}\n",
+    )
+    .expect("write clone A event log");
+    assert_git_ok(&git(&env.store, &["add", "-A"]));
+    assert_git_ok(&git(&env.store, &["commit", "-qm", "local change"]));
+
+    let mut server = McpServer::start(&env.store, &env.cwd);
+    server.initialize();
+
+    let response = server.call_tool("mem_sync", json!({}));
+    assert!(
+        response.get("error").is_none(),
+        "a conflicted sync is a tool business error: {}",
+        response
+    );
+    assert_eq!(
+        response["result"]["isError"],
+        json!(true),
+        "a conflicted sync must set isError: {}",
+        response
+    );
+    let text = tool_text(&response);
+    assert!(
+        text.contains("run mem_resolve then retry"),
+        "the isError text must tell the agent to run mem_resolve and retry: {}",
+        text
+    );
+    assert!(
+        text.to_lowercase().contains("conflict"),
+        "the isError text must mention the conflict: {}",
+        text
     );
 }

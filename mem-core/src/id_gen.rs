@@ -1,7 +1,27 @@
 use chrono::Utc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
+static COUNTER_SEED: OnceLock<u64> = OnceLock::new();
+
+/// Per-process counter offset.
+///
+/// Two processes that start their counter at zero in the same nanosecond would
+/// mint identical ids once the pid matches — which is common in containers where
+/// every process is pid 1. Mixing the start time with the pid and a constant
+/// spreads the counter space without changing the id format.
+fn counter_seed() -> u64 {
+    *COUNTER_SEED.get_or_init(|| {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos() as u64)
+            .unwrap_or(0);
+        let pid = std::process::id() as u64;
+        nanos.rotate_left(17) ^ pid.wrapping_shl(32) ^ 0x9E37_79B9_7F4A_7C15
+    })
+}
 
 /// Generate a unique identifier in the format:
 /// `YYYYMMDDHHMMSS_<nanos(9)>_<pid(5)>_<counter(4)>`
@@ -23,7 +43,7 @@ pub fn generate_id() -> String {
     let stamp = now.format("%Y%m%d%H%M%S");
     let nanos = now.timestamp_subsec_nanos();
     let pid = std::process::id() % 100_000;
-    let counter = COUNTER.fetch_add(1, Ordering::SeqCst) % 10_000;
+    let counter = counter_seed().wrapping_add(COUNTER.fetch_add(1, Ordering::SeqCst)) % 10_000;
     format!("{}_{:09}_{:05}_{:04}", stamp, nanos, pid, counter)
 }
 

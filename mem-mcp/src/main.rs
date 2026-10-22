@@ -1,23 +1,22 @@
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use mem_core::compact::compact_project_files;
-use mem_core::git::{
-    git_add_all, git_commit, git_has_conflicts, git_pull_rebase, git_push, git_status_clean,
-};
 use mem_core::render::write_project_readme;
 use mem_core::resolve::resolve_conflicts;
 use mem_core::{
-    default_device_name, generate_id, normalize_file_name, now_rfc3339, resolve_store_root, Event,
-    FileRecord, MemIndex, MemStore, ProjectMeta,
+    default_device_name, generate_id, normalize_file_name, now_rfc3339, resolve_store_root,
+    sync_store, Event, FileRecord, MemIndex, MemStore, ProjectMeta, SyncOutcome,
 };
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
-    #[allow(dead_code)]
+    /// JSON-RPC version; validated against `"2.0"` by the dispatcher.
+    #[serde(default)]
     jsonrpc: String,
     #[serde(default)]
     id: Option<Value>,
@@ -78,6 +77,23 @@ fn mcp_text_content(text: impl Into<String>) -> Value {
                 "text": text.into()
             }
         ]
+    })
+}
+
+/// A tool-level failure.
+///
+/// MCP recommends reporting business errors inside a successful JSON-RPC
+/// response with `isError: true`, so the calling agent can read the message and
+/// correct itself; -32603 is reserved for genuine server faults.
+fn mcp_error_content(text: impl Into<String>) -> Value {
+    serde_json::json!({
+        "content": [
+            {
+                "type": "text",
+                "text": text.into()
+            }
+        ],
+        "isError": true
     })
 }
 
@@ -330,11 +346,35 @@ fn handle_get_context(store: &MemStore, args: GetContextArgs) -> Result<Value, S
     }
 }
 
+/// File action values accepted from MCP clients.
+///
+/// Deserializing into an enum makes anything but the three exact, case-sensitive
+/// values a tool-argument error (-32602) instead of silently storing junk.
+#[derive(Debug, Clone, Copy, Deserialize)]
+enum FileAction {
+    #[serde(rename = "Created")]
+    Created,
+    #[serde(rename = "Modified")]
+    Modified,
+    #[serde(rename = "Deleted")]
+    Deleted,
+}
+
+impl FileAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "Created",
+            Self::Modified => "Modified",
+            Self::Deleted => "Deleted",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct AddEventFileArg {
     file_name: String,
     #[serde(default)]
-    action: Option<String>,
+    action: Option<FileAction>,
     #[serde(default)]
     size_bytes: Option<u64>,
     #[serde(default)]
@@ -368,7 +408,10 @@ fn handle_add_event(store: &MemStore, args: AddEventArgs) -> Result<Value, Strin
     let raw_files = args.files.unwrap_or_default();
     let mut files = Vec::with_capacity(raw_files.len());
     for f in raw_files {
-        let action = f.action.unwrap_or_else(|| "Modified".to_string());
+        let action = f
+            .action
+            .map(|action| action.as_str().to_string())
+            .unwrap_or_else(|| "Modified".to_string());
         let file_id = generate_id();
         // MCP clients usually send absolute paths. Store the canonical,
         // store-relative identity so that `mem_query by=filename` (which indexes
@@ -587,46 +630,27 @@ struct SyncArgs {
     message: Option<String>,
 }
 
-fn handle_sync(store: &MemStore, args: Option<SyncArgs>) -> Result<Value, String> {
-    let mut steps = Vec::new();
-
-    let is_clean =
-        git_status_clean(&store.root).map_err(|e| format!("Git status check failed: {}", e))?;
-
-    if !is_clean {
-        git_add_all(&store.root).map_err(|e| format!("git add -A failed: {}", e))?;
-
-        let commit_msg = args
-            .and_then(|a| a.message)
-            .filter(|m| !m.trim().is_empty())
-            .unwrap_or_else(|| "Auto-sync memory store".to_string());
-
-        git_commit(&store.root, &commit_msg).map_err(|e| format!("git commit failed: {}", e))?;
-        steps.push(format!("Committed local changes (\"{}\")", commit_msg));
-    } else {
-        steps.push("Working directory clean".to_string());
+fn handle_sync(store: &MemStore, args: SyncArgs) -> Result<Value, String> {
+    // Shared with the CLI: locks the store, commits dirty state, skips the pull
+    // when there is no upstream, and refuses to push after a failed pull.
+    match sync_store(&store.root, args.message.as_deref()) {
+        Ok(SyncOutcome::Success { steps }) => Ok(mcp_text_content(format!(
+            "Sync completed successfully: {}",
+            steps.join("; ")
+        ))),
+        Ok(SyncOutcome::Conflict { steps, message }) => Err(format!(
+            "Sync stopped on a git conflict: {}. Completed steps: {}. \
+             Resolve the JSONL conflicts with the `mem_resolve` tool, then retry \
+             (run mem_resolve then retry mem_sync).",
+            message,
+            steps.join("; ")
+        )),
+        Err(error) => Err(format!(
+            "Sync failed: {}. Check the git remote/upstream configuration, then run \
+             mem_sync again.",
+            error
+        )),
     }
-
-    if let Err(pull_err) = git_pull_rebase(&store.root) {
-        if git_has_conflicts(&store.root).unwrap_or(false) {
-            return Err(format!(
-                "Git conflict detected during pull --rebase: {}. Please call the `mem_resolve` tool to automatically deduplicate and merge the JSONL records.",
-                pull_err
-            ));
-        }
-        // Non-conflict error (e.g. no upstream changes or network blip), log note and proceed
-        steps.push(format!("pull note: {}", pull_err));
-    } else {
-        steps.push("Pulled remote changes with rebase".to_string());
-    }
-
-    git_push(&store.root).map_err(|e| format!("git push failed: {}", e))?;
-    steps.push("Pushed to remote successfully".to_string());
-
-    Ok(mcp_text_content(format!(
-        "Sync completed successfully: {}",
-        steps.join("; ")
-    )))
 }
 
 fn handle_resolve(store: &MemStore) -> Result<Value, String> {
@@ -663,7 +687,35 @@ fn handle_render(store: &MemStore, args: RenderArgs) -> Result<Value, String> {
 
 // ----------------- Request Dispatcher -----------------
 
+/// Deserialize one tool's arguments, mapping schema violations to JSON-RPC
+/// `-32602` (Invalid params) instead of an internal error.
+fn parse_tool_args<T: DeserializeOwned>(
+    id: &Value,
+    tool: &str,
+    arguments: Value,
+) -> Result<T, JsonRpcResponse> {
+    serde_json::from_value(arguments).map_err(|error| {
+        error_response(
+            id.clone(),
+            -32602,
+            format!("Invalid arguments for {}: {}", tool, error),
+        )
+    })
+}
+
 fn handle_request(store: &MemStore, request: JsonRpcRequest) -> Option<JsonRpcResponse> {
+    // JSON-RPC 2.0 requires the version field; anything else is an Invalid Request.
+    if request.jsonrpc != "2.0" {
+        return Some(error_response(
+            request.id.unwrap_or(Value::Null),
+            -32600,
+            format!(
+                "Invalid Request: expected jsonrpc \"2.0\", got {:?}",
+                request.jsonrpc
+            ),
+        ));
+    }
+
     // Protocol notifications: do not send any response
     if request.method == "notifications/initialized"
         || request.method == "initialized"
@@ -683,7 +735,7 @@ fn handle_request(store: &MemStore, request: JsonRpcRequest) -> Option<JsonRpcRe
                 },
                 "serverInfo": {
                     "name": "mem-mcp",
-                    "version": "0.1.0"
+                    "version": "0.1.1"
                 }
             });
             Some(success_response(id, result))
@@ -719,31 +771,36 @@ fn handle_request(store: &MemStore, request: JsonRpcRequest) -> Option<JsonRpcRe
                 .unwrap_or_else(|| Value::Object(Default::default()));
 
             let call_result = match call_params.name.as_str() {
-                "mem_get_context" => match serde_json::from_value::<GetContextArgs>(args_val) {
-                    Ok(args) => handle_get_context(store, args),
-                    Err(e) => Err(format!("Invalid arguments for mem_get_context: {}", e)),
-                },
-                "mem_add_event" => match serde_json::from_value::<AddEventArgs>(args_val) {
-                    Ok(args) => handle_add_event(store, args),
-                    Err(e) => Err(format!("Invalid arguments for mem_add_event: {}", e)),
-                },
-                "mem_query" => match serde_json::from_value::<QueryArgs>(args_val) {
+                "mem_get_context" => {
+                    match parse_tool_args::<GetContextArgs>(&id, "mem_get_context", args_val) {
+                        Ok(args) => handle_get_context(store, args),
+                        Err(response) => return Some(response),
+                    }
+                }
+                "mem_add_event" => {
+                    match parse_tool_args::<AddEventArgs>(&id, "mem_add_event", args_val) {
+                        Ok(args) => handle_add_event(store, args),
+                        Err(response) => return Some(response),
+                    }
+                }
+                "mem_query" => match parse_tool_args::<QueryArgs>(&id, "mem_query", args_val) {
                     Ok(args) => handle_query(store, args),
-                    Err(e) => Err(format!("Invalid arguments for mem_query: {}", e)),
+                    Err(response) => return Some(response),
                 },
                 "mem_list_projects" => handle_list_projects(store),
-                "mem_compact" => match serde_json::from_value::<CompactArgs>(args_val) {
+                "mem_compact" => match parse_tool_args::<CompactArgs>(&id, "mem_compact", args_val)
+                {
                     Ok(args) => handle_compact(store, args),
-                    Err(e) => Err(format!("Invalid arguments for mem_compact: {}", e)),
+                    Err(response) => return Some(response),
                 },
-                "mem_sync" => {
-                    let sync_args = serde_json::from_value::<SyncArgs>(args_val).ok();
-                    handle_sync(store, sync_args)
-                }
+                "mem_sync" => match parse_tool_args::<SyncArgs>(&id, "mem_sync", args_val) {
+                    Ok(args) => handle_sync(store, args),
+                    Err(response) => return Some(response),
+                },
                 "mem_resolve" => handle_resolve(store),
-                "mem_render" => match serde_json::from_value::<RenderArgs>(args_val) {
+                "mem_render" => match parse_tool_args::<RenderArgs>(&id, "mem_render", args_val) {
                     Ok(args) => handle_render(store, args),
-                    Err(e) => Err(format!("Invalid arguments for mem_render: {}", e)),
+                    Err(response) => return Some(response),
                 },
                 unknown => {
                     return Some(error_response(
@@ -755,8 +812,11 @@ fn handle_request(store: &MemStore, request: JsonRpcRequest) -> Option<JsonRpcRe
             };
 
             match call_result {
-                Ok(val) => Some(success_response(id, val)),
-                Err(err_msg) => Some(error_response(id, -32603, err_msg)),
+                Ok(result) => Some(success_response(id, result)),
+                // Business failures (git conflict, invalid query dimension, ...)
+                // are reported as isError results in a successful response so the
+                // calling agent can read the message and self-correct.
+                Err(message) => Some(success_response(id, mcp_error_content(message))),
             }
         }
         other => Some(error_response(
@@ -813,6 +873,79 @@ where
     Ok(explicit)
 }
 
+/// Maximum size of a single JSON-RPC request line (16 MiB).
+///
+/// Without a cap a client that never sends a newline could make the server
+/// buffer unbounded input and exhaust its memory.
+const MAX_REQUEST_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+/// One result of reading a request line from stdin.
+enum LimitedLine {
+    /// A complete line, without its trailing newline.
+    Line(Vec<u8>),
+    /// The line exceeded the cap; it was discarded up to and including its newline.
+    TooLong,
+    /// End of input.
+    Eof,
+}
+
+/// Read one newline-terminated line without ever buffering more than `limit` bytes.
+fn read_limited_line<R: BufRead>(reader: &mut R, limit: usize) -> io::Result<LimitedLine> {
+    let mut line = Vec::new();
+    {
+        // One byte more than the cap is enough to detect a line that does not fit.
+        let mut limited = std::io::Read::take(&mut *reader, limit as u64 + 1);
+        limited.read_until(b'\n', &mut line)?;
+    }
+
+    if line.is_empty() {
+        return Ok(LimitedLine::Eof);
+    }
+
+    let newline_terminated = line.ends_with(b"\n");
+    if !newline_terminated && line.len() > limit {
+        // Discard the rest of the oversized line so the stream stays in sync.
+        discard_until_newline(reader)?;
+        return Ok(LimitedLine::TooLong);
+    }
+    if newline_terminated {
+        line.pop();
+    }
+    Ok(LimitedLine::Line(line))
+}
+
+/// Consume stdin up to and including the next newline (or EOF).
+fn discard_until_newline<R: BufRead>(reader: &mut R) -> io::Result<()> {
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(());
+        }
+        match available.iter().position(|&byte| byte == b'\n') {
+            Some(position) => {
+                reader.consume(position + 1);
+                return Ok(());
+            }
+            None => {
+                let consumed = available.len();
+                reader.consume(consumed);
+            }
+        }
+    }
+}
+
+/// Write one JSON-RPC response line and flush it.
+fn write_response(stdout: &io::Stdout, response: &JsonRpcResponse) {
+    match serde_json::to_string(response) {
+        Ok(out) => {
+            let mut lock = stdout.lock();
+            let _ = writeln!(lock, "{}", out);
+            let _ = lock.flush();
+        }
+        Err(e) => eprintln!("Failed to serialize JSON-RPC response: {}", e),
+    }
+}
+
 fn main() {
     let explicit_root = match parse_store_path_arg(std::env::args_os().skip(1)) {
         Ok(root) => root,
@@ -840,16 +973,35 @@ fn main() {
 
     let stdin = io::stdin();
     let stdout = io::stdout();
+    let mut reader = stdin.lock();
 
-    for line_res in stdin.lock().lines() {
-        let line = match line_res {
-            Ok(l) => l,
+    loop {
+        let line_bytes = match read_limited_line(&mut reader, MAX_REQUEST_LINE_BYTES) {
+            Ok(LimitedLine::Eof) => break,
+            Ok(LimitedLine::Line(line)) => line,
+            Ok(LimitedLine::TooLong) => {
+                // The oversized line (including its newline) was already
+                // discarded, so the server can keep serving later requests.
+                write_response(
+                    &stdout,
+                    &error_response(
+                        Value::Null,
+                        -32600,
+                        format!(
+                            "Invalid Request: request line exceeds {} bytes",
+                            MAX_REQUEST_LINE_BYTES
+                        ),
+                    ),
+                );
+                continue;
+            }
             Err(e) => {
                 eprintln!("Error reading line from stdin: {}", e);
                 break;
             }
         };
 
+        let line = String::from_utf8_lossy(&line_bytes);
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -858,35 +1010,16 @@ fn main() {
         let request: JsonRpcRequest = match serde_json::from_str(trimmed) {
             Ok(req) => req,
             Err(e) => {
-                let err_resp = JsonRpcResponse {
-                    jsonrpc: "2.0".to_string(),
-                    id: Value::Null,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: -32700,
-                        message: format!("Parse error: {}", e),
-                    }),
-                };
-                if let Ok(out) = serde_json::to_string(&err_resp) {
-                    let mut lock = stdout.lock();
-                    let _ = writeln!(lock, "{}", out);
-                    let _ = lock.flush();
-                }
+                write_response(
+                    &stdout,
+                    &error_response(Value::Null, -32700, format!("Parse error: {}", e)),
+                );
                 continue;
             }
         };
 
         if let Some(response) = handle_request(&store, request) {
-            match serde_json::to_string(&response) {
-                Ok(out) => {
-                    let mut lock = stdout.lock();
-                    let _ = writeln!(lock, "{}", out);
-                    let _ = lock.flush();
-                }
-                Err(e) => {
-                    eprintln!("Failed to serialize JSON-RPC response: {}", e);
-                }
-            }
+            write_response(&stdout, &response);
         }
     }
 }

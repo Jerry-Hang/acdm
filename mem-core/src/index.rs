@@ -1,6 +1,5 @@
 use crate::models::Event;
 use crate::storage::MemStore;
-use regex::Regex;
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fs::{self, File};
@@ -43,14 +42,13 @@ impl MemIndex {
         files.sort();
 
         for file_path in files {
-            let file = File::open(&file_path)?;
-            if file.metadata()?.len() == 0 {
+            let data = fs::read(&file_path)?;
+            if data.is_empty() {
                 continue;
             }
-            let mmap = unsafe { memmap2::Mmap::map(&file)? };
             let mut offset = 0u64;
 
-            for line in mmap.split(|&b| b == b'\n') {
+            for line in data.split(|&b| b == b'\n') {
                 let line_len = line.len() as u64;
                 if !line.is_empty() {
                     if let Ok(event) = serde_json::from_slice::<Event>(line) {
@@ -114,9 +112,14 @@ impl MemIndex {
         Ok(event)
     }
 
-    /// Fuzzy search through JSONL files using regular expressions and memmap2.
+    /// Fuzzy search through JSONL files with regular expressions.
     pub fn fuzzy_search(store: &MemStore, pattern: &str) -> Result<Vec<Event>, Box<dyn Error>> {
-        let regex = Regex::new(pattern)?;
+        // A pathological pattern must not be able to exhaust memory: the regex
+        // crate guarantees linear matching, but the compiled program size still
+        // needs a bound when the pattern comes from an AI agent.
+        let regex = regex::RegexBuilder::new(pattern)
+            .size_limit(10 * 1024 * 1024)
+            .build()?;
         let events_dir = store.events_dir();
         if !events_dir.exists() {
             return Ok(Vec::new());
@@ -134,13 +137,12 @@ impl MemIndex {
 
         let mut matched_events = Vec::new();
         for file_path in files {
-            let file = File::open(&file_path)?;
-            if file.metadata()?.len() == 0 {
+            let data = fs::read(&file_path)?;
+            if data.is_empty() {
                 continue;
             }
-            let mmap = unsafe { memmap2::Mmap::map(&file)? };
 
-            for line in mmap.split(|&b| b == b'\n') {
+            for line in data.split(|&b| b == b'\n') {
                 if line.is_empty() {
                     continue;
                 }

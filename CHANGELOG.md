@@ -3,6 +3,78 @@
 本文件记录 ACDM 的显著变更。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.1.1] - 2026-10-23
+
+针对独立外部代码审查（15 项发现，含 2 个 P0）的安全与健壮性加固版本。
+**无数据格式变更**：既有 store 不需要迁移；升级后建议执行一次 `mem compact -p <project>` 重建投影。
+
+### 安全
+
+- **项目名校验（P0）**：`project` 之前被直接拼进 `projects/<project>`，CLI 与 MCP 可传入 `../..`、
+  绝对路径等导致目录穿越（写 `meta.json` / `README.md`、读任意目录）。现在项目名必须是单一
+  路径组件：非空、非 `.`/`..`、不含 `/`、`\`、无控制字符、≤200 字节；所有读写入口统一拒绝。
+- **MCP `files[].action` 强校验**：只接受 `Created` / `Modified` / `Deleted`（缺省 `Modified`），
+  其他值返回参数错误。
+- **资源上限**：MCP 单行请求上限 16 MiB（超限返回 `-32600` 并继续服务；此前可被超长行 OOM）；
+  fuzzy 正则编译限制 10 MiB 程序尺寸；`mem add` 改用 64 KiB 分块流式 SHA-256（不再整文件读入内存）。
+- **渲染转义**：`mem render` 对表格单元格与时间线字段中的 `|`、换行转义，数据不再能破坏
+  Markdown 结构或注入内容。
+
+### 冲突解决
+
+- **精确冲突标记判定（P0）**：只有 Git 精确形态的标记才会被删除（`=======` 必须整行恰好；
+  `<<<<<<<` / `>>>>>>>` / `|||||||` 之后必须是行尾或空格）。以标记前缀开头的普通数据行不再被误删。
+- **字节级保留**：`mem resolve` 改为字节级处理，非 UTF-8 字节同样逐字保留（"never silently
+  dropping data" 现在对任意字节成立）；CRLF 换行正确处理。
+- **多提交 rebase 一次完成（P1）**：`mem resolve` 现在循环执行「解决 JSONL → `git add` →
+  `git rebase --continue`」（上限 100 轮），一次调用即可推进多个冲突提交；只有非 JSONL 文件仍冲突时
+  才报错并列出需要手工处理的文件。
+- **FileRecord 因果顺序（P2）**：去重不再按 `file_id` 重排历史，`files.jsonl` 投影的
+  last-write-wins 语义不再可能被旧状态覆盖。
+- 冲突解决全程持有 store 写锁，与追加/压缩/同步串行。
+
+### 同步
+
+- `sync` 收敛到 `mem_core::git::sync_store`，CLI 与 MCP 行为一致；全程持 store 写锁。
+- **不再静默吞掉 pull 失败（P1）**：非冲突的 `git pull --rebase` 错误会中止同步并报错，
+  不会再继续 `git push` 掩盖真实原因。
+- **冲突时 CLI 非零退出**：`mem sync` 检测到冲突会提示运行 `mem resolve` 并以退出码 1 结束
+  （此前退出 0，自动化脚本会误判成功）；MCP `mem_sync` 以 `isError` 结果返回同一提示。
+- 去掉 `git pull --rebase --autostash`：同步前已提交全部改动并持写锁，autostash 只会在
+  中途制造难以恢复的 stash 冲突；无 upstream 时跳过 pull。
+
+### 存储
+
+- **新增跨进程 store 写锁**：追加事件、`compact`、`resolve`、`sync` 全部串行；锁文件位于
+  `$XDG_RUNTIME_DIR`（或系统临时目录），按 store 规范路径哈希命名，不进入 Git 仓库。
+- **`mem compact` 重写为从事件日志重建投影（P1）**：持写锁读取全部事件 → 按时间排序 →
+  每个 `file_name` 保留最后写入者 → 临时文件 + 原子 rename。因此可修复崩溃/并发导致的投影
+  缺失或截断（自愈），并发追加的记录也不会再被覆盖丢失；`Records before/after/pruned` 输出不变。
+- **移除 mmap（P1）**：所有读取改为普通 `fs::read`。此前并发 `resolve` 截断文件时，读取进程
+  可能触发 `SIGBUS`/未定义行为；顺带消除全部 `unsafe` 块与 `memmap2` 依赖。
+
+### 其他修复
+
+- **Git 冲突检测（P2）**：只依据 `git ls-files -u`、porcelain 冲突码与 rebase/merge 状态文件，
+  不再扫描全部跟踪文件查找 `<<<<<<<` —— 事件摘要或文档引用该字符串不会再导致永久误判冲突。
+- **路径身份（P2）**：对存在的路径前缀做 `fs::canonicalize`（解析符号链接），不存在的尾部词法拼接；
+  store 根与文件一侧使用软链路径时也能得到一致的相对身份（macOS `/var`→`/private/var` 等）。
+- **ID 碰撞熵（P2）**：计数器以「启动时间 + pid」派生的随机偏移起步（**格式不变**），
+  显著降低容器环境（pid 恒为 1、同纳秒启动）下的跨设备碰撞概率。
+- **MCP 协议一致性（P3）**：校验 `jsonrpc == "2.0"`（否则 `-32600`）；工具参数反序列化失败返回
+  `-32602`；工具执行期业务错误改为成功响应 + `result.isError = true`（便于 Agent 读取错误并自我纠正）；
+  未知工具/方法 `-32601`、坏 JSON `-32700` 不变。
+
+### 质量
+
+- 测试从 55 个增加到 **84 个**（48 core + 13 CLI 集成 + 6 MCP 单元 + 17 MCP 集成），
+  新增覆盖：项目名穿越、多提交 rebase、非 UTF-8 冲突、marker 前缀数据行、并发追加（8 线程 × 50）、
+  compact 与 append 并发、投影自愈、render 转义、sync 冲突/无 upstream 退出码、MCP isError/错误码/
+  超长行恢复、软链路径身份、冲突检测无误报。
+- `cargo fmt --check`、`cargo clippy --workspace --all-targets -- -D warnings`、
+  `cargo doc -D warnings` 全部通过。
+- Release 二进制：`mem` 3.11 MB、`mem-mcp` 2.85 MB。
+
 ## [0.1.0] - 2026-10-22
 
 首个公开发布版本。

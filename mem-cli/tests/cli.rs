@@ -592,3 +592,275 @@ fn render_before_add_still_creates_project_metadata() {
         stdout(&out)
     );
 }
+
+// ----------------- Review fixes: sync semantics, validation, streaming hash -----------------
+
+/// Run `git` in `cwd` and return its output.
+fn git(cwd: &Path, args: &[&str]) -> Output {
+    Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .expect("failed to run git")
+}
+
+fn assert_git_ok(output: &Output) {
+    assert!(
+        output.status.success(),
+        "git command failed: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn git_stdout(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// Review finding #1/#5: a project name must never be usable to escape `projects/`
+/// or the store, and the CLI must fail before touching the filesystem.
+#[test]
+fn project_name_traversal_is_rejected() {
+    let tmp = TempDir::new("project-traversal");
+    let store = tmp.init_store("store");
+    fs::write(store.join("tracked.txt"), "content\n").expect("write tracked file");
+
+    let absolute_outside = tmp.path().join("abs-outside");
+    let invalid_names = [
+        "../escape",
+        "a/b",
+        absolute_outside.to_str().expect("UTF-8 path"),
+    ];
+
+    for name in invalid_names {
+        for args in [
+            vec!["add", "-p", name, "-s", "must fail", "tracked.txt"],
+            vec!["render", "-p", name],
+            vec!["compact", "-p", name],
+            vec!["list", "-p", name],
+            vec!["query", "-p", name],
+        ] {
+            let output = run(&store, &args);
+            assert!(
+                !output.status.success(),
+                "invalid project name {:?} must be rejected by {:?}",
+                name,
+                args
+            );
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "invalid project name must exit 1: {:?}",
+                args
+            );
+            assert!(
+                stderr(&output).contains("invalid project name"),
+                "error must name the invalid project: {:?} -> {}",
+                args,
+                stderr(&output)
+            );
+        }
+    }
+
+    assert!(
+        !tmp.path().join("escape").exists(),
+        "`../escape` must not create a directory next to the store"
+    );
+    assert!(
+        !store.join("escape").exists(),
+        "`../escape` must not escape projects/ inside the store"
+    );
+    assert!(
+        !absolute_outside.exists(),
+        "an absolute project name must not create a directory outside the store"
+    );
+    assert!(
+        !store.join("projects").join("a").exists(),
+        "a nested project name must not create nested directories"
+    );
+}
+
+/// Review finding #5: `mem sync` used to swallow a failed push and still exit 0.
+/// Without an upstream the pull is skipped, but the push must fail loudly.
+#[test]
+fn sync_without_upstream_reports_push_failure_and_exits_nonzero() {
+    let tmp = TempDir::new("sync-no-upstream");
+    let store = tmp.init_store("store");
+    assert_git_ok(&git(&store, &["init", "--quiet"]));
+    assert_git_ok(&git(&store, &["config", "user.email", "test@acdm.local"]));
+    assert_git_ok(&git(&store, &["config", "user.name", "ACDM Test"]));
+
+    let output = run(&store, &["sync"]);
+    assert!(
+        !output.status.success(),
+        "sync without a remote must not exit 0: stdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a failed sync must exit with 1"
+    );
+    let combined = format!("{}\n{}", stdout(&output), stderr(&output)).to_lowercase();
+    assert!(
+        combined.contains("push"),
+        "the error must point at the failed push/remote: {}",
+        combined
+    );
+    assert!(
+        !stdout(&output).contains("Sync successful"),
+        "a failed sync must not claim success: {}",
+        stdout(&output)
+    );
+}
+
+/// Review finding #5: a pull conflict is not a success. The CLI must exit
+/// non-zero and tell the user to run `mem resolve`.
+#[test]
+fn sync_conflict_returns_nonzero_and_points_to_resolve() {
+    let tmp = TempDir::new("sync-conflict");
+
+    // A bare remote seeded with an initialised store.
+    let bare = tmp.path().join("origin.git");
+    assert_git_ok(&git(
+        tmp.path(),
+        &["init", "--bare", bare.to_str().expect("UTF-8 path")],
+    ));
+
+    let seed = tmp.path().join("seed");
+    fs::create_dir_all(&seed).expect("create seed directory");
+    assert_success(&run(&seed, &["init"]));
+    fs::write(
+        seed.join("events").join("2026-10.jsonl"),
+        "{\"event_id\":\"base\"}\n",
+    )
+    .expect("write seed event log");
+    assert_git_ok(&git(&seed, &["init", "--quiet"]));
+    assert_git_ok(&git(&seed, &["config", "user.email", "test@acdm.local"]));
+    assert_git_ok(&git(&seed, &["config", "user.name", "ACDM Test"]));
+    assert_git_ok(&git(&seed, &["add", "-A"]));
+    assert_git_ok(&git(&seed, &["commit", "-qm", "seed store"]));
+    assert_git_ok(&git(
+        &seed,
+        &[
+            "remote",
+            "add",
+            "origin",
+            bare.to_str().expect("UTF-8 path"),
+        ],
+    ));
+    let branch = git_stdout(&git(&seed, &["rev-parse", "--abbrev-ref", "HEAD"]));
+    assert_git_ok(&git(&seed, &["push", "-q", "-u", "origin", &branch]));
+
+    let clone_a = tmp.path().join("clone-a");
+    let clone_b = tmp.path().join("clone-b");
+    for clone in [&clone_a, &clone_b] {
+        assert_git_ok(&git(
+            tmp.path(),
+            &[
+                "clone",
+                "-q",
+                bare.to_str().expect("UTF-8 path"),
+                clone.to_str().expect("UTF-8 path"),
+            ],
+        ));
+        assert_git_ok(&git(clone, &["config", "user.email", "test@acdm.local"]));
+        assert_git_ok(&git(clone, &["config", "user.name", "ACDM Test"]));
+    }
+
+    // Clone B pushes a conflicting change first.
+    fs::write(
+        clone_b.join("events").join("2026-10.jsonl"),
+        "{\"event_id\":\"remote\"}\n",
+    )
+    .expect("write clone B event log");
+    assert_git_ok(&git(&clone_b, &["add", "-A"]));
+    assert_git_ok(&git(&clone_b, &["commit", "-qm", "remote change"]));
+    assert_git_ok(&git(&clone_b, &["push", "-q"]));
+
+    // Clone A now diverges: the pull --rebase inside `mem sync` must conflict.
+    fs::write(
+        clone_a.join("events").join("2026-10.jsonl"),
+        "{\"event_id\":\"local\"}\n",
+    )
+    .expect("write clone A event log");
+    assert_git_ok(&git(&clone_a, &["add", "-A"]));
+    assert_git_ok(&git(&clone_a, &["commit", "-qm", "local change"]));
+
+    let output = run(&clone_a, &["sync"]);
+    assert!(
+        !output.status.success(),
+        "a conflicted sync must exit non-zero: stdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a conflicted sync must exit with 1"
+    );
+    let combined = format!("{}\n{}", stdout(&output), stderr(&output));
+    assert!(
+        combined.contains("mem resolve"),
+        "conflict output must point at `mem resolve`: {}",
+        combined
+    );
+    assert!(
+        combined.to_lowercase().contains("conflict"),
+        "conflict output must mention a conflict: {}",
+        combined
+    );
+    assert!(
+        !combined.contains("Sync successful"),
+        "a conflicted sync must not claim success: {}",
+        combined
+    );
+
+    // The repository is intentionally left conflicted for the user to resolve.
+    let unmerged = git(&clone_a, &["ls-files", "-u"]);
+    assert_git_ok(&unmerged);
+    assert!(
+        !git_stdout(&unmerged).is_empty(),
+        "the conflict should be left staged for `mem resolve`"
+    );
+}
+
+/// Review finding #9: `mem add` must hash files in a streaming fashion and stay
+/// correct for large files.
+#[test]
+fn add_streams_eight_megabyte_file() {
+    let tmp = TempDir::new("large-file");
+    let store = tmp.init_store("store");
+    let file = store.join("large.bin");
+    let payload = vec![0xABu8; 8 * 1024 * 1024];
+    fs::write(&file, &payload).expect("write 8 MiB file");
+
+    let output = run(
+        &store,
+        &["add", "-p", "demo", "-s", "large file", "large.bin"],
+    );
+    assert_success(&output);
+
+    let records = file_record_lines(&store, "demo");
+    assert_eq!(records.len(), 1, "expected one file record");
+    assert!(
+        records[0].contains("\"action\":\"Created\""),
+        "first record must be Created: {}",
+        records[0]
+    );
+    assert!(
+        records[0].contains("\"size_bytes\":8388608"),
+        "the streamed size must be 8 MiB: {}",
+        records[0]
+    );
+
+    // SHA-256 of 8 MiB of 0xAB, computed independently with Python's hashlib.
+    let expected = "831439a0359856291c8e5d9dff6e683970721e5e76cc7a34df5b82f52dc3d01d";
+    assert!(
+        records[0].contains(&format!("\"hash\":\"{}\"", expected)),
+        "the streaming hash must match the independent SHA-256: {}",
+        records[0]
+    );
+}

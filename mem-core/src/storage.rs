@@ -5,7 +5,94 @@ use ignore::WalkBuilder;
 use std::error::Error;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
+
+/// Cross-process exclusive lock guarding writes to one memory store.
+///
+/// This is an advisory `fs2`/`flock` lock on a small lock file kept in the
+/// runtime directory (or the system temp directory), keyed by the canonical store
+/// path. Keeping it outside the store avoids polluting the synchronized Git
+/// repository, and holding it across a multi-file operation (event append,
+/// projection rebuild, conflict resolution, sync) removes the interleaving
+/// windows that a per-file lock cannot cover.
+pub struct StoreWriteLock {
+    _file: File,
+}
+
+impl Drop for StoreWriteLock {
+    fn drop(&mut self) {
+        let _ = self._file.unlock();
+    }
+}
+
+fn lock_file_path(root: &Path) -> PathBuf {
+    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let digest = crate::models::compute_sha256(canonical.to_string_lossy().as_bytes());
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
+        .unwrap_or_else(std::env::temp_dir);
+    dir.join(format!("acdm-store-{}.lock", &digest[..16]))
+}
+
+/// Acquire the store-wide write lock (blocks while another writer holds it).
+pub fn lock_store(root: &Path) -> Result<StoreWriteLock, Box<dyn Error>> {
+    let path = lock_file_path(root);
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)?;
+    file.lock_exclusive()?;
+    Ok(StoreWriteLock { _file: file })
+}
+
+/// Validate that `project` is safe to use as a single directory name under
+/// `projects/`.
+///
+/// MCP tool arguments can be produced by an AI agent, so a project name must
+/// never be able to escape the store: reject empty/whitespace, control
+/// characters, path separators, and anything that is not exactly one normal path
+/// component (`.`/`..`/absolute paths/drive prefixes are all rejected).
+pub fn validate_project_name(project: &str) -> Result<(), Box<dyn Error>> {
+    if project.is_empty() {
+        return Err("project name must not be empty".into());
+    }
+    if project != project.trim() {
+        return Err(format!(
+            "invalid project name {:?}: leading or trailing whitespace",
+            project
+        )
+        .into());
+    }
+    if project.len() > 200 {
+        return Err(format!("invalid project name {:?}: longer than 200 bytes", project).into());
+    }
+    if project.chars().any(char::is_control) {
+        return Err(format!(
+            "invalid project name {:?}: contains control characters",
+            project
+        )
+        .into());
+    }
+    if project.contains('/') || project.contains('\\') {
+        return Err(format!(
+            "invalid project name {:?}: must not contain path separators",
+            project
+        )
+        .into());
+    }
+    let mut components = Path::new(project).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(_)), None) => Ok(()),
+        _ => Err(format!(
+            "invalid project name {:?}: must be a single path component (no '.', '..', absolute paths or prefixes)",
+            project
+        )
+        .into()),
+    }
+}
 
 pub struct MemStore {
     pub root: PathBuf,
@@ -14,6 +101,11 @@ pub struct MemStore {
 impl MemStore {
     pub fn new(root: PathBuf) -> Self {
         Self { root }
+    }
+
+    /// Acquire the store-wide write lock (blocks while another writer holds it).
+    pub fn lock_writes(&self) -> Result<StoreWriteLock, Box<dyn Error>> {
+        lock_store(&self.root)
     }
 
     pub fn events_dir(&self) -> PathBuf {
@@ -78,6 +170,10 @@ impl MemStore {
     /// Append an event to `events/YYYY-MM.jsonl` and append its `FileRecord`s to
     /// `projects/<name>/files.jsonl`.
     pub fn append_event(&self, event: &Event) -> Result<(), Box<dyn Error>> {
+        validate_project_name(&event.project)?;
+        // Held for both appends: the event log and the files.jsonl projection
+        // must not be interleaved with a projection rebuild or a rebase.
+        let _write_lock = self.lock_writes()?;
         let ym = if event.ts.len() >= 7 && event.ts.as_bytes()[4] == b'-' {
             &event.ts[..7]
         } else {
@@ -119,21 +215,26 @@ impl MemStore {
         Ok(())
     }
 
-    /// Read historical events for a given YYYY-MM using memmap2 for zero-copy.
+    /// Read historical events for a given YYYY-MM.
+    ///
+    /// Uses a plain buffered read rather than `mmap`: the store can be rewritten
+    /// in place (conflict resolution truncates files, `git pull` may replace
+    /// them), and reading through a mapping of a truncated file is undefined
+    /// behaviour / `SIGBUS`. One file read is also simpler than mapping and
+    /// unmapping a small file.
     pub fn read_events_for_month(&self, year_month: &str) -> Result<Vec<Event>, Box<dyn Error>> {
         let path = self.events_dir().join(format!("{}.jsonl", year_month));
         if !path.exists() {
             return Ok(Vec::new());
         }
 
-        let file = File::open(&path)?;
-        if file.metadata()?.len() == 0 {
+        let data = fs::read(&path)?;
+        if data.is_empty() {
             return Ok(Vec::new());
         }
 
-        let mmap = unsafe { memmap2::Mmap::map(&file)? };
         let mut events = Vec::new();
-        for line in mmap.split(|&b| b == b'\n') {
+        for line in data.split(|&b| b == b'\n') {
             if line.is_empty() {
                 continue;
             }
@@ -166,12 +267,11 @@ impl MemStore {
 
         let mut all_events = Vec::new();
         for path in files {
-            let file = File::open(&path)?;
-            if file.metadata()?.len() == 0 {
+            let data = fs::read(&path)?;
+            if data.is_empty() {
                 continue;
             }
-            let mmap = unsafe { memmap2::Mmap::map(&file)? };
-            for line in mmap.split(|&b| b == b'\n') {
+            for line in data.split(|&b| b == b'\n') {
                 if line.is_empty() {
                     continue;
                 }
@@ -193,6 +293,7 @@ impl MemStore {
         project: &str,
         n: usize,
     ) -> Result<Vec<Event>, Box<dyn Error>> {
+        validate_project_name(project)?;
         if n == 0 {
             return Ok(Vec::new());
         }
@@ -245,19 +346,19 @@ impl MemStore {
 
     /// Read all records from `projects/<project>/files.jsonl`.
     pub fn read_project_files(&self, project: &str) -> Result<Vec<FileRecord>, Box<dyn Error>> {
+        validate_project_name(project)?;
         let path = self.project_dir(project).join("files.jsonl");
         if !path.exists() {
             return Ok(Vec::new());
         }
 
-        let file = File::open(&path)?;
-        if file.metadata()?.len() == 0 {
+        let data = fs::read(&path)?;
+        if data.is_empty() {
             return Ok(Vec::new());
         }
 
-        let mmap = unsafe { memmap2::Mmap::map(&file)? };
         let mut records = Vec::new();
-        for line in mmap.split(|&b| b == b'\n') {
+        for line in data.split(|&b| b == b'\n') {
             if line.is_empty() {
                 continue;
             }
@@ -270,6 +371,7 @@ impl MemStore {
 
     /// Read files.jsonl, deduplicate by file_name keeping only last occurrence.
     pub fn get_latest_files(&self, project: &str) -> Result<Vec<FileRecord>, Box<dyn Error>> {
+        validate_project_name(project)?;
         let records = self.read_project_files(project)?;
         let mut map = std::collections::BTreeMap::new();
         for r in records {
@@ -280,6 +382,7 @@ impl MemStore {
 
     /// Read `projects/<project>/meta.json`.
     pub fn read_project_meta(&self, project: &str) -> Result<ProjectMeta, Box<dyn Error>> {
+        validate_project_name(project)?;
         let path = self.project_dir(project).join("meta.json");
         let file = File::open(&path)?;
         let meta = serde_json::from_reader(file)?;
@@ -292,6 +395,8 @@ impl MemStore {
         project: &str,
         meta: &ProjectMeta,
     ) -> Result<(), Box<dyn Error>> {
+        validate_project_name(project)?;
+        let _write_lock = self.lock_writes()?;
         let proj_dir = self.project_dir(project);
         fs::create_dir_all(&proj_dir)?;
         let path = proj_dir.join("meta.json");
@@ -313,7 +418,7 @@ impl MemStore {
 
     /// Check if a project exists.
     pub fn project_exists(&self, project: &str) -> bool {
-        self.project_dir(project).is_dir()
+        validate_project_name(project).is_ok() && self.project_dir(project).is_dir()
     }
 
     /// List subdirectories in projects/ respecting gitignore via ignore crate.
@@ -599,5 +704,95 @@ mod tests {
 
         let projects = store.list_projects().unwrap();
         assert_eq!(projects, vec!["new_proj".to_string()]);
+    }
+
+    /// Regression for the two-append write path: eight writers racing on the
+    /// same store must not lose, duplicate or tear event/projection lines.
+    ///
+    /// `flock` locks are tied to open file descriptions, so the store-wide lock
+    /// taken by each thread's own `MemStore` serialises them even inside one
+    /// process. Without that lock the projection would lose records whenever
+    /// two appends interleave.
+    #[test]
+    fn test_concurrent_append_events_no_lost_lines() {
+        let (_tmp, store) = create_temp_store();
+        let root = store.root.clone();
+        let project = "concurrent_append";
+        let writers = 8usize;
+        let per_writer = 50usize;
+        let total = writers * per_writer;
+
+        let handles: Vec<_> = (0..writers)
+            .map(|writer| {
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    let store = MemStore::new(root);
+                    for index in 0..per_writer {
+                        let event = Event {
+                            event_id: format!("eid_{}_{}", writer, index),
+                            ts: format!("2026-10-22T00:{:02}:00Z", index),
+                            device: format!("device-{}", writer),
+                            agent: format!("agent-{}", writer),
+                            project: project.to_string(),
+                            summary: format!("event {} from writer {}", index, writer),
+                            files: vec![FileRecord {
+                                file_id: format!("fid_{}_{}", writer, index),
+                                file_name: format!("src/w{}/f{}.rs", writer, index),
+                                action: "Created".to_string(),
+                                size_bytes: index as u64,
+                                hash: format!("hash_{}_{}", writer, index),
+                            }],
+                        };
+                        store.append_event(&event).unwrap();
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("concurrent writer must not panic");
+        }
+
+        // Every event line in the month shard is complete, parseable JSON.
+        let event_data = fs::read(store.events_dir().join("2026-10.jsonl")).unwrap();
+        let event_lines: Vec<&[u8]> = event_data
+            .split(|&byte| byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(event_lines.len(), total, "event lines must not be lost");
+        for line in event_lines {
+            serde_json::from_slice::<Event>(line).unwrap_or_else(|error| {
+                panic!(
+                    "torn event line {:?}: {}",
+                    String::from_utf8_lossy(line),
+                    error
+                )
+            });
+        }
+
+        // Same for the files.jsonl projection: exactly one parsable record per
+        // event, and every file_id appears exactly once.
+        let projection = fs::read(store.project_dir(project).join("files.jsonl")).unwrap();
+        let mut file_ids = std::collections::BTreeSet::new();
+        let mut projection_lines = 0usize;
+        for line in projection
+            .split(|&byte| byte == b'\n')
+            .filter(|line| !line.is_empty())
+        {
+            let record: FileRecord = serde_json::from_slice(line).unwrap_or_else(|error| {
+                panic!(
+                    "torn projection line {:?}: {}",
+                    String::from_utf8_lossy(line),
+                    error
+                )
+            });
+            file_ids.insert(record.file_id);
+            projection_lines += 1;
+        }
+        assert_eq!(projection_lines, total, "projection lines must not be lost");
+        assert_eq!(file_ids.len(), total, "no duplicate or missing file_id");
+
+        assert_eq!(store.read_all_events().unwrap().len(), total);
+        assert_eq!(store.read_project_files(project).unwrap().len(), total);
     }
 }

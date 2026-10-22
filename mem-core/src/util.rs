@@ -14,6 +14,7 @@
 use chrono::{DateTime, SecondsFormat, Utc};
 use std::cmp::Ordering;
 use std::env;
+use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
@@ -120,15 +121,25 @@ pub fn find_store_root(start: &Path) -> Option<PathBuf> {
 ///
 /// Priority: explicit path → `$ACDM_STORE` → nearest ancestor that is a store
 /// root → current working directory.
+///
+/// Every shape (explicit path, environment variable, ancestor search, CWD
+/// fallback) is returned in canonical form, so the same store never has two
+/// string identities — for example when it is reached through a symbolic link.
 pub fn resolve_store_root(explicit: Option<&Path>) -> io::Result<PathBuf> {
     if let Some(path) = explicit {
-        return Ok(lexical_absolute(path));
+        return Ok(canonicalize_existing_prefix(&lexical_absolute(path)));
     }
     if let Some(from_env) = env::var_os(STORE_ENV_VAR).filter(|value| !value.is_empty()) {
-        return Ok(lexical_absolute(Path::new(&from_env)));
+        return Ok(canonicalize_existing_prefix(&lexical_absolute(Path::new(
+            &from_env,
+        ))));
     }
     let cwd = env::current_dir()?;
-    Ok(find_store_root(&cwd).unwrap_or(cwd))
+    let cwd = canonicalize_existing_prefix(&lexical_clean(&cwd));
+    Ok(match find_store_root(&cwd) {
+        Some(root) => canonicalize_existing_prefix(&root),
+        None => cwd,
+    })
 }
 
 /// Normalise a user supplied path into a stable, device independent identity.
@@ -137,10 +148,16 @@ pub fn resolve_store_root(explicit: Option<&Path>) -> io::Result<PathBuf> {
 /// the enclosing git work tree, otherwise relative to the current directory, and
 /// finally the absolute path. Components always use `/` so the same file keeps
 /// the same identity on every platform and device.
+///
+/// Existing prefixes are canonicalised (symbolic links resolved) on both sides of
+/// every comparison. Mixing a symlinked form with a canonical form would make
+/// `strip_prefix` fail and silently degrade the identity to an absolute path.
 pub fn normalize_file_name(path: &Path, store_root: &Path) -> String {
     let absolute = lexical_absolute(path);
 
-    let store = lexical_absolute(store_root);
+    // Canonicalise the store root as well: a root reached through a symlink must
+    // match the canonical absolute path, not fall through to the absolute form.
+    let store = canonicalize_existing_prefix(&lexical_absolute(store_root));
     if let Ok(relative) = absolute.strip_prefix(&store) {
         let name = to_slash(relative);
         if !name.is_empty() {
@@ -158,7 +175,8 @@ pub fn normalize_file_name(path: &Path, store_root: &Path) -> String {
     }
 
     if let Ok(cwd) = env::current_dir() {
-        if let Ok(relative) = absolute.strip_prefix(lexical_clean(&cwd)) {
+        let cwd = lexical_absolute(&cwd);
+        if let Ok(relative) = absolute.strip_prefix(&cwd) {
             let name = to_slash(relative);
             if !name.is_empty() {
                 return name;
@@ -170,6 +188,9 @@ pub fn normalize_file_name(path: &Path, store_root: &Path) -> String {
 }
 
 /// Find the enclosing git work tree of a (possibly not yet existing) path.
+///
+/// The returned root is canonicalised so it matches the canonicalised absolute
+/// path even when the work tree is reached through a symbolic link.
 fn find_git_root(path: &Path) -> Option<PathBuf> {
     let mut current = if path.is_dir() {
         Some(path)
@@ -178,21 +199,78 @@ fn find_git_root(path: &Path) -> Option<PathBuf> {
     };
     while let Some(dir) = current {
         if dir.join(".git").exists() {
-            return Some(dir.to_path_buf());
+            return Some(canonicalize_existing_prefix(dir));
         }
         current = dir.parent();
     }
     None
 }
 
-/// Make a path absolute against the current working directory, without touching
-/// the filesystem (targets may be deleted, so `canonicalize` is not usable).
-fn lexical_absolute(path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        return lexical_clean(path);
+/// Canonicalise the longest on-disk-existing prefix of `path`, then append the
+/// still-missing tail lexically.
+///
+/// `fs::canonicalize` fails for paths that do not exist yet (a deleted file, the
+/// target of `mem init`, ...). Instead of requiring the whole path to exist, this
+/// walks up to the deepest ancestor that really is on disk, canonicalises that
+/// (following symbolic links), and re-attaches the remaining components. The
+/// result stays usable for nonexistent paths while giving every existing part a
+/// single stable string identity — even when the current directory or the store
+/// root is reached through a symbolic link (for example `/tmp` on some systems,
+/// or macOS `/var` → `/private/var`).
+///
+/// The result is absolute whenever the input (or the current directory used to
+/// make a relative input absolute) is available.
+fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        lexical_clean(path)
+    } else {
+        env::current_dir()
+            .map(|cwd| lexical_clean(&cwd.join(path)))
+            .unwrap_or_else(|_| lexical_clean(path))
+    };
+
+    // Walk from the full path up to the filesystem root until canonicalisation
+    // succeeds; `existing` ends up as the longest prefix that is really on disk.
+    let mut existing: &Path = &absolute;
+    let canonical = loop {
+        if let Ok(canonical) = fs::canonicalize(existing) {
+            break Some(canonical);
+        }
+        match existing.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => existing = parent,
+            _ => break None,
+        }
+    };
+
+    match canonical {
+        Some(canonical) => {
+            // Re-attach the components that do not exist yet, lexically.
+            let tail = absolute.strip_prefix(existing).unwrap_or(Path::new(""));
+            if tail.as_os_str().is_empty() {
+                canonical
+            } else {
+                canonical.join(tail)
+            }
+        }
+        // Nothing on disk could be canonicalised (e.g. no usable parent at all):
+        // keep the lexical result rather than failing.
+        None => absolute,
     }
-    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    lexical_clean(&cwd.join(path))
+}
+
+/// Make a path absolute against the current working directory and resolve the
+/// on-disk-existing part of it (following symlinks).
+///
+/// The whole path is not required to exist: a deleted file keeps a deterministic
+/// absolute identity while its existing ancestors are canonicalised.
+fn lexical_absolute(path: &Path) -> PathBuf {
+    let lexical = if path.is_absolute() {
+        lexical_clean(path)
+    } else {
+        let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        lexical_clean(&cwd.join(path))
+    };
+    canonicalize_existing_prefix(&lexical)
 }
 
 /// Resolve `.` and `..` lexically.
@@ -328,6 +406,94 @@ mod tests {
 
         let name = normalize_file_name(&repo.join("src").join("lib.rs"), &store);
         assert_eq!(name, "src/lib.rs");
+    }
+
+    /// A path reached through a symlinked directory must keep a relative file
+    /// identity instead of degrading to an absolute path.
+    #[cfg(unix)]
+    #[test]
+    fn test_normalize_resolves_symlinked_cwd() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TestDir::new();
+        let real = tmp.path.join("real");
+        fs::create_dir_all(real.join("src")).unwrap();
+        let link = tmp.path.join("link");
+        symlink(&real, &link).unwrap();
+
+        // Both the file path and the store root spelled through the symlink.
+        assert_eq!(
+            normalize_file_name(&link.join("src").join("a.rs"), &link),
+            "src/a.rs"
+        );
+
+        // The interesting regression: the file is reached through the symlink
+        // while the store root is the canonical path (or vice versa). Before the
+        // existing prefixes were canonicalised this fell back to an absolute
+        // path and broke cross-device identity.
+        assert_eq!(
+            normalize_file_name(&link.join("src").join("a.rs"), &real),
+            "src/a.rs"
+        );
+    }
+
+    /// A symlinked store root must be canonicalised before `strip_prefix`, so a
+    /// file given by its real path still gets the same relative identity.
+    #[cfg(unix)]
+    #[test]
+    fn test_normalize_canonicalizes_store_root() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TestDir::new();
+        let real = tmp.path.join("real");
+        fs::create_dir_all(real.join("src")).unwrap();
+        let link = tmp.path.join("link");
+        symlink(&real, &link).unwrap();
+
+        assert_eq!(
+            normalize_file_name(&real.join("src").join("a.rs"), &link),
+            "src/a.rs"
+        );
+        assert_eq!(
+            normalize_file_name(&link.join("src").join("a.rs"), &real),
+            "src/a.rs"
+        );
+    }
+
+    /// `resolve_store_root` must return one canonical path for a store, even when
+    /// it is addressed through a symlink or does not exist yet.
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_store_root_canonicalizes_explicit_path() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TestDir::new();
+        let real = tmp.path.join("real");
+        fs::create_dir_all(&real).unwrap();
+        let link = tmp.path.join("link");
+        symlink(&real, &link).unwrap();
+        let canonical_real = fs::canonicalize(&real).unwrap();
+
+        assert_eq!(
+            resolve_store_root(Some(&link)).unwrap(),
+            canonical_real,
+            "an explicit symlinked --path must resolve to the canonical root"
+        );
+        // The same store must not have two string identities.
+        assert_eq!(
+            resolve_store_root(Some(&real)).unwrap(),
+            canonical_real,
+            "canonical and symlinked spellings must agree"
+        );
+
+        // A path that does not exist yet must still be accepted: only its
+        // existing prefix is canonicalised and the tail is re-attached.
+        let missing = link.join("not-created-yet");
+        assert_eq!(
+            resolve_store_root(Some(&missing)).unwrap(),
+            canonical_real.join("not-created-yet"),
+            "a nonexistent explicit path must not fail"
+        );
     }
 
     #[test]

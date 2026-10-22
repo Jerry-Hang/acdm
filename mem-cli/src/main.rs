@@ -1,18 +1,15 @@
 use std::error::Error;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 
 use mem_core::compact::compact_project_files;
-use mem_core::git::{
-    git_add_all, git_commit, git_has_conflicts, git_pull_rebase, git_push, git_status_clean,
-};
 use mem_core::render::write_project_readme;
 use mem_core::resolve::resolve_conflicts;
 use mem_core::{
-    compute_sha256, default_device_name, generate_id, normalize_file_name, now_rfc3339,
-    resolve_store_root, Event, FileRecord, MemIndex, MemStore, ProjectMeta, STORE_MARKER,
+    default_device_name, generate_id, normalize_file_name, now_rfc3339, resolve_store_root,
+    sync_store, validate_project_name, Event, FileRecord, MemIndex, MemStore, ProjectMeta,
+    SyncOutcome, STORE_MARKER,
 };
 
 #[derive(Parser)]
@@ -169,6 +166,10 @@ fn run() -> Result<(), Box<dyn Error>> {
             agent,
             files,
         } => {
+            // Reject traversal/invalid names before touching the store so no
+            // directory can ever be created outside `projects/`.
+            validate_project_name(&project)?;
+
             let root = resolve_store_root(cli.path.as_deref())?;
             let store = MemStore::new(root);
 
@@ -191,11 +192,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                 let (action, size_bytes, hash) = if !exists {
                     ("Deleted".to_string(), 0u64, String::new())
                 } else {
-                    let bytes = fs::read(file_path).map_err(|e| {
-                        format!("Failed to read file '{}': {}", file_path.display(), e)
+                    // Stream the file through SHA-256 (64 KiB chunks in mem-core):
+                    // `mem add` must never load a whole large file into memory.
+                    let (size, hash) = mem_core::hash_file(file_path).map_err(|e| {
+                        format!("Failed to hash file '{}': {}", file_path.display(), e)
                     })?;
-                    let size = bytes.len() as u64;
-                    let hash = compute_sha256(&bytes);
                     let is_known = existing_files.iter().any(|f| f.file_name == file_name);
                     let act = if is_known { "Modified" } else { "Created" };
                     (act.to_string(), size, hash)
@@ -268,6 +269,11 @@ fn run() -> Result<(), Box<dyn Error>> {
             filename,
             fuzzy,
         } => {
+            // Validate before doing any work so traversal-like names fail fast.
+            if let Some(ref p) = project {
+                validate_project_name(p)?;
+            }
+
             let root = resolve_store_root(cli.path.as_deref())?;
             let store = MemStore::new(root);
             let index = MemIndex::build(&store)?;
@@ -379,6 +385,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
 
         Commands::List { project } => {
+            if let Some(ref p) = project {
+                validate_project_name(p)?;
+            }
+
             let root = resolve_store_root(cli.path.as_deref())?;
             let store = MemStore::new(root);
 
@@ -437,6 +447,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
 
         Commands::Compact { project } => {
+            validate_project_name(&project)?;
+
             let root = resolve_store_root(cli.path.as_deref())?;
             let store = MemStore::new(root);
             println!("Compacting file records for project '{}'...", project);
@@ -452,42 +464,29 @@ fn run() -> Result<(), Box<dyn Error>> {
 
         Commands::Sync => {
             let root = resolve_store_root(cli.path.as_deref())?;
-            println!("Checking Git repository status at: {}", root.display());
-            let is_clean = git_status_clean(&root)?;
-            if !is_clean {
-                let dev = default_device_name();
-                let now = now_rfc3339();
-                let commit_msg = format!("Auto-sync from {} at {}", dev, now);
-                println!(
-                    "Repository is dirty. Staging and committing changes: \"{}\"",
-                    commit_msg
-                );
-                git_add_all(&root)?;
-                git_commit(&root, &commit_msg)?;
-            } else {
-                println!("Repository working directory is clean.");
-            }
+            println!("Synchronizing memory store at: {}", root.display());
 
-            println!("Pulling remote changes with rebase...");
-            let pull_res = git_pull_rebase(&root);
-
-            if pull_res.is_err() {
-                let has_conflicts = git_has_conflicts(&root).unwrap_or(false);
-                if has_conflicts {
-                    eprintln!("\n⚠️  Warning: Git conflicts detected during pull --rebase!");
-                    eprintln!(
-                        "Please run `mem resolve` to automatically resolve JSONL conflict markers."
-                    );
-                    return Ok(());
+            // One shared implementation with the MCP server: it holds the store
+            // write lock, commits dirty state, skips the pull without an upstream
+            // and refuses to push over a failed/inconsistent pull.
+            match sync_store(&root, None)? {
+                SyncOutcome::Success { steps } => {
+                    for step in &steps {
+                        println!("  • {}", step);
+                    }
+                    println!("✅ Sync successful: repository is up-to-date and pushed to remote.");
                 }
-                // pull failed but no conflicts — could be "no remote tracking branch" etc.
-                // Log warning but continue to push
-                eprintln!("⚠️  git pull --rebase returned an error (possibly no remote changes). Continuing...");
+                SyncOutcome::Conflict { steps, message } => {
+                    for step in &steps {
+                        println!("  • {}", step);
+                    }
+                    eprintln!(
+                        "⚠️  git conflict detected; run `mem resolve`, then retry `mem sync`"
+                    );
+                    // Must exit non-zero: a conflicted sync is not a success.
+                    return Err(format!("sync stopped on a git conflict: {}", message).into());
+                }
             }
-
-            println!("Pushing changes to remote...");
-            git_push(&root)?;
-            println!("✅ Sync successful: repository is up-to-date and pushed to remote.");
         }
 
         Commands::Resolve => {
@@ -508,6 +507,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
 
         Commands::Render { project } => {
+            validate_project_name(&project)?;
+
             let root = resolve_store_root(cli.path.as_deref())?;
             let store = MemStore::new(root);
             println!("Rendering README.md for project '{}'...", project);
@@ -524,6 +525,14 @@ fn run() -> Result<(), Box<dyn Error>> {
 }
 
 fn main() {
+    // Rust ignores SIGPIPE, so a consumer closing the pipe early (`mem ... | head`)
+    // would make `println!` panic with a broken-pipe error. Restoring the default
+    // handler gives the conventional Unix behaviour: quiet termination.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     if let Err(err) = run() {
         eprintln!("Error: {}", err);
         std::process::exit(1);
