@@ -19,6 +19,7 @@
 | MCP client cannot connect / tools report errors | configuration path, protocol, parameters | [§8](#8-mcp-client-issues) |
 | Queries become slow | index rebuilt O(N) every time | [§9](#9-performance-issues) |
 | Suspected data corruption | truncated lines caused by power loss/concurrent writes | [§10](#10-data-health-check) |
+| A project name is rejected (`invalid project name`) | Windows-reserved device name, trailing `.`, path separator, or other invalid component | [§12](#12-known-limitations) |
 
 ## 1. Store resolves to an unexpected location
 
@@ -103,14 +104,15 @@ mem --path /path/to/store sync     # sync again
 - Removes only the **exact** Git marker shapes (`=======` must be the whole line; `<<<<<<<` / `>>>>>>>` / `|||||||` must be followed by end-of-line or a space), so a data line that merely starts with marker-like characters is preserved;
 - Works on raw bytes, so non-UTF-8 lines and CRLF endings are preserved verbatim (never silently dropped); records with the same `event_id` / `file_id` are **last-write-wins**, and `FileRecord`s keep their causal order;
 - Parseable records are sorted by time and written back; **unparseable lines are preserved verbatim** (placed at the end of the file);
-- After writing back it runs `git add`; only when a rebase state actually exists (`.git/rebase-merge` / `rebase-apply`) does it run `git rebase --continue`, independent of the system language, and it loops through a multi-commit rebase (up to 100 rounds) in one call.
+- After writing back it runs `git add`; a failed `git add` is now a **hard error** (previously only a warning), because the following `git rebase --continue` could never succeed.
+- Rebase state is resolved with `git rev-parse --git-path` and repository detection with `git rev-parse --git-dir`, independent of the system language and working in `git worktree` / submodule checkouts where `.git` is a **file**.
+- It loops through a multi-commit rebase (up to 100 rounds) in one call; when a replayed commit becomes an **empty patch** after de-duplication, it is dropped automatically with `git rebase --skip` instead of aborting on git's "No changes" error.
 
 Troubleshooting:
 
 - A non-zero `Lines preserved` in the output means there are unparseable lines (usually truncated lines produced by an interrupted write, or invalid UTF-8). This is
   **intentional data protection**, not an error. After checking the content, delete them with an editor or leave them as they are.
-- `git add ... failed: warning`: the file may be ignored by `.gitignore` or have a special path.
-  Check with `git -C <store> check-ignore -v events/2026-10.jsonl`, and use `git add -f` if necessary.
+- `git add failed for ...`: since 0.1.2 this is a **hard error** that stops the run (it would otherwise hide the real cause of a doomed `rebase --continue`). Add the file manually (`git -C <store> add -- <path>`) and continue, or run `mem resolve` again after fixing the cause; if the path is skipped by a `.gitignore` rule, check with `git -C <store> check-ignore -v <path>`.
 - Still conflicting after resolve: check `git -C <store> status`; confirm the conflicting file is inside the repository, has a `.jsonl` suffix,
   and that a rebase/merge is currently in progress. JSONL-only conflicts are resolved and the rebase is advanced automatically; the command fails only when a **non-JSONL file conflict** remains,
   most commonly `projects/<project>/meta.json`: when two devices write metadata for the same project for the first time at the same time,
@@ -150,14 +152,15 @@ if you need extra notes, write them in a different file, or change the rendering
   no `Content-Length` header is needed.
 - **Exits immediately on startup**: unknown startup arguments print usage and `exit 2` (to prevent a typo from silently using the wrong store);
   make sure you only pass `--path`.
+- **The client keeps waiting for a response**: a message **without** `id` is a Notification and is never answered, by design. If your client sends a `notifications/*` method **with** an `id`, 0.1.2 answers it with `-32601 Method not found: notifications/...` rather than dropping it; if an older server left you waiting, upgrade to 0.1.2.
 - **Tool call returns an error**: distinguish the two channels:
   - JSON-RPC `error` means a protocol problem: `-32700` the request is not valid JSON; `-32600` the `jsonrpc` field is not `"2.0"` or the request line exceeds 16 MiB; `-32601` unknown method or unknown tool; `-32602` the `tools/call` parameters or the tool's arguments do not match the schema (including an invalid `action` value).
   - A **successful response with `result.isError = true`** means the tool ran but failed logically (Git conflict, failed sync, invalid query dimension, unsafe project name, failed compact/render); read `result.content[0].text` for the reason and retry after fixing it. `-32603` is reserved for genuine internal server faults.
 - **Tool execution failed but the server is still alive**: this is expected behavior; fix the arguments or the underlying git state and retry. An over-long request line is discarded and answered with `-32600` without desynchronizing the stream.
 - **Store not found / events written to a strange location**: MCP runs `init` at startup (creating a store in the resolved root when it is missing).
   It is recommended to pass `--path` explicitly or set `ACDM_STORE`, to avoid depending on the client process's CWD.
-- **Multiple clients in parallel**: each client starts its own `mem-mcp` process; all writes (append, compact, resolve, sync) take the store-wide `fs2` cross-process lock, so concurrent writes on one machine are serialized, and reads are lock-free (`fs::read`, no mmap).
-- **Invalid project names**: `project` must be a single safe path component (no `/`, `\`, `.`/`..`, control characters; ≤200 bytes); otherwise the tool returns `isError` with `invalid project name`, and nothing is written outside `projects/`.
+- **Multiple clients in parallel**: each client starts its own `mem-mcp` process; all writes (append, compact, render, init, resolve, sync) take the store-wide `fs2` cross-process lock, so concurrent writes on one machine are serialized, and reads are lock-free (`fs::read`, no mmap).
+- **Invalid project names**: `project` must be a single safe path component (no `/`, `\`, `.`/`..`, control characters; ≤200 bytes); Windows-reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, case-insensitive, including `con.txt`) and names ending in `.` are rejected as well. The name is validated **before anything is written**, so the tool returns `isError` with `Invalid project: invalid project name ...` and nothing is created.
 
 ## 9. Performance issues
 
@@ -212,8 +215,9 @@ As well as the command that failed, the full stderr, the MCP client configuratio
 
 ## 12. Known limitations
 
-- Writes on one machine are serialized by a single store-wide lock (append / compact / resolve / sync); there is still no cross-device lock and no multi-writer transaction, so cross-device consistency is "eventual consistency + deduplication".
+- Writes on one machine are serialized by a single store-wide lock (append / compact / render / init / resolve / sync); there is still no cross-device lock and no multi-writer transaction, so cross-device consistency is "eventual consistency + deduplication".
 - The SHA-256 in event records is supplied by the writer (the CLI computes it by streaming; MCP callers may pass an empty value).
 - Non-UTF-8 paths: they can be written and read, but the `resolve` staging path is passed to Git in lossy form. (Non-UTF-8 *content* in JSONL is preserved byte-for-byte by `resolve` since 0.1.1.)
-- Project names are restricted to one safe path component; names containing path separators or control characters are rejected by the CLI and MCP.
+- Project names are restricted to one safe path component (no `/`, `\`, `.`/`..`, control characters; ≤200 bytes), and since 0.1.2 Windows-reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, case-insensitive, including `con.txt`), names ending in `.`, and the Windows-invalid characters `<>:"|?*` are rejected by both the CLI and MCP. **If an existing store already contains such a project**, rename `projects/<old>` and update the `project` field of its records (and the name in any event lines), or start a fresh project name, before syncing that store to Windows; otherwise the Windows checkout fails.
+- `mem add` records only **regular files**: FIFOs, device nodes and directories are rejected with `Error: cannot record '<path>': not a regular file` (exit 1), and the hash is computed before the store-wide lock is taken, so a blocking/special file cannot stall other writers. A missing path is still recorded as a `Deleted` record; there is no way to point `mem add` at file contents through a FIFO — copy the data into a regular file first.
 - No built-in authentication or encryption: the security of the store depends on Git remote permissions and disk permissions.

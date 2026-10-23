@@ -2,7 +2,7 @@
 
 # Migration Guide
 
-> Audience: users upgrading an existing ACDM store to 0.1.1, or developers migrating from internal prerelease snapshots.
+> Audience: users upgrading an existing ACDM store to 0.1.2, or developers migrating from internal prerelease snapshots.
 > This document explains "which changes require action and which are already compatible on the read side", and provides a migration script that has been tested in practice.
 
 ## Data format and compatibility ground rules
@@ -43,6 +43,22 @@
 | MCP: `jsonrpc` validated (`-32600`), tool arguments validated (`-32602`), business errors returned as `result.isError = true`, 16 MiB request-line cap, `action` enum enforced | Clients/monitoring that match on `-32603` or on old text must be updated | Depends |
 | Project names validated as a single safe path component | Names containing `/`, `\`, `.`/`..`, control characters, or >200 bytes are rejected | Rename such projects (and their `projects/<name>/` directories) before upgrading |
 | `resolve` is byte-level, matches only exact Git markers, advances a multi-commit rebase in one call, and keeps `FileRecord` causal order | Non-UTF-8 content and marker-prefixed data lines are preserved; fewer manual steps | No |
+
+## Upgrading from 0.1.1 to 0.1.2
+
+Nothing to migrate: **0.1.2 changes no data format** (the same `events/`, `files.jsonl`, `meta.json`, `.mem` files are read and written), so an existing store works as-is and every fix takes effect automatically after replacing the binaries.
+
+What you get for free after upgrading:
+
+- **Consistent, complete locking**: `mem render` and `MemStore::init` now also take the store-wide write lock, so rendering can no longer dirty the work tree in the middle of a `sync` rebase; meta.json bootstrap and the `Created`/`Modified` decision are atomic with the append (including metadata self-heal after a corrupt `meta.json`).
+- **Conflict resolution keeps going**: a replayed commit that becomes an empty patch is dropped with `git rebase --skip` instead of aborting on "No changes"; `git worktree` / submodule checkouts (`.git` is a file) are supported; a failed `git add` is a hard error.
+- **MCP correctness**: a `notifications/*` method sent *with* an `id` is answered with `-32601` instead of leaving the client waiting; unsafe project names are rejected before anything is written; sync's default commit message is the same as the CLI's.
+
+Action items:
+
+1. Optional: run `mem compact -p <project>` once per project to rebuild the `files.jsonl` projection from the authoritative event log (also heals a stale or truncated projection).
+2. **Only if you sync to Windows**: rename any project whose name is a Windows-reserved device name (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, case-insensitive, including `con.txt`) or ends with `.` — 0.1.2 now rejects such names, and Windows cannot check them out. Rename the directory under `projects/` and update the `project` field of that project's records before syncing to Windows.
+3. No other action is needed; the 0.1.1 recommendations (running `compact` once) remain valid but are optional.
 
 ## Upgrade steps (single machine)
 

@@ -3,7 +3,7 @@
 # ACDM Architecture
 
 > Intended for developers who want to understand how ACDM works, plan to contribute code, or troubleshoot storage/sync problems.
-> This document describes the actual behavior of the current source (v0.1.1); for the rationale behind the design see [DESIGN.md](DESIGN.md), and for command usage see [CLI.md](CLI.md) and [MCP.md](MCP.md).
+> This document describes the actual behavior of the current source (v0.1.2); for the rationale behind the design see [DESIGN.md](DESIGN.md), and for command usage see [CLI.md](CLI.md) and [MCP.md](MCP.md).
 
 ## 1. Design goals and constraints
 
@@ -65,7 +65,7 @@ Responsibilities and dependency direction of the three crates:
 
 Dependencies point in one direction only: `mem-cli` / `mem-mcp` → `mem-core`; `mem-core` knows nothing about any entry point. Both entry points locate the store through [`resolve_store_root`](../mem-core/src/util.rs) and share the same timestamp, ID, and path-normalization functions, which avoids "the CLI and the MCP behave differently".
 
-The MCP entry point is a newline-delimited JSON-RPC 2.0 server over stdio. It speaks one protocol version (`jsonrpc: "2.0"`) and separates two kinds of failure: protocol errors are JSON-RPC error responses (`-32700` malformed JSON, `-32600` invalid request, `-32601` unknown tool/method, `-32602` invalid arguments), while tool-level business failures are returned as a **successful response with `result.isError = true`** so an agent can read the message and retry. A single request line is capped at 16 MiB and discarded in a stream-preserving way when exceeded, so one oversized request cannot take the server down or desynchronize the stream.
+The MCP entry point is a newline-delimited JSON-RPC 2.0 server over stdio. It speaks one protocol version (`jsonrpc: "2.0"`) and separates two kinds of failure: protocol errors are JSON-RPC error responses (`-32700` malformed JSON, `-32600` invalid request, `-32601` unknown tool/method, `-32602` invalid arguments), while tool-level business failures are returned as a **successful response with `result.isError = true`** so an agent can read the message and retry. A single request line is capped at 16 MiB and discarded in a stream-preserving way when exceeded, so one oversized request cannot take the server down or desynchronize the stream. A message **without** an `id` is a JSON-RPC notification and gets no response; a message **with** an `id` must always be answered, so a `notifications/*` method with an `id` is treated as an ordinary request and falls through to `-32601` (`Method not found`) instead of leaving the client waiting forever.
 
 ## 3. Write path
 
@@ -74,7 +74,7 @@ The MCP entry point is a newline-delimited JSON-RPC 2.0 server over stdio. It sp
 The entry point is the `Commands::Add` branch in [`mem-cli/src/main.rs`](../mem-cli/src/main.rs):
 
 1. clap parses the global `--path` and the `add` arguments; [`validate_project_name`](../mem-core/src/storage.rs) rejects an unsafe project name before any store operation; [`resolve_store_root`](../mem-core/src/util.rs) yields the store root directory.
-2. Construct a `MemStore` and call `get_latest_files(project)` to load the project's current latest file state (used to decide `Created` / `Modified`).
+2. Construct a `MemStore` and call [`record_file_event`](../mem-core/src/storage.rs). It works in two phases: **before** taking the store-wide write lock it normalizes each path, stats it and streams its SHA-256 hash (slow file I/O never holds the store lock; a path that is not a regular file — FIFO, device node, directory — aborts with `not a regular file`); then it takes the lock and keeps the whole read latest → decide `Created`/`Modified` → ensure metadata → append sequence inside one critical section (see 3.3), so a concurrent writer can neither make the decision stale nor race the metadata write.
 3. For each file to record:
 
    | Step | Behavior |
@@ -82,29 +82,30 @@ The entry point is the `Commands::Add` branch in [`mem-cli/src/main.rs`](../mem-
    | Path normalization | [`normalize_file_name(file_path, &store.root)`](../mem-core/src/util.rs); if the result is still an absolute path (the file is neither inside the store, nor inside any Git repository, nor under the CWD), print a warning to stderr |
    | Existence | Checked against the **original path supplied by the user**, not the normalized name |
    | Missing | `action = Deleted`, `size_bytes = 0`, `hash = ""` |
-   | Present | [`hash_file(path)`](../mem-core/src/models.rs) streams the file through SHA-256 in 64 KiB chunks → `size_bytes` = byte count, `hash` = SHA256 hex; the file is never loaded whole |
+   | Present | Must be a **regular file**; [`hash_file(path)`](../mem-core/src/models.rs) streams it through SHA-256 in 64 KiB chunks → `size_bytes` = byte count, `hash` = SHA256 hex (never loaded whole). FIFOs, device nodes and directories are rejected with `cannot record '<path>': not a regular file` |
    | action | `Modified` if the normalized name already exists in the "latest file records", otherwise `Created` |
    | file_id | Generated by [`generate_id()`](../mem-core/src/id_gen.rs) |
 
 4. Build the event fields: `ts = now_rfc3339()`, `event_id = generate_id()`, `device` from `-d/--device` or [`default_device_name()`](../mem-core/src/util.rs), and `agent` defaulting to `human` via clap.
-5. If `read_project_meta(project)` fails (`meta.json` is missing or unreadable), write a minimal `meta.json` (`description = "Project <name>"`, `created_at = ts`). The check is "is the metadata readable" rather than "does the directory exist", so that a project directory created earlier by `mem render` does not make `add` believe the project is fully initialized.
-6. Call [`MemStore::append_event`](../mem-core/src/storage.rs) to persist the event (see 3.3).
+5. Metadata is ensured under the same lock: if `read_project_meta(project)` fails (missing **or corrupt**), a minimal `meta.json` is written (`description = "Project <name>"`, `created_at = ts`). A metadata write failure aborts the whole command instead of being ignored; a project directory created earlier by `mem render` without metadata is healed here.
+6. Append the event and its `FileRecord`s to disk (see 3.3) and print the summary; paths whose normalized identity is still absolute get the usual stderr warning.
 
 ### 3.2 `mem_add_event` (MCP)
 
 The entry point is the `tools/call` dispatch and `handle_add_event` in [`mem-mcp/src/main.rs`](../mem-mcp/src/main.rs):
 
 1. Deserialize `AddEventArgs` from the JSON-RPC `params.arguments`: `project` and `summary` are required; `device`, `agent`, and `files` are optional.
-2. Defaults: `device = default_device_name()`, `agent = "mcp-agent"`; for each file `action = "Modified"`, `size_bytes = 0`, `hash = ""`.
-3. Each `file_name` is normalized with `normalize_file_name` as well (MCP clients commonly send absolute paths); `file_id` is generated by `generate_id()`.
-4. Project metadata is checked with `read_project_meta(&project).is_err()` rather than by directory existence — so even if `mem render` created the directory earlier and `meta.json` has not been written yet, the metadata is filled in.
-5. `append_event` persists the event and returns the text: "`Event <event_id> recorded with <n> files`".
+2. **Validate the project name first** and return a tool-level error immediately (`Invalid project: ...`) — before any ID is generated or any directory could be created; nothing is left on disk for a rejected name.
+3. Defaults: `device = default_device_name()`, `agent = "mcp-agent"`; for each file `action = "Modified"`, `size_bytes = 0`, `hash = ""`.
+4. Each `file_name` is normalized with `normalize_file_name` as well (MCP clients commonly send absolute paths); `file_id` is generated by `generate_id()`.
+5. Call [`append_event_with_meta`](../mem-core/src/storage.rs) with the bootstrap metadata: the metadata check/write and both appends happen under one store-wide lock, and a metadata write failure now aborts the tool call (it is no longer swallowed). Missing or corrupt `meta.json` is healed in the same critical section.
+6. Return the text: "`Event <event_id> recorded with <n> files`".
 
 ### 3.3 How `append_event` writes to disk
 
-[`MemStore::append_event`](../mem-core/src/storage.rs) is the only write entry point for events:
+[`MemStore::append_event`](../mem-core/src/storage.rs) is a thin wrapper over [`append_event_with_meta`](../mem-core/src/storage.rs), the only write entry point for events:
 
-1. Validate the project name, then take the **store-wide write lock** and hold it for both appends below.
+1. Validate the project name, then take the **store-wide write lock** and hold it for the optional metadata write and both appends below.
 2. Compute the shard name: if `ts` has length ≥ 7 and its 5th byte is `-`, take `ts[..7]` (that is, `YYYY-MM`); otherwise fall back to `default`.
 3. Ensure `events/` exists, open `events/YYYY-MM.jsonl` with `create + append`.
 4. Take an `fs2` exclusive lock → serialize the event with `serde_json::to_string(event)` into a **single line** of JSON → append with `writeln!` → `flush` → unlock.
@@ -227,7 +228,7 @@ This algorithm ensures that, across months, newer-month events are never missed 
 | `github_url` | string \| null | no (may be omitted or `null`) | Associated repository URL |
 | `created_at` | string | yes | Creation time (fixed-width UTC nanoseconds) |
 
-Every `project` value (and every CLI/MCP project argument) is validated by [`validate_project_name`](../mem-core/src/storage.rs) before it is used as a path: it must be non-empty, exactly one normal path component (no `.`/`..`/absolute paths), must not contain `/`, `\`, or control characters, and must be at most 200 bytes. This prevents a project name from escaping `projects/`.
+Every `project` value (and every CLI/MCP project argument) is validated by [`validate_project_name`](../mem-core/src/storage.rs) before it is used as a path: it must be non-empty, exactly one normal path component (no `.`/`..`/absolute paths), must not contain `/`, `\`, or control characters, and must be at most 200 bytes. It must also be representable on Windows: DOS device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, case-insensitive, checked on the part before the first dot so `nul.log` is reserved too), names ending in `.`, and the Windows-invalid characters `<>:"|?*` are rejected on every platform, so a store created on Unix still checks out on Windows. This prevents a project name from escaping `projects/` and from breaking cross-platform checkouts.
 
 ### 5.4 The `.mem` marker file
 
@@ -313,7 +314,7 @@ Implementation details:
 
 ### Metadata
 - **Created At:** <meta.created_at>
-- **GitHub:** [<url>](<url>)          # when github_url is present
+- **GitHub:** <github_url>           # when github_url is present
 
 ## Tracked Files
 
@@ -338,7 +339,7 @@ Implementation details:
 
 | Operation | Lock | Notes |
 | --- | --- | --- |
-| Every store write: `append_event`, `compact`, `resolve`, `sync`, `write_project_meta`, `write_project_readme` | store-wide advisory lock (`fs2`) | One lock file per store, named from a hash of the canonical store path and kept in `$XDG_RUNTIME_DIR` (or the system temp directory). It is never written into the Git repository. |
+| Every store write: `append_event`/`append_event_with_meta`/`record_file_event`, `compact`, `resolve`, `sync`, `write_project_meta`, `write_project_readme`, `MemStore::init` | store-wide advisory lock (`fs2`) | The lock target is the store's `.mem` marker, opened **read-only** and flocked: nothing is written, the Git work tree stays clean, and the store's file permissions scope the lock. A marker-less store (only the very first `init`) falls back to an owner-only (`0600`) lock file under `$XDG_RUNTIME_DIR` / the system temp dir, named from a hash of the user and the canonical store path — never inside the repository, and collision-free across users on a shared machine. |
 | `append_event` (event line) | additional `fs2` exclusive lock | Lock after opening `events/<ym>.jsonl`; write one line, `flush`, unlock |
 | `append_event` (file lines) | additional `fs2` exclusive lock | Same handling for `files.jsonl` |
 | `resolve` write-back | additional `fs2` exclusive lock | Rewrite the whole file, then `git add` |
@@ -364,8 +365,8 @@ The store-wide lock is what makes multi-file operations atomic **between process
 
 1. Validate the project name, then take the store-wide write lock and hold it through the rename below.
 2. Count the non-empty lines of the existing `files.jsonl` as `records_before` (0 if the file is missing).
-3. Read the authoritative event log, keep events of this project, and sort them in causal order (`sort_events`, parse-aware).
-4. Replay every `FileRecord` in event order into a `BTreeMap<file_name, FileRecord>` — the last writer for each `file_name` wins.
+3. Read the authoritative event log, keep events of this project, and sort them by `ts` (parse-aware) with `event_id` as the tie-breaker (`sort_events`).
+4. Replay every `FileRecord` in that order into a `BTreeMap<file_name, FileRecord>` — the last writer for each `file_name` wins. Note the deliberate asymmetry: incremental appends and `resolve` keep the **physical append order** (causal), while this replay orders by timestamp first; both are deterministic, and `compact` is the operation that regenerates the projection from the authoritative log.
 5. If neither a projection nor any event exists, return a zero report without creating a directory.
 6. Write the projection to `files.jsonl.tmp`, `flush` and `sync_all`, then `fs::rename` it over `files.jsonl` — an atomic replacement within the same filesystem.
 
@@ -405,7 +406,7 @@ git push   ──▶ SyncOutcome::Success (steps printed by the caller)
 
 **MCP `mem_sync`** ([`mem-mcp/src/main.rs`](../mem-mcp/src/main.rs)) calls the same `sync_store` implementation, with these differences:
 
-- The commit message can be overridden with the `message` parameter; the default is `Auto-sync memory store`;
+- The commit message can be overridden with the `message` parameter; like the CLI, the default is `Auto-sync from <device> at <ts>` (one shared default in `sync_store`);
 - On conflict or failure it returns an `isError` result telling the caller to run `mem_resolve` and retry, with the completed steps included in the text;
 - On success the returned text lists the result of each step (clean/committed, pulled/skipped, pushed).
 
@@ -447,21 +448,21 @@ Steps in [`resolve_conflicts`](../mem-core/src/resolve.rs):
 
    5. De-duplicate: for the same key, later occurrences override earlier ones (last-write-wins). `Event` / `Generic` results are then sorted by `ts_cmp` + key; `FileRecord`s keep their original **causal order** (they are not re-sorted, otherwise a last-write-wins projection could be rolled back to an older state); `Unknown` is not sorted.
    6. Preserved lines (including identical duplicates, collapsed once) are re-emitted **byte-for-byte** and appended at the end of the file.
-   7. Write the result back with an exclusive lock and `truncate`; if the store root has `.git`, stage the file with `git add -- <relative path>` (failure only warns). Accumulate the report across rounds.
+   7. Write the result back with an exclusive lock and `truncate`; if the store is a Git repository (detected with `git rev-parse --git-dir`, so linked worktrees and submodules whose `.git` is a **file** work too), stage the file with `git add -- <relative path>`. A failed `git add` is now a **hard error** — continuing would only hide the real reason why `rebase --continue` can never succeed. Accumulate the report across rounds.
    8. If no rebase is active, deduplicate the reported file list and return.
-   9. Otherwise run `git rebase --continue`: success → next round (the next replayed commit may conflict too). On failure, inspect the still-unresolved files: if every one is a `.jsonl` file and this round actually resolved something, continue with the next round; otherwise return an error that lists the **non-JSONL files** that genuinely need manual resolution.
+   9. Otherwise run `git rebase --continue`: success → next round (the next replayed commit may conflict too). On failure, inspect the still-unresolved files: if every one is a `.jsonl` file and this round actually resolved something, continue with the next round. When nothing is unresolved and the work tree is clean, the replayed commit became an **empty patch** after de-duplication (every record it added already exists upstream): git refuses to commit it ("No changes"), so the resolver drops it with `git rebase --skip` and continues. Otherwise return an error that lists the **non-JSONL files** that genuinely need manual resolution.
 3. After 100 rounds without finishing, return an error listing the still-conflicted files and the manual recovery steps.
 
 `ResolveReport` aggregates `resolved_files`, `total_conflicts_resolved`, `deduplicated_items`, and `lines_preserved` across all rounds.
 
 ### 7.4 Why rebase detection uses Git state directories
 
-The old implementation matched the error text from `git rebase --continue` (the English `no rebase in progress`) to decide whether to skip, which broke under non-English locales and turned "no rebase in progress" into a hard error. It now checks Git's own state directories instead:
+The old implementation matched the error text from `git rebase --continue` (the English `no rebase in progress`) to decide whether to skip, which broke under non-English locales and turned "no rebase in progress" into a hard error. It now asks Git itself via `git rev-parse --git-path` and checks whether these state paths exist:
 
-- `.git/rebase-merge/` (an interactive/ordinary rebase is in progress)
-- `.git/rebase-apply/` (an `am` / non-interactive rebase is in progress)
+- `<git-path>/rebase-merge` (an interactive/ordinary rebase is in progress)
+- `<git-path>/rebase-apply` (an `am` / non-interactive rebase is in progress)
 
-This is Git's internal state, independent of the language environment, and yields a strict, stable decision. The multi-round loop uses the same bookkeeping (`git status --porcelain` conflict codes) to decide whether the resolver can still make progress or whether a non-JSONL file is blocking the rebase.
+Resolving the paths through `--git-path` (rather than assuming `<root>/.git` is a directory) is what makes `git worktree` and submodule checkouts work: in those layouts `.git` is a *file* and the rebase state lives in a per-worktree git directory. The decision is Git's internal state, independent of the language environment; the multi-round loop uses the same bookkeeping (`git status --porcelain` conflict codes and the work-tree-clean check for empty patches) to decide whether the resolver can still make progress or whether a non-JSONL file is blocking the rebase.
 
 ### 7.5 After conflicts are resolved
 

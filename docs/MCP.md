@@ -4,7 +4,7 @@
 
 > Audience: developers who want to integrate ACDM into Claude Desktop, Cursor, or a custom MCP client. This document covers how `mem-mcp` starts, the JSON-RPC 2.0 session over stdio, and the parameters, return values, edge-case behavior, and error codes of the 8 tools; for the CLI side see [CLI.md](CLI.md), and for the overall design see [ARCHITECTURE.md](ARCHITECTURE.md) and [DESIGN.md](DESIGN.md).
 
-This document treats the `inputSchema` returned by `tools/list` in `mem-mcp/src/main.rs` and the actual behavior of each handler as the **sole authority**. All messages and return texts below were produced by feeding stdin to the real v0.1.1 binary through a pipe; for readability, absolute local paths in the examples are replaced with `/path/to/...` placeholders, while event IDs, timestamps, and hashes are kept as-is. Actual responses are **single-line JSON**; examples that keep the original single-line message quote the measured output directly, and the few structural illustrations (such as the tree-style expansion of `tools/list`) are explicitly labeled as illustrations.
+This document treats the `inputSchema` returned by `tools/list` in `mem-mcp/src/main.rs` and the actual behavior of each handler as the **sole authority**. All messages and return texts below were produced by feeding stdin to the real v0.1.2 binary through a pipe; for readability, absolute local paths in the examples are replaced with `/path/to/...` placeholders, while event IDs, timestamps, and hashes are kept as-is. Actual responses are **single-line JSON**; examples that keep the original single-line message quote the measured output directly, and the few structural illustrations (such as the tree-style expansion of `tools/list`) are explicitly labeled as illustrations.
 
 ## Table of Contents
 
@@ -42,7 +42,7 @@ This document treats the `inputSchema` returned by `tools/list` in `mem-mcp/src/
 Key facts:
 
 - **Transport**: **newline-delimited JSON-RPC 2.0** over stdio. One JSON object per line on stdin; one response object per line on stdout. Not `Content-Length` framing like LSP. A single request line is capped at **16 MiB**; an oversized line is discarded up to its newline, answered with `-32600`, and the server keeps serving.
-- **Protocol version**: `initialize` always returns `protocolVersion: "2024-11-05"`, with `serverInfo` being `{"name":"mem-mcp","version":"0.1.1"}`.
+- **Protocol version**: `initialize` always returns `protocolVersion: "2024-11-05"`, with `serverInfo` being `{"name":"mem-mcp","version":"0.1.2"}`.
 - **Capabilities**: declares only `capabilities.tools = {}`; no resources, prompts, logging, sampling, or other capabilities.
 - **Single-threaded and serial**: the main loop reads stdin line by line, handles one request synchronously, writes one response back and flushes it, and only then reads the next line; there is no concurrent processing.
 - **Store initialized at startup**: at startup the store is resolved with the same rules as the CLI, and `MemStore::init()` is called — missing directory structure or `.mem` is created automatically (equivalent to `mem init`).
@@ -160,7 +160,7 @@ A store resolution/initialization failure at startup (an error from `resolve_sto
 - Success response: `{"jsonrpc":"2.0","id":<id>,"result":<object>}`.
 - Error response: `{"jsonrpc":"2.0","id":<id>,"error":{"code":<int>,"message":"<text>"}}`.
 - The `id` in a response echoes the request's `id` as-is (`null` is used only for a Parse error where no request object can be parsed out).
-- **A message without `id` is treated as a notification: it produces no response and the method is not executed** (messages whose method name starts with `notifications/` or equals `initialized` are silently dropped even earlier).
+- **A message without `id` is a JSON-RPC Notification**: it produces no response and the method is not executed. A message **with** an `id` is a Request and must always be answered — including a `notifications/*` method, which falls through to `-32601` (`Method not found`) instead of being silently dropped (clients would otherwise wait forever for that `id`).
 - **JSON-RPC batch arrays are not supported**: the whole line must be a single request object; an array is returned as the parse error `-32700`.
 - Standard input and output are the protocol channel: only JSON-RPC responses are written to stdout; diagnostics go to stderr.
 
@@ -171,13 +171,13 @@ The first step of the client handshake. The server **does not validate** the req
 Request (real message):
 
 ```json
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"docs-client","version":"0.1.1"}}}
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"docs-client","version":"0.1.2"}}}
 ```
 
 Response (real message):
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"tools":{}},"protocolVersion":"2024-11-05","serverInfo":{"name":"mem-mcp","version":"0.1.1"}}}
+{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"tools":{}},"protocolVersion":"2024-11-05","serverInfo":{"name":"mem-mcp","version":"0.1.2"}}}
 ```
 
 ### 3.3 notifications/initialized
@@ -186,16 +186,16 @@ The notification sent after the handshake completes, which **produces no respons
 
 ```text
 # stdin (3 lines)
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"docs-client","version":"0.1.1"}}}
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"docs-client","version":"0.1.2"}}}
 {"jsonrpc":"2.0","method":"notifications/initialized"}
 {"jsonrpc":"2.0","id":2,"method":"ping"}
 
 # stdout (2 lines)
-{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"tools":{}},"protocolVersion":"2024-11-05","serverInfo":{"name":"mem-mcp","version":"0.1.1"}}}
+{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"tools":{}},"protocolVersion":"2024-11-05","serverInfo":{"name":"mem-mcp","version":"0.1.2"}}}
 {"jsonrpc":"2.0","id":2,"result":{}}
 ```
 
-Any method with a `notifications/` prefix is handled silently as a notification; in addition, the method name `initialized` is also treated as a notification.
+Only a message **without `id`** is handled as a notification (no response). A `notifications/*` method **with** an `id` is an ordinary request and returns `-32601 Method not found: notifications/...` — the server never leaves a request id unanswered.
 
 ### 3.4 ping
 
@@ -384,7 +384,7 @@ Records one event and its associated file changes. This is the primary entry poi
 
 | Parameter | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `project` | string | **Yes** | — | Project name; validated as a single safe path component (non-empty, not `.`/`..`, no `/` or `\`, no control characters, ≤200 bytes) |
+| `project` | string | **Yes** | — | Project name; validated **before anything is written** as a single safe path component (non-empty, not `.`/`..`, no `/` or `\`, no control characters, ≤200 bytes; Windows-reserved device names such as `CON`/`NUL`/`LPT1`/`con.txt`, names ending in `.`, and the Windows-invalid characters `<>:"\|?*` are rejected too) |
 | `summary` | string | **Yes** | — | Event summary |
 | `device` | string | No | Local hostname | Device name; `null`/whitespace-only is treated as not given and falls back to the hostname (same rules as the CLI) |
 | `agent` | string | No | `mcp-agent` | Recorder name; whitespace-only falls back to the default |
@@ -454,11 +454,11 @@ Real request and response with the optional fields omitted (`action` defaults to
 
 **Edge-case behavior**
 
-- When `project` is recorded for the first time and `projects/<project>/meta.json` does not exist, minimal metadata is **written automatically** (`description` = `"Project <name>"`, `github_url` = null, `created_at` = the event time), consistent with the CLI `add`.
+- When `project` is recorded for the first time — and equally when its `meta.json` is missing **or corrupt** — minimal metadata is **written automatically** in the same critical section as the event append (`description` = `"Project <name>"`, `github_url` = null, `created_at` = the event time). A metadata write failure aborts the tool call (it is no longer swallowed), so the call either records event + metadata together or reports an error.
 - When `files` is omitted or is an empty array, the event is still written (`recorded with 0 files`), and no `files.jsonl` record is appended.
 - `file_name` normalization rules are the same as the CLI: relative to the store root → relative to the git repository root → relative to the CWD → absolute path (the MCP side does **not** print the absolute-path warning that the CLI does). Existing path prefixes are canonicalized, so a symlinked store/project still yields a relative identity.
 - `action` is enum-validated: only the exact strings `Created` / `Modified` / `Deleted` are accepted; `"Renamed"` or any other value fails argument deserialization with JSON-RPC `-32602` (`unknown variant \`Renamed\`, expected one of \`Created\`, \`Modified\`, \`Deleted\``). `size_bytes` / `hash` are still passed through without checking whether the file exists.
-- An unsafe `project` (for example `"../escape"`, `"a/b"`, or an absolute path) is rejected by the store validation layer and returned as a tool-level error (`isError: true`, message `Failed to append event: invalid project name ...`), so it can never create a directory outside `projects/`.
+- An unsafe `project` is validated **first** and returned immediately as a tool-level error (`isError: true`, message `Invalid project: invalid project name ...`) — before any ID generation or file access — so a rejected name never creates a directory outside `projects/`. This covers traversal (`"../escape"`, `"a/b"`, absolute paths), Windows-reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, case-insensitive, including `con.txt`), names ending in `.`, and the Windows-invalid characters `<>:"|?*` (e.g. `Invalid project: invalid project name "a:b": character ':' is not allowed (would be invalid on Windows)`). File paths are supplied by the caller here: the MCP server never reads file contents, so the "regular file only" rule of `mem add` does not apply to `mem_add_event`.
 - Event IDs are generated by the server (`YYYYMMDDHHMMSS_nanos9_pid5_counter4`, UTC); `ts` is a fixed-width UTC nanosecond timestamp.
 - Failure example: missing `project` / `summary` is a deserialization failure and returns JSON-RPC `-32602`, with a message like `Invalid arguments for mem_add_event: missing field \`project\``.
 
@@ -673,7 +673,7 @@ Syncs the store to a remote git repository through the same `sync_store` impleme
 
 | Parameter | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `message` | string | No | `"Auto-sync memory store"` | Commit message when there are local changes; a whitespace-only string is treated as not given |
+| `message` | string | No | `Auto-sync from <device> at <ts>` | Commit message when there are local changes; a whitespace-only string is treated as not given. The default is the **same** as the CLI `sync` (one shared default inside `sync_store`) |
 
 **inputSchema (verbatim from tools/list)**
 
@@ -713,7 +713,7 @@ Syncs the store to a remote git repository through the same `sync_store` impleme
 - No upstream: the pull is skipped (`No upstream configured; skipped pull`), the push is still attempted; a push failure (e.g. no remote) becomes `Sync failed: git command 'git push' failed: ...`.
 - `git add -A` / `git commit` failures are also surfaced as isError text (`git add -A failed:` / `git commit failed:`).
 - The whole operation holds the store-wide write lock (local `add` / `compact` / `resolve` wait while it runs), and the tree is committed before the pull, so `--autostash` is never needed.
-- Prerequisites: a git repository, a push target (remote + credentials), a configured git user identity; an upstream is optional. A whitespace-only `message` is filtered out and the default `Auto-sync memory store` is used.
+- Prerequisites: a git repository, a push target (remote + credentials), a configured git user identity; an upstream is optional. A whitespace-only `message` is filtered out and the shared default `Auto-sync from <device> at <ts>` is used.
 
 ### 4.7 mem_resolve
 
@@ -740,8 +740,9 @@ Automatically resolves Git conflict markers in all `.jsonl` files under the stor
 
 **Edge-case behavior**
 
-- Same implementation as the CLI `resolve`: byte-level marker stripping (only exact Git markers), deduplication (later occurrences win), time/ID sorting for events, **causal-order preservation for `FileRecord`s**, verbatim preservation of unparseable bytes and unknown fields, `git add` for rewritten files when `.git` exists, and `git rebase --continue` only while a rebase is active.
-- One call keeps resolving and continuing the rebase until it finishes (up to 100 rounds), so a rebase replaying several conflicting commits is completed by a single `mem_resolve`. The returned counts aggregate all rounds.
+- Same implementation as the CLI `resolve`: byte-level marker stripping (only exact Git markers), deduplication (later occurrences win), time/ID sorting for events, **causal-order preservation for `FileRecord`s**, verbatim preservation of unparseable bytes and unknown fields, `git add` for rewritten files, and `git rebase --continue` only while a rebase is active.
+- One call keeps resolving and continuing the rebase until it finishes (up to 100 rounds), so a rebase replaying several conflicting commits is completed by a single `mem_resolve`. The returned counts aggregate all rounds. A replayed commit that becomes an **empty patch** after de-duplication is dropped automatically with `git rebase --skip` instead of stopping on git's "No changes" error.
+- Works in `git worktree` / submodule checkouts (where `.git` is a **file**): rebase state is resolved with `git rev-parse --git-path` and repository detection with `git rev-parse --git-dir`. A failed `git add` is a hard tool-level error (`isError`), not a warning, because the following `rebase --continue` could never succeed.
 - No conflict is not an error: the all-zero success text is returned.
 - Only JSONL conflicts are resolved automatically. If a **non-JSONL** file (for example `meta.json`) is still conflicted, the call returns a tool-level error (`isError: true`) with a message beginning `Conflict resolution failed:` that lists the files requiring manual resolution; resolve them by hand, `git add` them, and run `git rebase --continue` (see [CLI.md](CLI.md#37-resolve) and [TROUBLESHOOTING.md](TROUBLESHOOTING.md)).
 - The whole operation holds the store-wide write lock, so it cannot interleave with a local `add`, `compact`, or `sync`.
@@ -807,6 +808,9 @@ Generates or updates `projects/<project>/README.md`.
 // -32601: unknown tool
 {"jsonrpc":"2.0","id":7,"error":{"code":-32601,"message":"Unknown tool: nope"}}
 
+// -32601: a notifications/* method WITH an id is an ordinary request (it must be answered)
+{"jsonrpc":"2.0","id":99,"error":{"code":-32601,"message":"Method not found: notifications/foo"}}
+
 // -32602: tool arguments missing a required field
 {"jsonrpc":"2.0","id":4,"error":{"code":-32602,"message":"Invalid arguments for mem_compact: missing field `project`"}}
 
@@ -826,6 +830,7 @@ Generates or updates `projects/<project>/README.md`.
 - **Two error channels**: protocol problems use the JSON-RPC `error` object (and there is no `result`); business failures use a success response with `result.isError = true` (and there is no `error`). A success result without `isError` means the tool really succeeded.
 - An unparseable line affects only that line: the loop continues after `-32700` (`id` is `null`).
 - An over-long request line is discarded in a stream-preserving way: the server answers `-32600` (with `id: null`) and keeps reading later lines.
+- **Notifications vs. requests**: a message without `id` is a Notification and gets **no response** (this includes `notifications/initialized`). A `notifications/*` method **with** an `id` is a Request, so it is answered with `-32601 Method not found` rather than dropped silently — verified against the 0.1.2 binary (`{"jsonrpc":"2.0","id":99,"method":"notifications/foo"}` → `Method not found: notifications/foo`).
 - `-32602` covers both the outer `tools/call` params and a tool's `arguments`; clients should treat `error.message` / `result.content[0].text` as displayable text.
 
 ## 6. Recommended Workflow for Sharing a Store with the CLI
@@ -853,7 +858,7 @@ Example session sequence (each line is one request; see the corresponding tool s
 Notes for sharing with the CLI:
 
 - **Same store**: the CLI's `mem list` / `mem query` can immediately see events written by MCP, and vice versa; the two are separate processes and serialize all writes through the store-wide `fs2` cross-process lock.
-- **Concurrent writes**: multiple MCP processes / the CLI writing at the same time is safe — append, `compact`, `resolve`, and `sync` all hold the store-wide write lock, so operations on one machine are serialized (reads are lock-free). This is a same-machine guarantee only; different machines converge through `mem_sync`.
+- **Concurrent writes**: multiple MCP processes / the CLI writing at the same time is safe — append (including the atomic `Created`/`Modified` decision and metadata bootstrap), `compact`, `render`, `init`, `resolve`, and `sync` all hold the store-wide write lock, so operations on one machine are serialized (reads are lock-free). This is a same-machine guarantee only; different machines converge through `mem_sync`.
 - **Projection maintenance**: because `mem_compact` rebuilds `files.jsonl` from the event log, it is safe to run periodically and after an interrupted write; it heals a stale or missing projection.
 - **Sync is not automatic**: writing an event only lands in local files; cross-device visibility requires an explicit `mem_sync` (or CLI `mem sync`).
 - **Consistent naming**: `project` maps directly to the `projects/<project>/` directory name and stays consistent with the CLI side; do not give the same project different names on the two sides.
@@ -870,8 +875,8 @@ Notes for sharing with the CLI:
 - **Context truncation**: `mem_get_context` takes only the latest 5 events, and the `mem_render` timeline takes only the latest 10.
 - **Sync prerequisites**: `mem_sync` requires the store to be a git repository and a usable push target (remote + credentials); an upstream is optional (the pull is skipped without one). Conflicts and failures are returned as `isError` results, not `-32603`.
 - **Conflict resolution covers JSONL only**: `mem_resolve` does not handle conflicts in non-JSONL files such as `meta.json` (they may need to be resolved manually followed by `git rebase --continue`); a single call does advance a multi-commit rebase for JSONL conflicts.
-- **Fixed protocol version**: always returns `2024-11-05`; does not validate the client version, does not support batch arrays, and does not support server-initiated notifications.
-- **Project names are validated**: `project` must be a single safe path component (non-empty, not `.`/`..`, no `/` or `\`, no control characters, ≤200 bytes); unsafe names are rejected by the store layer and returned as `isError` results, so an agent-supplied name cannot escape `projects/`.
+- **Fixed protocol version / notifications**: always returns `2024-11-05`; does not validate the client version, does not support batch arrays, and does not send server-initiated notifications. Client Notifications are supported in the JSON-RPC sense: a message without `id` is never answered, while a `notifications/*` method *with* an `id` is an ordinary request and gets `-32601`.
+- **Project names are validated**: `project` must be a single safe path component (non-empty, not `.`/`..`, no `/` or `\`, no control characters, ≤200 bytes; Windows-reserved device names such as `CON`/`NUL`/`LPT1`/`con.txt`, names ending in `.`, and the Windows-invalid characters `<>:"|?*` are rejected too); unsafe names are validated first and returned as `isError` results, so an agent-supplied name cannot escape `projects/` or break a Windows checkout.
 
 ## 8. Related Documentation
 

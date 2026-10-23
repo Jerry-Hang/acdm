@@ -19,6 +19,7 @@
 | MCP 客户端连不上 / 工具报错 | 配置路径、协议、参数 | [§8](#8-mcp-客户端问题) |
 | 查询变慢 | 索引每次重建 O(N) | [§9](#9-性能问题) |
 | 怀疑数据损坏 | 断电/并发写导致截断行 | [§10](#10-数据健康检查) |
+| `mem add` / `mem_add_event` 报 invalid project name（CON / 尾点 / `<>:"|?*` 等） | 项目名在 Windows 上不可创建 | [§12](#12-已知限制) |
 
 ## 1. store 定位与预期不一致
 
@@ -116,8 +117,13 @@ mem --path /path/to/store sync     # 再次同步
 
 - 输出里 `Lines preserved` 非零：说明有无法解析的行（通常是写入中断产生的截断行）。这是
   **有意的数据保护**，不是错误。确认内容后用编辑器删掉或无碍保留。
-- 报 `git add ... failed: warning`：文件可能被 `.gitignore` 忽略或路径特殊。
-  检查 `git -C <store> check-ignore -v events/2026-10.jsonl`，必要时 `git add -f`。
+- 报 `git add ... failed`：0.1.2 起这是**硬错误**（命令退出 1，而不是只警告），rebase 会停在这里，
+  不会带着未暂存文件继续。文件可能被 `.gitignore` 忽略或路径特殊：检查
+  `git -C <store> check-ignore -v events/2026-10.jsonl`，必要时 `git add -f` 后再运行 `mem resolve`。
+- 空补丁提交会自动 `git rebase --skip`：多轮冲突解决时，某个提交要应用的改动可能已经在目标分支里，
+  `mem resolve` 会自动跳过它并继续推进 rebase，这是正常行为，不是冲突。
+- `git worktree` / submodule：`.git` 是**文件**而不是目录，0.1.2 起通过 `git rev-parse --git-path`
+  定位 per-worktree 的 rebase 状态，可以直接在 worktree 内运行 `mem resolve`。
 - resolve 后仍然冲突：看 `git -C <store> status`；确认冲突文件在仓库内、`.jsonl` 后缀、
   且当前处于 rebase/merge 状态。剩余冲突通常意味着存在**非 JSONL 文件冲突**，
   最常见的是 `projects/<project>/meta.json`：两台设备同时首次为同一项目写入元数据时，
@@ -166,8 +172,10 @@ mem --path /path/to/store sync     # 再次同步
 - **工具执行失败但 server 还活着**：这是预期行为，读 `isError` 文本、修正参数后重试即可。
 - **找不到 store / 事件写到奇怪位置**：MCP 启动时会 `init`（缺 store 时在解析出的根目录自建）。
   建议显式 `--path` 或设置 `ACDM_STORE`，避免依赖客户端进程的 CWD。
-- **多客户端并发**：每个客户端各自启动一个 `mem-mcp` 进程；写操作由**跨进程 store 写锁**（`fs2`，
-  锁文件在运行时/临时目录、不进仓库）串行化，多进程同时写是安全的；查询无锁（普通文件读取，不再用 `mmap`）。
+- **多客户端并发**：每个客户端各自启动一个 `mem-mcp` 进程；写操作由**跨进程 store 写锁**（`fs2`）串行化。
+  0.1.2 起锁目标优先是 store 的 `.mem` 标记文件（只读 `flock`，不写仓库）；只有还没有标记的首次 `init`
+  会回退到运行时/临时目录里按用户隔离的 `0600` 锁文件（修复多用户共享机器的 `EACCES`）。
+  多进程同时写是安全的；查询无锁（普通文件读取，不再用 `mmap`）。
 
 ## 9. 性能问题
 
@@ -226,3 +234,9 @@ ls -la /path/to/store /path/to/store/events
 - 事件记录里的 SHA-256 由写入方提供（CLI 会计算；MCP 调用方可以传空）。
 - 非 UTF-8 路径：可以写入与读取；`resolve` 已按字节处理，但 `git add` 的 stage 路径会以 lossy 形式传给 Git。
 - 没有内置的鉴权与加密：store 的安全性依赖 Git 远端权限与磁盘权限；项目名经过安全校验，文件路径与摘要仍需自行审查。
+- **项目名校验扩展（0.1.2）**：除路径安全外，项目名还拒绝 Windows 保留设备名（`CON` / `PRN` / `AUX` / `NUL` /
+  `COM1`–`COM9` / `LPT1`–`LPT9`，大小写不敏感，`con.txt` 这类带扩展名形式也算）、以 `.` 结尾的名字，
+  以及 Windows 非法字符 `<>:"|?*`（错误信息含 "would be invalid on Windows"）。
+  原因：store 会在 Linux/macOS/Windows 设备之间同步，Windows 无法创建或 checkout 这些目录/名字。
+  历史数据里若已有这类项目名，先本地改名（`git mv projects/<old> projects/<new>`，并清理外部脚本引用）再同步；
+  已有事件记录不会被自动改写。

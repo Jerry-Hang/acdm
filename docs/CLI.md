@@ -4,7 +4,7 @@
 
 > Audience: developers and AI-agent operators who use or script the `mem` CLI day to day. This document covers the arguments, output formats, exit codes, and real boundary behavior of all 8 subcommands; for the MCP entry point used by agents see [MCP.md](MCP.md), and for architecture and design rationale see [ARCHITECTURE.md](ARCHITECTURE.md) and [DESIGN.md](DESIGN.md).
 
-The clap definition in `mem-cli/src/main.rs` is the **single source of truth** for this document (argument names, requiredness, and defaults all follow the source). Every example output below was produced by running the actual v0.1.1 binary; for readability, store absolute paths in the examples are replaced with the `/path/to/store` placeholder, while event IDs, timestamps, SHA256 values, and all other text are kept verbatim. Git user identity was configured before any commit shown here; commands that surface git errors were run with `LC_ALL=C`, so the error text is English (git error messages vary with locale).
+The clap definition in `mem-cli/src/main.rs` is the **single source of truth** for this document (argument names, requiredness, and defaults all follow the source). Every example output below was produced by running the actual v0.1.2 binary; for readability, store absolute paths in the examples are replaced with the `/path/to/store` placeholder, while event IDs, timestamps, SHA256 values, and all other text are kept verbatim. Git user identity was configured before any commit shown here; commands that surface git errors were run with `LC_ALL=C`, so the error text is English (git error messages vary with locale).
 
 ## Contents
 
@@ -162,7 +162,7 @@ For more information, try '--help'.
 ```
 
 - A Git conflict during `sync` is a **runtime error**: the command prints the steps it completed, tells you on stderr to run `mem resolve`, and exits with **code 1** (it no longer exits 0 on conflicts; see [3.6 sync](#36-sync)).
-- An invalid project name is rejected before any store write, with exit code 1 and an `Error: invalid project name ...` message. A valid project name is a single path component: non-empty, not `.`/`..`, no `/`, `\`, or control characters, at most 200 bytes.
+- An invalid project name is rejected before any store write, with exit code 1 and an `Error: invalid project name ...` message. A valid project name is a single path component: non-empty, not `.`/`..`, no `/`, `\`, or control characters, at most 200 bytes. It must also be representable on Windows: DOS device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, case-insensitive, including `con.txt`) and names ending in `.` are rejected, e.g. `Error: invalid project name "con": reserved Windows device name (would be invalid on Windows)` / `Error: invalid project name "foo.": must not end with '.' (would be invalid on Windows)`.
 
 ## 3. Subcommands
 
@@ -253,22 +253,21 @@ mem add [OPTIONS] --project <PROJECT> --summary <SUMMARY> <FILES>...
 | `-s` | `--summary <SUMMARY>` | **Yes** | — | Summary of this change |
 | `-d` | `--device <DEVICE>` | No | Local hostname | Device name; when hostname is unavailable it falls back to `$HOSTNAME`, then `$COMPUTERNAME`, then `localhost` |
 | `-a` | `--agent <AGENT>` | No | `human` | Recorder name |
-| — | `<FILES>...` | **Yes** (at least 1) | — | File paths (relative to the CWD, or absolute) |
+| — | `<FILES>...` | **Yes** (at least 1) | — | File paths (relative to the CWD, or absolute); each must be a **regular file** (FIFOs, device nodes and directories are rejected) |
 | — | `--path <DIR>` | No | Auto-discovered | Global option: store root directory |
 | `-h` | `--help` | No | — | Print help |
 
 **Behavior**
 
 1. Validate the project name (a single safe path component; otherwise exit 1 with `Error: invalid project name ...`) **before touching the store**.
-2. Read the set of existing `file_name` values from the project's `projects/<project>/files.jsonl` (only the latest record per filename).
-3. For each `<FILES>` entry:
+2. **Unlocked pre-computation** (this phase deliberately runs *before* the store lock, so slow file I/O never blocks other writers): for each `<FILES>` entry
    - normalize the file identity `file_name`: prefer relative to the store root; when the file is outside the store, relative to the nearest git repository root; then fall back to relative to the CWD; if none of these applies, keep the **absolute path** and print a warning to stderr. Existing path prefixes are canonicalized (symlinks resolved), so a symlinked store or project directory still yields a stable relative identity;
-   - file exists: **stream** its contents through SHA-256 in 64 KiB chunks (the file is not loaded into memory as a whole), set `size_bytes` to the byte count and `hash` to the SHA256 hex digest; if `file_name` is already a known filename in this project the action is `Modified`, otherwise `Created`;
-   - file does not exist: record `Deleted` with `size_bytes = 0` and `hash = ""`;
-   - generate an independent `file_id` for each record.
+   - stat the **original path**: a missing path becomes a `Deleted` candidate (`size_bytes = 0`, `hash = ""`); a path that exists but is **not a regular file** (FIFO, device node, directory) aborts with `Error: cannot record '<path>': not a regular file`;
+   - a regular file is **streamed** through SHA-256 in 64 KiB chunks (never loaded into memory as a whole); `size_bytes` and `hash` are prepared here.
+3. Take the store-wide cross-process write lock and, inside that one critical section, compare the prepared records with the latest `files.jsonl` snapshot to decide `Modified` / `Created`, then generate an independent `file_id` for each record. Because the hashing already finished, the lock is held only for the fast state transition (core API `record_file_event`), so the `Created` / `Modified` decision can never be based on a stale snapshot, a metadata write failure aborts the command instead of being ignored, and a slow file cannot stall `compact`/`resolve`/`sync` on the same machine.
 4. Generate the event: `event_id` has the form `YYYYMMDDHHMMSS_nanos9_pid5_counter4` (UTC); `ts` is the fixed-width UTC timestamp with nanoseconds, `YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ`.
-5. If `projects/<project>/meta.json` cannot be read (does not exist), automatically write minimal metadata: `description` is `"Project <name>"`, `github_url` is `null`, and `created_at` equals this event's time.
-6. Append the event line to `events/YYYY-MM.jsonl`, and append each of this event's `FileRecord` entries to `projects/<project>/files.jsonl`. Both appends happen under the store-wide cross-process write lock, so this command cannot interleave with `compact`, `resolve`, or `sync` on the same machine.
+5. If `projects/<project>/meta.json` cannot be read (missing **or corrupt**), automatically write minimal metadata under the same lock: `description` is `"Project <name>"`, `github_url` is `null`, and `created_at` equals this event's time; a store damaged by a partial metadata write therefore self-heals here.
+6. Append the event line to `events/YYYY-MM.jsonl`, and append each of this event's `FileRecord` entries to `projects/<project>/files.jsonl`. Both appends happen under the store-wide cross-process write lock.
 
 **Real output (Created)**
 
@@ -354,9 +353,10 @@ Successfully recorded event: 20261022130629_780024199_23222_0001                
 **Notes**
 
 - `<FILES>` is a required positional argument (at least one); each path may be relative to the CWD or absolute.
-- The project name must be a single safe path component: non-empty, not `.`/`..`, no `/`, `\`, or control characters, at most 200 bytes. The CLI and MCP both reject anything else with `invalid project name`, so an agent-supplied name can never escape `projects/`.
+- The project name must be a single safe path component: non-empty, not `.`/`..`, no `/`, `\`, or control characters, at most 200 bytes; Windows-reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, case-insensitive, including `con.txt`), names ending in `.`, and the Windows-invalid characters `<>:"|?*` are rejected as well. The CLI and MCP both reject anything else with `invalid project name`, so an agent-supplied name can never escape `projects/`, and a store created on Unix always checks out on Windows.
 - `Created` / `Modified` is decided **solely** by whether `file_name` already appears in this project's `files.jsonl` (including historical records, after deduplication); content hashes are not compared, so even if a file's contents did not change, recording it a second time yields `Modified`.
-- SHA-256 is computed by streaming in 64 KiB chunks, so recording a large file does not load it into memory; only the hash and byte count are stored.
+- SHA-256 is computed by streaming in 64 KiB chunks **before the store lock is taken**, so recording a large file neither loads it into memory nor holds the store-wide lock during slow I/O; only the hash and byte count are stored.
+- `add` only records **regular files**: a FIFO, device node or directory is rejected with `Error: cannot record '<path>': not a regular file` (exit 1), so a blocking/special file can never stall the store lock or produce a meaningless hash. A missing path is still recorded as `Deleted`.
 - A nonexistent file still produces a `Deleted` record, and its path is normalized by the same rules.
 - A recorded absolute path will not match across devices and is only suitable for temporary local records; for cross-device scenarios, keep the file inside the store or inside some git repository (see the notes on legacy absolute-path records in [MIGRATION.md](MIGRATION.md)).
 - File contents themselves are never stored; only path, size, and SHA256 are kept.
@@ -588,7 +588,7 @@ mem compact [OPTIONS] --project <PROJECT>
 1. Validate the project name.
 2. Take the store-wide cross-process write lock and hold it through the rename below.
 3. Count the non-empty lines of the existing `projects/<project>/files.jsonl` as `records_before` (0 when the file does not exist).
-4. Read the **event log** (`events/*.jsonl`), keep this project's events, sort them in causal order, and replay every `FileRecord`: the last writer for each `file_name` wins. The result is the complete latest-state projection.
+4. Read the **event log** (`events/*.jsonl`), keep this project's events, sort them by `ts` (parse-aware) with `event_id` as the tie-breaker, and replay every `FileRecord`: the last writer for each `file_name` wins. The result is the complete latest-state projection. Note the deliberate asymmetry: incremental `add`/`resolve` writes follow the physical append (causal) order, while this replay orders by timestamp first.
 5. Write it to a temporary file `files.jsonl.tmp` in the same directory (`flush` + `sync_all`), then atomically `rename` it over the original file. If neither the projection nor any event exists, return `0/0` without creating a directory.
 6. Print the record counts before and after compaction and the number pruned.
 
@@ -687,18 +687,18 @@ Two devices each append events to the same `events/2026-10.jsonl`; A syncs first
 ```text
 $ LC_ALL=C mem --path ./store-b sync
 Synchronizing memory store at: /path/to/store-b
-  • Committed local changes ("Auto-sync from localhost at 2026-10-22T16:17:56.885385697Z")
+  • Committed local changes ("Auto-sync from localhost at 2026-10-23T10:13:38.142137956Z")
 
 # stderr:
 ⚠️  git conflict detected; run `mem resolve`, then retry `mem sync`
 Error: sync stopped on a git conflict: Git conflict detected during pull --rebase: git command 'git pull --rebase' failed: From /path/to/remote
-   3283b63..452cb6d  main       -> origin/main
-Rebasing (1/1)error: could not apply c4b16c4... Auto-sync from localhost at 2026-10-22T16:17:56.885385697Z
+   d8eeed6..6016dab  main       -> origin/main
+Rebasing (1/1)error: could not apply 01a1009... Auto-sync from localhost at 2026-10-23T10:13:38.142137956Z
 ...
 [exit code 1]
 ```
 
-(The warning line printed by the CLI itself is currently Chinese — it says "git conflict detected, run `mem resolve` and retry"; the rest of the error comes from git and follows `LC_ALL`.)
+(The `⚠️` warning is printed by the CLI itself; the rest of the error comes from git and follows `LC_ALL`.)
 
 The working tree keeps the conflict markers, waiting for `mem resolve`. The real output after running `mem resolve` and then `mem sync` again appears in [3.7 resolve](#37-resolve) under "Real output (recovering from a genuine two-device rebase conflict)".
 
@@ -740,7 +740,7 @@ Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).
 - On conflict the command **does not** auto-merge and **does not** abort the rebase; it leaves the conflict state to `mem resolve`. Since 0.1.1 a conflicted sync exits with **code 1**, so scripts can rely on the exit code; MCP's `mem_sync` reports the same situation as an `isError` result.
 - No `--autostash`: the tree is committed before the pull and the store write lock is held, so there is nothing to stash. Removing autostash avoids the hard-to-recover state where a stash pop conflicts in the middle of a rebase.
 - A non-conflict pull failure aborts the sync (no push); the error is surfaced instead of being swallowed.
-- The commit message is fixed to `Auto-sync from <device> at <ts>`; `sync` offers no custom-message argument (MCP's `mem_sync` supports an optional `message`, see [MCP.md](MCP.md)).
+- The commit message is fixed to `Auto-sync from <device> at <ts>`; `sync` offers no custom-message argument (MCP's `mem_sync` supports an optional `message`, but its **default is the same** `Auto-sync from <device> at <ts>`; see [MCP.md](MCP.md)). Both entry points share the one default inside `sync_store`.
 - While `sync` runs, the store write lock prevents local `add` / `compact` / `resolve` from interleaving; other devices are not locked (cross-device coordination is the Git remote's job).
 - Git's error text depends on locale; the examples use `LC_ALL=C`, and the content itself is raw git output.
 - `sync` does not invoke any conflict-resolution logic (it never runs `resolve` automatically), nor does it create a remote; remotes are configured only by `mem init --remote` or manual git commands.
@@ -771,9 +771,9 @@ mem resolve [OPTIONS]
    - event records are sorted by parsed timestamp (old formats are supported), with `event_id` as the tie-breaker; file records **keep their original causal order** (only the last occurrence of each `file_id` is kept, at its original position); other valid JSON records are sorted by `ts` (when present) and then by deduplication key;
    - **anything that cannot be parsed as the corresponding record kind is preserved verbatim as raw bytes** (including original whitespace and non-UTF-8 bytes) and placed at the end of the file; identical preserved lines are deduplicated;
    - valid records are **re-emitted with their original raw line text**, so unknown fields, field order, and formatting are never lost.
-4. Write the resolved file back (holding an exclusive file lock); when the store root contains `.git`, run `git add -- <relative path>` for every rewritten file.
-5. If a rebase is in progress (`.git/rebase-merge` or `.git/rebase-apply` exists; detection never relies on git's localized error text), run `git rebase --continue` (with `GIT_EDITOR=true` to avoid blocking on an editor) and **repeat from step 1** — a rebase replaying several conflicting commits is advanced to completion in this single invocation, up to 100 rounds.
-6. Stop when no rebase is active (report totals across all rounds). If `git rebase --continue` fails, inspect the still-unresolved files: when every one of them is a `.jsonl` file and progress was made in the round, keep going; otherwise print an actionable error listing the **non-JSONL** files (e.g. `projects/<p>/meta.json`) that must be resolved manually with `git add <file>` and `git rebase --continue`.
+4. Write the resolved file back (holding an exclusive file lock); when the store is a Git repository (detected with `git rev-parse --git-dir`, so linked worktrees and submodules whose `.git` is a **file** work too), run `git add -- <relative path>` for every rewritten file. A failed `git add` is a **hard error** (the following `rebase --continue` could never succeed, and a warning would hide the real cause).
+5. If a rebase is in progress (Git state paths resolved via `git rev-parse --git-path`; detection never relies on git's localized error text), run `git rebase --continue` (with `GIT_EDITOR=true` to avoid blocking on an editor) and **repeat from step 1** — a rebase replaying several conflicting commits is advanced to completion in this single invocation, up to 100 rounds.
+6. Stop when no rebase is active (report totals across all rounds). If `git rebase --continue` fails: when every still-unresolved file is a `.jsonl` file and progress was made in the round, keep going; when nothing is unresolved and the work tree is clean, the replayed commit became an **empty patch** after deduplication (all its records already exist upstream), so it is dropped with `git rebase --skip` and the rebase continues; otherwise print an actionable error listing the **non-JSONL** files (e.g. `projects/<p>/meta.json`) that must be resolved manually with `git add <file>` and `git rebase --continue`.
 
 **Real output (hand-crafted conflict file outside a git directory: one unparseable truncated line)**
 
@@ -857,6 +857,8 @@ Afterwards another device can run `git pull --rebase` and will see both sides' e
 - Preserved lines are never silently discarded — this now holds at the byte level, including invalid UTF-8 and CRLF content; valid historical records are never rewritten either (apart from conflict markers, deduplication, and sorting, the raw line text stays as-is).
 - Deduplication is "the later occurrence wins": in a rebase scenario this usually means the record from the `theirs` branch replaces the same-ID record from `ours`. `FileRecord`s keep their original causal order instead of being re-sorted, so the last-write-wins projection cannot be rolled back to an older state.
 - `Files updated` shows absolute paths. The report counts are aggregated over all rebase rounds performed by the single invocation.
+- A replayed commit that becomes an **empty patch** after de-duplication is skipped automatically with `git rebase --skip` (0.1.2); otherwise git's "No changes - did you forget to use `git add`?" would stop the loop on a commit that should simply be dropped.
+- Works in `git worktree` / submodule checkouts (`.git` is a file) and treats a failed `git add` as a hard error instead of a warning.
 
 ### 3.8 render
 
@@ -882,7 +884,7 @@ mem render [OPTIONS] --project <PROJECT>
 2. Read `projects/<project>/meta.json`; **if reading fails**, use in-memory fallback metadata (`name` = project name, `description` = `"Project <name>"`, `github_url` = null, `created_at` = current time) and **do not write `meta.json` back**;
 3. take the latest record per `file_name` for that project to build the file table;
 4. take the project's 10 most recent events to build the timeline (newest first);
-5. write `projects/<project>/README.md` under an exclusive lock (creating the directory if needed), overwriting it every time. Every interpolated value is escaped: `|` becomes `\|` and CR/LF are folded to spaces, so recorded summaries/file names/metadata cannot break the table or inject extra Markdown lines.
+5. take the store-wide cross-process write lock, then write `projects/<project>/README.md` (creating the directory if needed), overwriting it every time — rendering cannot dirty the work tree in the middle of a `sync` rebase. Every interpolated value is escaped: `|` becomes `\|` and CR/LF are folded to spaces, so recorded summaries/file names/metadata cannot break the table or inject extra Markdown lines.
 
 Generated README structure:
 

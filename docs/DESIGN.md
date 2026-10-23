@@ -60,7 +60,9 @@ Costs (accepted and documented):
 
 ### 3.1 Single-writer lock
 
-On one machine, every write operation — event append, projection rebuild (`compact`), conflict resolution, `sync`, and the overwrite writes of `meta.json` / `README.md` — takes a **store-wide cross-process advisory lock** (`fs2`). The lock file is derived from a hash of the canonical store path and kept in `$XDG_RUNTIME_DIR` (or the system temp directory), so it never pollutes the synchronized Git repository. One lock held across a whole multi-file operation removes the interleaving windows that per-file locks cannot cover: an append cannot slip into the middle of a projection rebuild, a rebase, or a conflict resolution.
+On one machine, every write operation — event append (including the atomic `Created`/`Modified` decision and metadata bootstrap), projection rebuild (`compact`), README rendering, `init`, conflict resolution, `sync`, and the overwrite writes of `meta.json` — takes a **store-wide cross-process advisory lock** (`fs2`).
+
+The lock target is the store's own `.mem` marker, opened **read-only** and flocked: taking the lock writes nothing, so the synchronized Git repository never gets dirtied by lock bookkeeping, and the store's file permissions naturally scope who can contend. Only a marker-less store (the very first `init`) falls back to a lock file in `$XDG_RUNTIME_DIR` (or the system temp directory), named from a hash of the user and the canonical store path and created owner-only (`0600`) — so multiple users on a shared machine neither collide nor get `EACCES` on each other's files. One lock held across a whole multi-file operation removes the interleaving windows that per-file locks cannot cover: an append cannot slip into the middle of a projection rebuild, a rebase, or a conflict resolution.
 
 The lock only works on the local machine: it is not a distributed lock; cross-device writes converge through conflict resolution after Git sync. Reads take no lock at all.
 
@@ -86,6 +88,13 @@ It is not a general CRDT: events with different `event_id`s never overwrite each
 - Ordering uses parse-aware comparison: parse into time and compare, falling back to string comparison when parsing fails; for equal timestamps, `event_id` acts as the tie-breaker;
 - **Clock skew is not corrected**: if one device's clock is fast/slow, event order reflects that clock rather than the real causal order;
 - Therefore ACDM promises "approximately ordered by recorded time", not a causally consistent total order. For the "project memory" use case, this approximation is acceptable.
+
+Two orderings coexist on purpose (0.1.2 documented this trade-off explicitly):
+
+- **Incremental projection writes** (`append_event` → `files.jsonl`) and **`resolve`** follow the **physical append order**. That is the causal order of what each device actually recorded, and it is what `get_latest_files` / `compact` use for last-write-wins, so a later state can never be replaced by an older one.
+- **`compact` replay** starts from the append-only event log and orders events by `ts` first, with `event_id` as the tie-breaker, then replays them. This makes the regenerated projection deterministic and gives the timestamp priority across months and devices.
+
+The asymmetry is deliberate, not a bug: incremental paths preserve causality, while rebuilding a projection needs a total order, and the fixed-width UTC `ts` is the closest available approximation of "when it happened".
 
 > Related source: [`now_rfc3339` / `parse_ts` / `ts_cmp` / `event_cmp`](../mem-core/src/util.rs)
 
@@ -200,13 +209,13 @@ After conflict merging, line order may come from interleaved appends on both sid
 
 Re-sorting `FileRecord`s by `file_id` (the pre-0.1.1 behavior) scrambled history: because `get_latest_files` / `compact` apply last-write-wins in file order, a lexicographically larger but older record could be picked as the "latest" state. Keeping causal order is what makes the projection semantics sound.
 
-Normal syncs produce few conflicts anyway; normalized ordering for events makes "the same input always yield the same output", which simplifies review and testing.
+Normal syncs produce few conflicts anyway; normalized ordering for events makes "the same input always yield the same output", which simplifies review and testing. The same asymmetry appears in `compact`: incremental projection writes and `resolve` keep physical append order, while the rebuild replays events ordered by `ts` then `event_id` (see §3.4). That is intentional — causality for incremental writes, a deterministic total order for reconstruction.
 
 ### 6.4 Deciding whether to continue the rebase
 
-The old implementation detected "is a rebase in progress" by matching the English error text of `git rebase --continue`, which turned a normal path into a hard failure under non-English locales. Now it only checks whether Git's state directories (`.git/rebase-merge` / `.git/rebase-apply`) exist — a language-independent source of truth: if they are there, a rebase is in progress; if not, there is none.
+The old implementation detected "is a rebase in progress" by matching the English error text of `git rebase --continue`, which turned a normal path into a hard failure under non-English locales. Now it resolves Git's own state paths with `git rev-parse --git-path` and checks whether `rebase-merge` / `rebase-apply` exist — a language-independent source of truth. Using `--git-path` (instead of assuming `<root>/.git` is a directory) is also what makes **linked worktrees and submodules** work: in those layouts `.git` is a file and the rebase state lives in a per-worktree git directory. A failed `git add` is a hard error, because a warning would only hide the real reason why the following `rebase --continue` can never succeed.
 
-A rebase that replays several conflicting commits needs one resolve → `git add` → `git rebase --continue` round per commit. `mem resolve` loops those rounds itself (bounded at 100), using Git's unmerged-file list to decide whether it can still make progress; it stops with a precise error only when a **non-JSONL** file is conflicted, because such a file genuinely needs a human.
+A rebase that replays several conflicting commits needs one resolve → `git add` → `git rebase --continue` round per commit. `mem resolve` loops those rounds itself (bounded at 100), using Git's unmerged-file list to decide whether it can still make progress. One special case matters: after de-duplication a replayed commit can become an **empty patch** — every record it added already exists upstream — and Git refuses to commit it ("No changes"). The resolver detects this (rebase still active, work tree clean, nothing unresolved) and advances with `git rebase --skip`; stopping there would leave the user stuck on a commit that should simply be dropped. It stops with a precise error only when a **non-JSONL** file is conflicted, because such a file genuinely needs a human.
 
 ### 6.5 Costs
 
@@ -233,7 +242,7 @@ A rebase that replays several conflicting commits needs one resolve → `git add
 
 - Before syncing to a public repository, review the contents of `events/` and `projects/`: paths and summaries may reveal private project structure;
 - `mem sync` runs `git add -A` against the store root, **so any file in the store directory will be committed**. Make sure the store directory holds only ACDM data; do not put project source code, `.env`, keys, etc. under the store root;
-- Project names supplied by an agent are validated as one safe path component (no separators, no `.`/`..`, no control characters, ≤200 bytes). This is a security boundary, not cosmetics: without it a `project` argument like `../x` would write `meta.json` / `README.md` outside `projects/` (fixed in 0.1.1);
+- Project names supplied by an agent are validated as one safe path component (no separators, no `.`/`..`, no control characters, ≤200 bytes), and — since 0.1.2 — Windows-reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, case-insensitive, including `con.txt`) and names ending in `.` are rejected everywhere. This is a security boundary, not cosmetics: without the component rule a `project` argument like `../x` would write `meta.json` / `README.md` outside `projects/` (fixed in 0.1.1); without the Windows rules, a store created on Unix could contain a project directory that Windows cannot check out;
 - Git history is immutable: even if a record is later deleted/overwritten, it may remain in historical commits. If you want to publish, prefer creating a fresh clean store and recording again rather than cleaning up the old repository;
 - SHA256 does not "leak contents", but it can be used to fingerprint known content; for strongly confidential scenarios, treat even hashes and sizes as sensitive information;
 - ACDM itself has no authentication/encryption: `mem-mcp` runs as the local user over stdio; the store is stored in plaintext on disk; transport security depends on the Git remote protocol (SSH/HTTPS).
@@ -253,7 +262,7 @@ A rebase that replays several conflicting commits needs one resolve → `git add
 | No fsync on append | `append_event` only `flush`es (the projection rebuild does `sync_all` its temp file) | Power loss may lose the last append | Accepted; Git commits provide another layer of durability |
 | Single-writer scope | A store-wide advisory lock serializes writers on **one machine**; no cross-device lock | Concurrent writes to the same store from multiple devices must converge via sync | Convention: "write locally, sync periodically" |
 | No multi-writer transactions | `events/` and `files.jsonl` are two separate appends | A crash may leave the projection briefly stale | `events/` is the source of truth; `mem compact` rebuilds the projection (self-healing) |
-| `compact` and concurrent appends | Holds the store-wide write lock for read → replay → rename | Concurrent appends on the same machine wait instead of being lost | Cross-device concurrency still needs sync; run `compact` as periodic maintenance |
+| `compact` and concurrent appends | Holds the store-wide write lock for read → replay → rename; replay orders events by `ts` then `event_id` | Concurrent appends on the same machine wait instead of being lost; a projection rebuilt after a crash may reorder same-file records by timestamp | Cross-device concurrency still needs sync; incremental append/resolve keep causal order |
 | Large files | `mem add` streams SHA-256 in 64 KiB chunks; the read path still loads a whole shard with `fs::read` | Write memory is bounded; query memory peaks around the largest shard | Month sharding bounds shard size; MCP callers supply size/hash themselves |
 | Non-UTF-8 content | `resolve` is byte-level and preserves invalid UTF-8 and CRLF verbatim | Such lines are kept but cannot be interpreted as records | Keep the store UTF-8 when possible; non-UTF-8 data is no longer a failure |
 | Non-UTF-8 paths | Paths go through `to_string_lossy` | Identity may be lossy | Avoid non-UTF-8 file names in the store |
@@ -262,7 +271,7 @@ A rebase that replays several conflicting commits needs one resolve → `git add
 | Time order ≈ real order | Depends on device clocks | Clock skew is reflected in ordering | NTP assumption; `event_id` tie-break |
 | Regex search | `--fuzzy` is Rust regex with a 10 MiB compiled-program cap | Not tokenized/semantic search; a bad or oversized pattern reports an error | Extend as needed |
 | No `git pull --autostash` | Sync commits first and holds the store write lock, so the tree is clean before the pull | A dirty tree is never silently stashed | This is deliberate: a stash-pop conflict in the middle of a rebase is very hard to recover from |
-| Project names are restricted | One safe path component (no `/`, `\`, `.`/`..`, control characters; ≤200 bytes) | A project cannot be named like a path | Security boundary against directory traversal by agent-supplied arguments |
+| Project names are restricted | One safe path component (no `/`, `\`, `.`/`..`, control characters; ≤200 bytes); Windows device names and trailing `.` rejected | A project cannot be named like a path, and a Unix-created store always checks out on Windows | Security/cross-platform boundary; rename legacy projects before syncing to Windows |
 | No authentication/encryption | Plaintext store + stdio MCP | The security boundary lies in the OS and Git layers | Private remote + external schemes such as git-crypt |
 | Symlinks are canonicalized only for existing paths | Existing prefixes are resolved, missing tails are lexical | A symlink created later can change the identity of a not-yet-existing path | Create/record files before linking them; avoid reorganizing store paths with symlinks |
 
