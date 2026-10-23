@@ -2,7 +2,7 @@
 
 # 迁移指南
 
-> 读者：正在把已有 ACDM store 升级到 0.1.4 的用户，或从内部预发布快照迁移的开发者。
+> 读者：正在把已有 ACDM store 升级到 0.1.5 的用户，或从内部预发布快照迁移的开发者。
 > 本文件说明「哪些变化需要动手、哪些读取端已经兼容」，并给出经过实测的迁移脚本。
 
 ## 数据格式与兼容性总则
@@ -45,6 +45,16 @@
   - **MCP `mem_add_event` 的 `file_name` 校验扩展**：空/空白、规范化后等于 store 根 / 进程工作目录 / 所在 git 工作树根、以及原路径本身是目录的 `file_name` 都会被拒绝（`isError`，错误文本分别以 `Invalid file_name: must not be empty`、`Invalid file_name: must not be a directory root (...)`、`Invalid file_name: '...' is a directory, not a file` 开头）；同一事件内按规范化 `file_name` **批次去重**（保留第一条，与 CLI 一致，例如 `b.rs` + `./b.rs` 只记录 1 个文件）。
   - **软链文件身份**：`normalize_file_name` 对**文件型符号链接**只 canonicalize 其父目录并保留链接自身名字，因此仓库内指向仓库外的软链文件（如 `src/config.json`）仍记录为仓库相对路径；目录型软链、软链形式的 store 根 / CWD 语义不变（仍解析），dangling 文件软链也保留名字。
   - **resolve 空补丁判定**：`git rebase --skip` 的判定改为 **index 干净**（`git diff --cached --quiet`，index 与 HEAD 一致）且无未解决文件，无关文件的**未暂存修改**不再阻止空补丁恢复；注意 `git rebase --skip` 可能重置工作树里无关的未暂存修改（Git 自身行为，resolver 不承诺保留）——若有需要保留的未暂存改动，请先 commit 或 stash。
+- **可选**：对每个项目执行一次 `mem compact -p <project>` 重建 `files.jsonl` 投影。
+- **升级步骤**：与既有升级流程相同（备份 → 替换二进制 → `mem list` / `mem resolve` 冒烟 → 可选 compact → `mem sync`），没有强制迁移动作。
+
+## 从 0.1.4 升级到 0.1.5
+
+- **无数据格式变更**：`.mem` 的 `format` 仍为 `1`，事件与文件记录 schema 未变；0.1.4 与 0.1.5 可以互相读写同一份 store。
+- **修复自动生效**（不需要迁移数据）：
+  - **悬空符号链接按 Git 链接语义记录**：`mem add` 打开文件得到 `NotFound`、但路径本身是符号链接（链接存在、目标缺失）时，不再记为 `Deleted`，而是记录目标路径字符串（`\` 归一为 `/`）的字节数与 SHA-256（Git 中软链就是保存该字符串的 blob）；首次 `Created`、再次 `Modified`，只有链接本身被删除后才 `Deleted`。非悬空文件软链仍跟随目标并哈希目标内容。
+  - **MCP `mem_add_event` 拒绝更多非法 `file_name`**：以 `/`、`\`、`/.`、`\.`、`/..`、`\..` 结尾 → `Invalid file_name: must not end with a path separator`；原路径是目录、或相对名指向 store 内部目录（如 `events`、`projects/demo`）→ `Invalid file_name: '<path>' is a directory, not a file`。两者均为 `isError`，不会写入任何记录。
+  - **resolve 空补丁 skip 守卫**：自动 `git rebase --skip` 现在要求**本轮确实消解过 JSONL 冲突**（`resolved_this_round > 0`）且 rebase 活跃、index 干净、无未解决文件；与 JSONL 无关的 rebase 暂停（`--exec` 失败、`edit`、GPG 签名失败等）会返回 Git 的**原始错误**，不再静默丢弃用户提交。`git rebase --skip` 可能重置工作区里无关的未暂存修改（Git 自身行为），需要保留请先 commit/stash。
 - **可选**：对每个项目执行一次 `mem compact -p <project>` 重建 `files.jsonl` 投影。
 - **升级步骤**：与既有升级流程相同（备份 → 替换二进制 → `mem list` / `mem resolve` 冒烟 → 可选 compact → `mem sync`），没有强制迁移动作。
 

@@ -2,7 +2,7 @@
 
 # Migration Guide
 
-> Audience: users upgrading an existing ACDM store to 0.1.4, or developers migrating from internal prerelease snapshots.
+> Audience: users upgrading an existing ACDM store to 0.1.5, or developers migrating from internal prerelease snapshots.
 > This document explains "which changes require action and which are already compatible on the read side", and provides a migration script that has been tested in practice.
 
 ## Data format and compatibility ground rules
@@ -93,6 +93,22 @@ Action items:
 
 1. Optional: run `mem compact -p <project>` once per project to rebuild the `files.jsonl` projection from the authoritative event log (also heals a stale or truncated projection).
 2. No other action is needed; the 0.1.3 recommendations remain valid but are optional.
+
+## Upgrading from 0.1.4 to 0.1.5
+
+Nothing to migrate: **0.1.5 changes no data format** (the same `events/`, `files.jsonl`, `meta.json`, `.mem` files are read and written), so an existing store works as-is and every fix takes effect automatically after replacing the binaries.
+
+What you get for free after upgrading:
+
+- **Dangling symlinks are recorded instead of reported as deletions**: when `mem add` opens a path whose target is missing but the path itself is a symlink, the link is recorded with Git's link semantics — content = the link target path (slashes normalised), `size_bytes` = its byte length, `hash` = its SHA-256. The first record is `Created`, a later one is `Modified`, and it only becomes `Deleted` when the link itself is removed; live symlinks are still followed and their target's content is hashed.
+- **MCP `file_name` validation is stricter**: `mem_add_event` now rejects values ending in a path separator or trailing `.`/`..` (`Invalid file_name: must not end with a path separator`), and also rejects paths that are directories or store subdirectories (`events`, `projects/<p>`, ...) even when the MCP process CWD is outside the store (`Invalid file_name: '<path>' is a directory, not a file`).
+- **Safer `resolve` recovery**: the automatic empty-patch `git rebase --skip` is only taken when the current round actually resolved JSONL conflicts (`resolved_this_round > 0`) *and* the index is clean with nothing unresolved. A rebase paused for an unrelated reason (`git rebase --exec` failure, `edit`, a failed commit signature, ...) therefore returns Git's original error instead of silently discarding the user's commit.
+- **Test suite**: 109 → 112 tests (67 core + 16 CLI integration + 6 MCP unit + 23 MCP integration).
+
+Action items:
+
+1. Optional: run `mem compact -p <project>` once per project to rebuild the `files.jsonl` projection from the authoritative event log (also heals a stale or truncated projection). If your store contains dangling symlinks recorded by older versions as `Deleted`, re-running `mem add` on those paths records them with the new link identity.
+2. No other action is needed; the 0.1.4 recommendations remain valid but are optional.
 
 ## Upgrade steps (single machine)
 
