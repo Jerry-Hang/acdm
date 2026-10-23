@@ -164,6 +164,9 @@ mem --path /path/to/store sync     # 再次同步
   不需要 `Content-Length` 头。
 - **启动即退出**：未知启动参数会打印 usage 并 `exit 2`（防止拼写错误静默用错 store）；
   确认只传 `--path`。
+- **客户端一直等待响应**：没有 `id` 的报文是 Notification，按设计**不会**有响应；如果客户端给
+  `notifications/*` 方法带了 `id`，0.1.3 会返回 `-32601 Method not found: notifications/...` 而不是
+  静默丢弃；如果旧版本 server 让你一直等，请升级到 0.1.3。
 - **工具调用返回 error**：先区分协议错误与业务错误：
   - `-32700` 请求不是合法 JSON；
   - `-32600` `jsonrpc` 不是 `"2.0"`，或单行请求超过 16 MiB（超限后 server 会丢弃该行并继续服务）；
@@ -174,9 +177,9 @@ mem --path /path/to/store sync     # 再次同步
     `-32603` 保留给真正的服务端故障，当前版本不会出现。
 - **工具执行失败但 server 还活着**：这是预期行为，读 `isError` 文本、修正参数后重试即可。
 - **`mem_add_event` 报 Invalid file_name**：0.1.3 起空白 `file_name` 返回 `isError`，文本为
-  `Invalid file_name: must not be empty`；规范化后等于 store 根目录的 `file_name`（`""` / `.` / `./`）
-  返回 `isError`，文本为 `Invalid file_name: must not be the store root`。修正传入的 `file_name`
-  （使用具体文件路径）后重试即可。
+  `Invalid file_name: must not be empty`；规范化后等于 store 根目录的 `file_name`（`"."` / `"./"`，
+  即客户端 CWD 恰好是 store 时，或 store 的绝对路径）返回 `isError`，文本为 `Invalid file_name: must not be the store root`。
+  修正传入的 `file_name`（使用具体文件路径）后重试即可。
 - **找不到 store / 事件写到奇怪位置**：MCP 启动时会 `init`（缺 store 时在解析出的根目录自建）。
   建议显式 `--path` 或设置 `ACDM_STORE`，避免依赖客户端进程的 CWD。
 - **多客户端并发**：每个客户端各自启动一个 `mem-mcp` 进程；写操作由**跨进程 store 写锁**（`fs2`）串行化。

@@ -195,7 +195,7 @@ mem-mcp: unrecognized argument "--help"; usage: mem-mcp [--path <store-root>]
 {"jsonrpc":"2.0","id":2,"result":{}}
 ```
 
-任何**没有 `id`** 的 `notifications/*` 报文都按通知静默处理（上面的 `notifications/initialized` 不产生输出）。**带 `id` 的 `notifications/*` 是普通 Request**：服务端必须应答，未注册的方法返回 `-32601`。0.1.2 实测：无 id 的 `notifications/foo` 无响应；带 id 的 `notifications/initialized` 返回单行报文 `{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"Method not found: notifications/initialized"}}`。
+任何**没有 `id`** 的 `notifications/*` 报文都按通知静默处理（上面的 `notifications/initialized` 不产生输出）。**带 `id` 的 `notifications/*` 是普通 Request**：服务端必须应答，未注册的方法返回 `-32601 Method not found`。0.1.3 实测：无 id 的 `notifications/foo` 无响应；带 id 的 `notifications/foo`（id 99）返回 `{"jsonrpc":"2.0","id":99,"error":{"code":-32601,"message":"Method not found: notifications/foo"}}`。
 
 ### 3.4 ping
 
@@ -826,6 +826,7 @@ Projects in memory store (<N>):
   （分别是坏 JSON 之后的 ping、未知工具之后的 ping。）
 - 成功响应与错误响应互斥：成功不含 `error`，错误不含 `result`；**但成功响应可能带 `result.isError = true`**（业务失败），客户端应优先检查该字段，再读 `result.content[].text`。
 - 无法解析/超长/超限的行只影响该行：`-32700` / `-32600` 后循环继续（`id` 为 `null`）。
+- **通知与请求的区别**：没有 `id` 的报文是 Notification，**不会产生响应**（包括 `notifications/initialized`）；带 `id` 的 `notifications/*` 方法是 Request，服务端会应答 `-32601 Method not found`，而不是静默丢弃。已用 0.1.3 二进制实测：`{"jsonrpc":"2.0","id":99,"method":"notifications/foo"}` → `Method not found: notifications/foo`。
 - `tools/call` 的 `params` 形状错误与工具参数 schema 不匹配是 `-32602`；工具执行期的业务失败一律是 `result.isError = true`，不再使用 `-32603`。
 - 单行请求上限 16 MiB（`MAX_REQUEST_LINE_BYTES`），超限返回 `-32600` 并丢弃整行。
 
