@@ -130,12 +130,23 @@ pub fn resolve_conflicts(root: &Path) -> Result<ResolveReport, Box<dyn Error>> {
                     // `git add`?") and the commit must be dropped with
                     // `git rebase --skip`.
                     //
-                    // The empty-patch signature is an *index* identical to HEAD
-                    // (`git diff --cached --quiet`), not a clean working tree:
-                    // unstaged edits to unrelated tracked files (or untracked
-                    // scratch files) do not change the replayed patch and must
-                    // not disable the recovery.
-                    if rebase_active(root) && crate::git::git_index_clean(root)? {
+                    // Only a round that really resolved JSONL conflicts may skip:
+                    // that is the evidence that the empty patch was caused by
+                    // this resolver's de-duplication. If nothing was resolved, the
+                    // rebase is paused for an unrelated reason (`--exec`, `edit`, a
+                    // failed commit signature, ...) and skipping would silently
+                    // drop the user's commit — surface Git's original error
+                    // instead.
+                    //
+                    // The empty-patch signature is also an *index* identical to
+                    // HEAD (`git diff --cached --quiet`), not a clean working
+                    // tree: unstaged edits to unrelated tracked files (or
+                    // untracked scratch files) do not change the replayed patch
+                    // and must not disable the recovery.
+                    if resolved_this_round > 0
+                        && rebase_active(root)
+                        && crate::git::git_index_clean(root)?
+                    {
                         if let Err(skip_error) = crate::git::git_rebase_skip(root) {
                             // `--skip` exits non-zero again when the rebase
                             // immediately stops on the next commit's conflict;
@@ -1716,6 +1727,97 @@ mod tests {
             "expected base + remote + unrelated + one replayed commit:\n{}",
             String::from_utf8_lossy(&log)
         );
+    }
+
+    /// Regression for a rebase paused for a reason unrelated to JSONL: when the
+    /// resolver did not resolve a single conflict in this round, a "clean index +
+    /// no unresolved files" state must not trigger `git rebase --skip` — that
+    /// would drop the user's commit (e.g. a paused `--exec`, an `edit` stop or a
+    /// failed commit signature). Git's original error must be surfaced instead.
+    #[test]
+    fn test_resolve_does_not_skip_when_no_jsonl_was_resolved_in_round() {
+        let tmp = TestDir::new();
+        let root = tmp.path.clone();
+        init_repo(&root);
+
+        let notes = root.join("notes.txt");
+        fs::write(&notes, "first\n").unwrap();
+        git_ok(&root, &["add", "-A"]);
+        git_ok(&root, &["commit", "-qm", "first"]);
+        fs::write(&notes, "second\n").unwrap();
+        git_ok(&root, &["add", "-A"]);
+        git_ok(&root, &["commit", "-qm", "second"]);
+
+        // Pause a rebase on a failing `--exec` step. `--reschedule-failed-exec`
+        // keeps the pause: `git rebase --continue` re-runs (and fails) the exec
+        // instead of silently resuming past it. Nothing is conflicted and the
+        // index is clean — exactly the empty-patch signature.
+        let rebase = git(
+            &root,
+            &[
+                "rebase",
+                "--exec",
+                "false",
+                "--reschedule-failed-exec",
+                "HEAD~1",
+            ],
+        );
+        assert!(
+            !rebase.status.success(),
+            "the exec step must stop the rebase:\n{}",
+            String::from_utf8_lossy(&rebase.stdout)
+        );
+        assert!(rebase_state_present(&root), "expected an active rebase");
+        assert!(
+            unresolved_files(&root).unwrap().is_empty(),
+            "the paused rebase must have no unresolved files"
+        );
+        assert!(
+            crate::git::git_index_clean(&root).unwrap(),
+            "the paused rebase must have a clean index"
+        );
+        let head_before = git_ok(&root, &["rev-parse", "HEAD"]).stdout;
+        let log_before = git_ok(&root, &["log", "--format=%s"]).stdout;
+
+        let error = resolve_conflicts(&root)
+            .expect_err("a rebase paused for an unrelated reason must not be skipped");
+        let message = error.to_string();
+        assert!(
+            message.contains("rebase --continue"),
+            "the Git error must be surfaced instead of being replaced by a failed \
+             skip attempt, got: {}",
+            message
+        );
+        assert!(
+            !message.contains("rebase --skip"),
+            "no automatic `git rebase --skip` may be attempted when nothing was \
+             resolved this round, got: {}",
+            message
+        );
+
+        // The paused commit was neither skipped nor rewritten...
+        assert_eq!(
+            git_ok(&root, &["rev-parse", "HEAD"]).stdout,
+            head_before,
+            "HEAD must not move"
+        );
+        assert_eq!(
+            git_ok(&root, &["log", "--format=%s"]).stdout,
+            log_before,
+            "no commit may be dropped"
+        );
+        assert!(
+            String::from_utf8_lossy(&git_ok(&root, &["log", "--format=%s"]).stdout)
+                .contains("second"),
+            "the paused commit must still be in the history"
+        );
+
+        // ...and the rebase stays paused for the user to fix.
+        assert!(
+            rebase_state_present(&root),
+            "the rebase must stay active for the user to fix"
+        );
+        assert!(unresolved_files(&root).unwrap().is_empty());
     }
 
     /// `unresolved_files` must return raw paths: Git's porcelain output quotes

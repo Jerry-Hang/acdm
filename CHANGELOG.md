@@ -3,6 +3,42 @@
 本文件记录 ACDM 的显著变更。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.1.5] - 2026-10-23
+
+第五轮独立外部审查（3 项修复 2 PASS / 1 PARTIAL，另报 3 项边缘 P2/P3 与 1 处文档不一致）的修复版本。
+**无数据格式变更**：既有 store 不需要迁移，升级后所有修复自动生效。
+
+### 数据安全
+
+- **悬空符号链接不再被误记为 `Deleted`**：`mem add` 打开文件返回 `NotFound` 时，若路径本身是
+  符号链接（链接存在、目标缺失），按 **Git 的符号链接语义**记录其目标路径：`size_bytes` 为目标
+  路径斜杠规范化字符串的字节长度，`hash` 为该字符串的 SHA-256；首次记录为 `Created`、再次为
+  `Modified`，链接被删除后才变 `Deleted`。非悬空软链仍跟随目标并哈希目标内容。
+
+### 协议与冲突解决
+
+- **MCP `mem_add_event` 拒绝尾随分隔符与 store 内部子目录**：`file_name` 以 `/`、`\`、`/.`、
+  `/..` 等结尾（文件不可能以分隔符结尾），或路径本身是目录、或相对名指向 store 内部目录
+  （如 `events`、`projects/demo`，即使 MCP 进程的 cwd 不在 store）时均返回 `isError`，不再把
+  目录写成文件记录。
+- **`mem resolve` 的空补丁自动 skip 仅在「本轮消解过 JSONL 冲突」时生效**：新增
+  `resolved_this_round > 0` 守卫；遇到与 JSONL 无关的 rebase 暂停点（`git rebase --exec` 失败、
+  `edit`、GPG 签名失败等，此时无未解决文件且 index 干净）时，不再静默执行 `git rebase --skip`
+  丢弃用户提交，而是把 Git 的原始错误交还用户。
+
+### 文档
+
+- 修正 DESIGN 的空补丁判定描述（`work tree clean` → `index clean`，与 ARCHITECTURE/CLI 一致）；
+  补充悬空软链语义、MCP `file_name` 新增校验与 resolve 守卫的说明（中英双语）。
+
+### 测试
+
+- **109 → 112 个测试**（67 core + 16 CLI 集成 + 6 MCP 单元 + 23 MCP 集成），新增覆盖：
+  悬空软链按链接目标字节记录（Created/Modified/Deleted 全链路）、MCP 尾随分隔符与 store 子目录
+  拒绝、无关 rebase 暂停点不被自动 skip。
+- `fmt` / `clippy -D warnings` / `rustdoc -D warnings` 全绿；release 二进制 `mem` 3.13 MB、
+  `mem-mcp` 2.88 MB。
+
 ## [0.1.4] - 2026-10-23
 
 第四轮独立外部审查（7/7 项 PASS，另报 3 项边缘 P2/P3）的修复版本。

@@ -480,6 +480,18 @@ fn handle_add_event(store: &MemStore, args: AddEventArgs) -> Result<Value, Strin
         if f.file_name.trim().is_empty() {
             return Err("Invalid file_name: must not be empty".to_string());
         }
+        // A file can never end with a path separator (or a trailing `.`/`..`
+        // component): `normalize_file_name` would strip it and silently record a
+        // directory path as if it were a file.
+        if f.file_name.ends_with('/')
+            || f.file_name.ends_with('\\')
+            || f.file_name.ends_with("/.")
+            || f.file_name.ends_with("\\.")
+            || f.file_name.ends_with("/..")
+            || f.file_name.ends_with("\\..")
+        {
+            return Err("Invalid file_name: must not end with a path separator".to_string());
+        }
 
         let action = f
             .action
@@ -499,9 +511,11 @@ fn handle_add_event(store: &MemStore, args: AddEventArgs) -> Result<Value, Strin
                     .to_string(),
             );
         }
-        // An existing directory is never a file record, even when its normalised
-        // identity is relative (e.g. a tracked subdirectory).
-        if Path::new(&f.file_name).is_dir() {
+        // An existing directory is never a file record. Check the raw path (which
+        // is relative to the process cwd) and the normalised identity resolved
+        // against the store, so store subdirectories such as `events` or
+        // `projects/demo` are caught even when the cwd is outside the store.
+        if Path::new(&f.file_name).is_dir() || store.root.join(&file_name).is_dir() {
             return Err(format!(
                 "Invalid file_name: '{}' is a directory, not a file",
                 f.file_name
@@ -821,7 +835,7 @@ fn handle_request(store: &MemStore, request: JsonRpcRequest) -> Option<JsonRpcRe
                 },
                 "serverInfo": {
                     "name": "mem-mcp",
-                    "version": "0.1.4"
+                    "version": "0.1.5"
                 }
             });
             Some(success_response(id, result))

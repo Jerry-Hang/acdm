@@ -1430,3 +1430,108 @@ fn mem_add_event_deduplicates_file_names_within_one_batch() {
     );
     assert_eq!(records[0]["file_name"], json!("a/b.rs"));
 }
+
+/// v0.1.5 review finding: the directory guard must also reject file names that
+/// end with a path separator / dot-tail, and store subdirectories passed as
+/// relative names while the MCP process cwd is outside the store.
+#[test]
+fn mem_add_event_rejects_trailing_slash_and_store_subdirs() {
+    let env = TestEnv::new("trailing-slash");
+    // Pre-create a store subdirectory and run the server from an external dir.
+    fs::create_dir_all(env.store.join("events")).expect("create store events dir");
+    let external = env.base.join("external");
+    fs::create_dir_all(&external).expect("create external dir");
+
+    let mut server = McpServer::start(&env.store, &external);
+    server.initialize();
+
+    let response = server.call_tool(
+        "mem_add_event",
+        json!({
+            "project": "demo",
+            "summary": "trailing separator",
+            "files": [{"file_name": "src/newdir/"}],
+        }),
+    );
+    assert!(
+        response.get("error").is_none(),
+        "a trailing separator is a tool business error: {}",
+        response
+    );
+    assert_eq!(
+        response["result"]["isError"],
+        json!(true),
+        "a file_name ending with a separator must set isError: {}",
+        response
+    );
+    assert!(
+        tool_text(&response).contains("path separator"),
+        "the error must explain the trailing separator: {}",
+        tool_text(&response)
+    );
+
+    let response = server.call_tool(
+        "mem_add_event",
+        json!({
+            "project": "demo",
+            "summary": "store subdirectory",
+            "files": [{"file_name": "events"}],
+        }),
+    );
+    assert!(
+        response.get("error").is_none(),
+        "a store subdirectory is a tool business error: {}",
+        response
+    );
+    assert_eq!(
+        response["result"]["isError"],
+        json!(true),
+        "a store subdirectory must set isError: {}",
+        response
+    );
+    assert!(
+        tool_text(&response).contains("directory"),
+        "the error must explain that it is a directory: {}",
+        tool_text(&response)
+    );
+
+    assert!(
+        store_events(&env.store).is_empty(),
+        "rejected file names must not record events"
+    );
+
+    // A normal relative file name still works and records its relative identity.
+    let response = server.call_tool(
+        "mem_add_event",
+        json!({
+            "project": "demo",
+            "summary": "regular file",
+            "files": [{"file_name": "src/ok.rs"}],
+        }),
+    );
+    assert!(
+        response.get("error").is_none(),
+        "the normal add failed: {}",
+        response
+    );
+    assert!(
+        response["result"].get("isError").is_none(),
+        "the normal add must succeed: {}",
+        response
+    );
+    let events = store_events(&env.store);
+    assert_eq!(
+        events.len(),
+        1,
+        "the normal add must record exactly one event: {:?}",
+        events
+    );
+    let records = read_jsonl(&env.store.join("projects").join("demo").join("files.jsonl"));
+    assert_eq!(records.len(), 1, "expected one file record: {:?}", records);
+    assert_eq!(
+        records[0]["file_name"],
+        json!("src/ok.rs"),
+        "the cwd-relative identity must be recorded: {}",
+        records[0]
+    );
+}

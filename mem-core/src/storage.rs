@@ -128,6 +128,39 @@ fn open_for_recording(path: &Path) -> std::io::Result<File> {
     }
 }
 
+/// The recordable identity of a *dangling* symbolic link, using Git's semantics.
+///
+/// Git stores a symlink as a blob whose content is the link target path verbatim,
+/// with `/` separators on every platform (mode `120000`). Following that model, a
+/// dangling link is a real, present file identity:
+///
+/// * the content is the (slash-normalised) target path string;
+/// * `size_bytes` is that content's byte length;
+/// * the SHA-256 is computed over the content, so it matches what Git would
+///   store in the blob.
+///
+/// Returns `Ok(None)` when `path` is not a symlink (a genuinely missing path, or
+/// a race where the file disappeared between `open` and this check); the caller
+/// then records a `Deleted` entry. A live symlink never reaches this function —
+/// `open` follows it and the target's content is hashed normally.
+fn dangling_symlink_identity(path: &Path) -> Result<Option<(u64, String)>, Box<dyn Error>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        // The path itself is gone: a real deletion.
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_symlink() {
+        return Ok(None);
+    }
+
+    let target = fs::read_link(path)?;
+    let content = target.to_string_lossy().replace('\\', "/");
+    let size_bytes = content.len() as u64;
+    let hash = crate::models::compute_sha256(content.as_bytes());
+    Ok(Some((size_bytes, hash)))
+}
+
 /// DOS device names that Windows rejects as file or directory names, in any
 /// case and even with an extension (`con.txt` is as reserved as `CON`).
 const WINDOWS_RESERVED_NAMES: [&str; 22] = [
@@ -384,6 +417,11 @@ impl MemStore {
     /// regular file`; a path that does not exist (at open time, or that vanishes
     /// during the hash) is recorded as `Deleted` instead of failing the batch.
     ///
+    /// A **dangling symbolic link** is *not* a deletion: following Git's link
+    /// semantics it is recorded as present, with the link target's
+    /// slash-normalised bytes as its content, size and SHA-256. A live symlink
+    /// keeps following its target (the target's bytes are hashed as before).
+    ///
     /// Duplicate file identities in one batch are collapsed: after normalisation
     /// only the first occurrence of a `file_name` is recorded, so passing
     /// `a.txt a.txt` cannot produce two records that both claim to be `Created`.
@@ -395,11 +433,12 @@ impl MemStore {
     /// instead of being ignored.
     ///
     /// For each distinct path: a missing file records `Deleted` (size 0, empty
-    /// hash); an existing regular file is recorded as `Modified` when its
-    /// normalised name is already tracked, `Created` otherwise. `file_name`
-    /// identity is normalised with [`crate::util::normalize_file_name`], so paths
-    /// outside the store and outside any Git work tree keep their absolute form
-    /// (callers can surface their own warning for that case).
+    /// hash); an existing regular file (or a dangling symlink, as described
+    /// above) is recorded as `Modified` when its normalised name is already
+    /// tracked, `Created` otherwise. `file_name` identity is normalised with
+    /// [`crate::util::normalize_file_name`], so paths outside the store and
+    /// outside any Git work tree keep their absolute form (callers can surface
+    /// their own warning for that case).
     pub fn record_file_event(
         &self,
         project: &str,
@@ -424,7 +463,15 @@ impl MemStore {
             let mut file = match open_for_recording(path) {
                 Ok(file) => file,
                 Err(error) if error.kind() == ErrorKind::NotFound => {
-                    pending.push((file_name, None));
+                    // `open` follows symlinks, so NotFound means either "no such
+                    // path" or "dangling symlink". A dangling link is a present
+                    // file identity under Git's link semantics (a blob holding
+                    // the target path); only a path that really does not exist is
+                    // a Deleted record.
+                    match dangling_symlink_identity(path)? {
+                        Some(identity) => pending.push((file_name, Some(identity))),
+                        None => pending.push((file_name, None)),
+                    }
                     continue;
                 }
                 Err(error) => return Err(error.into()),
@@ -1635,5 +1682,118 @@ mod tests {
         store.init().unwrap();
         assert_eq!(fs::read_to_string(&marker_path).unwrap(), first_content);
         assert!(!marker_temp.exists());
+    }
+
+    /// A dangling symbolic link is a *present* file identity under Git's link
+    /// semantics (the stored blob content is the link target), so `mem add` must
+    /// record Created/Modified for it instead of misreading it as a Deleted file.
+    /// Only deleting the link itself (or a path that never existed) is Deleted.
+    #[cfg(unix)]
+    #[test]
+    fn test_record_file_event_records_dangling_symlink_as_link_identity() {
+        use std::os::unix::fs::symlink;
+
+        let (_tmp, store) = create_temp_store();
+        let project = "dangling_link";
+        let link_path = store.root.join("link.txt");
+        let target = "target-created-later.txt";
+        symlink(target, &link_path).unwrap();
+
+        let expected_size = target.len() as u64;
+        let expected_hash = crate::models::compute_sha256(target.as_bytes());
+
+        // 1. The dangling link is present, not Deleted: content = target string,
+        //    size = content byte length, hash = SHA-256 of the content.
+        let created = store
+            .record_file_event(
+                project,
+                "add dangling link",
+                "device-x",
+                "agent-x",
+                std::slice::from_ref(&link_path),
+            )
+            .unwrap();
+        assert_eq!(created.files.len(), 1);
+        let record = &created.files[0];
+        assert_eq!(record.file_name, "link.txt");
+        assert_eq!(
+            record.action, "Created",
+            "a dangling link must not be recorded as Deleted"
+        );
+        assert_eq!(record.size_bytes, expected_size);
+        assert_eq!(record.hash, expected_hash);
+
+        // The projection contains the record as well.
+        let projected = store.read_project_files(project).unwrap();
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].file_name, "link.txt");
+        assert_eq!(projected[0].action, "Created");
+
+        // 2. Re-recording the dangling link is a modification.
+        let modified = store
+            .record_file_event(
+                project,
+                "touch dangling link",
+                "device-x",
+                "agent-x",
+                std::slice::from_ref(&link_path),
+            )
+            .unwrap();
+        assert_eq!(modified.files[0].action, "Modified");
+        assert_eq!(modified.files[0].size_bytes, expected_size);
+        assert_eq!(modified.files[0].hash, expected_hash);
+
+        // 3. Deleting the link itself is a Deleted record.
+        fs::remove_file(&link_path).unwrap();
+        let deleted = store
+            .record_file_event(
+                project,
+                "delete dangling link",
+                "device-x",
+                "agent-x",
+                std::slice::from_ref(&link_path),
+            )
+            .unwrap();
+        assert_eq!(deleted.files[0].action, "Deleted");
+        assert_eq!(deleted.files[0].file_name, "link.txt");
+        assert_eq!(deleted.files[0].size_bytes, 0);
+        assert!(deleted.files[0].hash.is_empty());
+
+        // 4. Contrast: a path that never existed is Deleted from the start.
+        let missing = store.root.join("never-existed.txt");
+        let missing_record = store
+            .record_file_event(
+                project,
+                "missing path",
+                "device-x",
+                "agent-x",
+                std::slice::from_ref(&missing),
+            )
+            .unwrap();
+        assert_eq!(missing_record.files[0].action, "Deleted");
+        assert_eq!(missing_record.files[0].size_bytes, 0);
+        assert!(missing_record.files[0].hash.is_empty());
+
+        // 5. Control: a live symlink still follows its target's bytes rather
+        //    than storing the link string.
+        let target_file = store.root.join("real-target.txt");
+        fs::write(&target_file, b"payload").unwrap();
+        let live_link = store.root.join("live-link.txt");
+        symlink(&target_file, &live_link).unwrap();
+        let live = store
+            .record_file_event(
+                project,
+                "add live link",
+                "device-x",
+                "agent-x",
+                std::slice::from_ref(&live_link),
+            )
+            .unwrap();
+        assert_eq!(live.files[0].action, "Created");
+        assert_eq!(live.files[0].size_bytes, b"payload".len() as u64);
+        assert_eq!(
+            live.files[0].hash,
+            crate::models::compute_sha256(b"payload")
+        );
     }
 }
