@@ -4,7 +4,7 @@
 
 > 读者：要把 ACDM 接入 Claude Desktop、Cursor 或自研 MCP 客户端的开发者。本文覆盖 `mem-mcp` 的启动方式、stdio 上的 JSON-RPC 2.0 会话、8 个工具的参数/返回/边界行为和错误码；CLI 侧参考见 [CLI.md](CLI.md)，整体设计见 [ARCHITECTURE.md](ARCHITECTURE.md) 与 [DESIGN.md](DESIGN.md)。
 
-本文以 `mem-mcp/src/main.rs` 中 `tools/list` 返回的 `inputSchema` 与各 handler 的实际行为为**唯一权威**。文中报文与返回文本都在 v0.1.0 / v0.1.1 / v0.1.2 的实际二进制上通过管道喂 stdin 实测得到（各版本行为变更处按该版本重新实测）；为可读性，示例中的本机绝对路径替换为 `/path/to/...` 占位符，事件 ID、时间戳、hash 保持原样。实际响应是**单行 JSON**；文中保留原始单行报文的示例直接引用实测输出，少数结构示意（如 `tools/list` 的树形展开）会明确标注为示意。
+本文以 `mem-mcp/src/main.rs` 中 `tools/list` 返回的 `inputSchema` 与各 handler 的实际行为为**唯一权威**。文中报文与返回文本都在 v0.1.0 / v0.1.1 / v0.1.2 / v0.1.3 的实际二进制上通过管道喂 stdin 实测得到（各版本行为变更处按该版本重新实测）；为可读性，示例中的本机绝对路径替换为 `/path/to/...` 占位符，事件 ID、时间戳、hash 保持原样。实际响应是**单行 JSON**；文中保留原始单行报文的示例直接引用实测输出，少数结构示意（如 `tools/list` 的树形展开）会明确标注为示意。
 
 ## 目录
 
@@ -44,7 +44,7 @@
 - **传输层**：stdio 上的**换行分隔 JSON-RPC 2.0**。stdin 每行一个 JSON 对象；stdout 每行一个响应对象。不是 LSP 那种 `Content-Length` 分帧。
 - **单行上限**：一行请求最多 16 MiB；超限行被丢弃（保持输入流同步）并返回 `-32600`，server 继续服务。
 - **错误分两类**：协议问题返回 JSON-RPC error（`-32700` / `-32600` / `-32601` / `-32602`）；工具级业务失败返回**成功响应 + `result.isError = true`** 与可读的错误文本，Agent 可据此自我纠正并重试（见 [5. 错误码与语义](#5-错误码与语义)）。
-- **协议版本**：`initialize` 固定返回 `protocolVersion: "2024-11-05"`，`serverInfo` 为 `{"name":"mem-mcp","version":"0.1.2"}`。
+- **协议版本**：`initialize` 固定返回 `protocolVersion: "2024-11-05"`，`serverInfo` 为 `{"name":"mem-mcp","version":"0.1.3"}`。
 - **能力**：只声明 `capabilities.tools = {}`；没有 resources、prompts、logging、sampling 等能力。
 - **单线程串行**：主循环逐行读取 stdin，同步处理完一个请求、写回一个响应并 flush 后才读下一行；没有并发处理。
 - **启动即初始化 store**：启动时按与 CLI 相同的规则定位 store，并调用 `MemStore::init()`——目录结构或 `.mem` 缺失时自动创建（等价于 `mem init`）。
@@ -171,13 +171,13 @@ mem-mcp: unrecognized argument "--help"; usage: mem-mcp [--path <store-root>]
 请求（真实报文）：
 
 ```json
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"docs-client","version":"0.1.2"}}}
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"docs-client","version":"0.1.3"}}}
 ```
 
 响应（真实报文）：
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"tools":{}},"protocolVersion":"2024-11-05","serverInfo":{"name":"mem-mcp","version":"0.1.2"}}}
+{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"tools":{}},"protocolVersion":"2024-11-05","serverInfo":{"name":"mem-mcp","version":"0.1.3"}}}
 ```
 
 ### 3.3 notifications/initialized
@@ -186,12 +186,12 @@ mem-mcp: unrecognized argument "--help"; usage: mem-mcp [--path <store-root>]
 
 ```text
 # stdin（3 行）
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"docs-client","version":"0.1.2"}}}
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"docs-client","version":"0.1.3"}}}
 {"jsonrpc":"2.0","method":"notifications/initialized"}
 {"jsonrpc":"2.0","id":2,"method":"ping"}
 
 # stdout（2 行）
-{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"tools":{}},"protocolVersion":"2024-11-05","serverInfo":{"name":"mem-mcp","version":"0.1.2"}}}
+{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"tools":{}},"protocolVersion":"2024-11-05","serverInfo":{"name":"mem-mcp","version":"0.1.3"}}}
 {"jsonrpc":"2.0","id":2,"result":{}}
 ```
 
@@ -389,7 +389,7 @@ Project demo
 | `device` | string | 否 | 本机 hostname | 设备名；`null`/空白字符串视为未给，回退 hostname（规则同 CLI） |
 | `agent` | string | 否 | `mcp-agent` | 记录者名称；空白字符串回退默认值 |
 | `files` | array | 否 | `[]` | 受影响的文件列表；省略表示本次事件没有文件变更 |
-| `files[].file_name` | string | **是** | — | 文件路径；**绝对路径会被规范化**为 store / git 仓库 / CWD 相对路径 |
+| `files[].file_name` | string | **是** | — | 文件路径；**绝对路径会被规范化**为 store / git 仓库 / CWD 相对路径。空白值（`""`/纯空白）与指向 store 根目录本身的值（`""`、`.`、`./` 规范化后等于 store 根）会被拒绝 |
 | `files[].action` | string | 否 | `Modified` | 只接受 `Created` / `Modified` / `Deleted`（大小写敏感）；其它值返回 `-32602` |
 | `files[].size_bytes` | integer | 否 | `0` | 文件字节数 |
 | `files[].hash` | string | 否 | `""` | 调用方提供的 SHA256 十六进制摘要；服务端**不计算也不校验** |
@@ -457,6 +457,7 @@ Project demo
 - `project` 第一次被记录时，若 `projects/<project>/meta.json` 不存在，会**自动写入**最小元数据（`description` = `"Project <name>"`、`github_url` = null、`created_at` = 事件时间），与 CLI `add` 一致。
 - `files` 省略或为空数组时事件仍会写入（`recorded with 0 files`），且不会追加 `files.jsonl` 记录。
 - `file_name` 规范化规则与 CLI 相同：相对 store 根 → 相对 git 仓库根 → 相对 CWD → 绝对路径（MCP 侧**不会**像 CLI 那样打印绝对路径警告）。
+- 0.1.3 起 `file_name` 有额外校验：空白值返回 `isError`，文本为 `Invalid file_name: must not be empty`；规范化后等于 store 根目录（`""` / `.` / `./`）返回 `isError`，文本为 `Invalid file_name: must not be the store root`。
 - `action` 只接受 `Created` / `Modified` / `Deleted`（缺省 `Modified`）；传 `"Renamed"` 等其它值会返回 `-32602`（`Invalid arguments for mem_add_event: unknown variant ...`）；`size_bytes` / `hash` 仍然透传，不校验文件是否存在。
 - 事件 ID 由服务端生成（`YYYYMMDDHHMMSS_nanos9_pid5_counter4`，UTC）；`ts` 为固定宽度 UTC 纳秒。
 - `project` 必须是单一安全路径组件（同 CLI 校验，0.1.2 起还拒绝 Windows 保留名、尾点与非法字符 `<>:"|?*`）；非法值（如 `../evil`、`CON`、`con.txt`、`foo.`、`a<b`）在写入前被拒绝，返回 `isError` 结果：`Invalid project: invalid project name "CON": reserved Windows device name (would be invalid on Windows)`。MCP 的 `files[]` 是调用方提供的元数据（服务端不读文件），因此没有 CLI 那样的「非普通文件」检查。

@@ -2,7 +2,7 @@
 
 # 迁移指南
 
-> 读者：正在把已有 ACDM store 升级到 0.1.2 的用户，或从内部预发布快照迁移的开发者。
+> 读者：正在把已有 ACDM store 升级到 0.1.3 的用户，或从内部预发布快照迁移的开发者。
 > 本文件说明「哪些变化需要动手、哪些读取端已经兼容」，并给出经过实测的迁移脚本。
 
 ## 数据格式与兼容性总则
@@ -25,6 +25,18 @@
 - **可选**：对每个项目再执行一次 `mem compact -p <project>`，按 0.1.2 的「按 `ts` 再 `event_id` 排序后重放」语义重建投影；日常追加与 `resolve` 仍遵循物理追加顺序（见 `DESIGN.md` 3.3）。
 - **默认提交信息统一**：CLI `mem sync` 与 MCP `mem_sync` 的缺省提交信息统一为 `Auto-sync from <device> at <ts>`；若脚本依赖旧 MCP 的默认提交信息，请改为显式传 `message` 或适配新文本。
 - **历史项目名需要留意**：若 store 里已有项目名命中 Windows 保留设备名（`CON` / `PRN` / `AUX` / `NUL` / `COM1`–`COM9` / `LPT1`–`LPT9`，含 `con.txt` 这类带扩展名形式）或以 `.` 结尾，0.1.2 的 CLI/MCP 会在新建事件前拒绝该名字；请先改名（`git mv projects/<old> projects/<new>`，并确认没有外部脚本引用旧名）再同步到 Windows。
+
+## 从 0.1.2 升级到 0.1.3
+
+- **无数据格式变更**：`.mem` 的 `format` 仍为 `1`，事件与文件记录 schema 未变；0.1.2 与 0.1.3 可以互相读写同一份 store。
+- **修复自动生效**（不需要迁移数据）：
+  - `mem add` / `record_file_event` 改为**单句柄**读取：每个路径只 `open` 一次（Unix 上加 `O_NONBLOCK`，防止路径在检查后被换成 FIFO 而永久阻塞），用同一句柄校验普通文件并流式计算 SHA-256；打开或哈希阶段遇到 `NotFound`（文件不存在、或读取过程中消失）记为 `Deleted`，不再让整批命令失败；
+  - 同一批次内规范化后重复的 `file_name` 自动去重（保留第一次出现）；
+  - `init` 以 `.mem.tmp` + `rename` **原子**发布 `.mem`（看到 `.mem` 就代表完整初始化），并清理引导用的 fallback 锁文件与残留的 `.mem.tmp`；
+  - `resolve` 的空补丁 `git rebase --skip` 判定只看**已跟踪**变更（`git status --porcelain --untracked-files=no`），未跟踪临时文件不再阻止恢复；未解决文件列表改用 `git diff --name-only --diff-filter=U -z`（NUL 分隔），含空格/特殊字符的路径不再被 Git 的引号转义破坏；
+  - CLI `add` 的绝对路径告警覆盖 Windows 盘符路径（如 `C:/...`）；MCP `mem_add_event` 拒绝空白 `file_name` 与指向 store 根目录的 `file_name`。
+- **可选**：对每个项目执行一次 `mem compact -p <project>` 重建 `files.jsonl` 投影（行为与 0.1.2 相同）。
+- **升级步骤**：与 0.1.0 的升级流程相同（备份 → 替换二进制 → `mem list` / `mem resolve` 冒烟 → 可选 compact → `mem sync`），没有强制迁移动作。
 
 ## 0.1.0 相对内部预发布快照的变化
 

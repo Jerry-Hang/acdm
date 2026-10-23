@@ -146,10 +146,10 @@ CI（`.github/workflows/ci.yml`）在每次 `push` / `pull_request` 时依次执
 
 | 指标 | 当前值 |
 | --- | --- |
-| 测试 | **100 个全部通过**：59 个 `mem-core` 单元测试 + 16 个 CLI 集成测试 + 6 个 MCP 单元测试 + 19 个 MCP 集成测试 |
+| 测试 | **105 个全部通过**：63 个 `mem-core` 单元测试 + 16 个 CLI 集成测试 + 6 个 MCP 单元测试 + 20 个 MCP 集成测试 |
 | 静态检查 | 本地校验中 `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo doc`（rustdoc）均无警告；CI 覆盖 fmt / clippy / test / release build |
-| Release 二进制 | `mem` 3.12 MB、`mem-mcp` 2.86 MB（release profile：`strip = true`、`lto = "thin"`、`codegen-units = 1`） |
-| 版本 / 许可 | v0.1.2 / MIT |
+| Release 二进制 | `mem` 3.13 MB、`mem-mcp` 2.86 MB（release profile：`strip = true`、`lto = "thin"`、`codegen-units = 1`） |
+| 版本 / 许可 | v0.1.3 / MIT |
 
 ## store 定位规则
 
@@ -357,7 +357,7 @@ Event: 20261022124608_499123055_15717_0001 | 2026-10-22T12:46:08.499121883Z
 | `mem_resolve` | 无 | 自动解决 JSONL 冲突，并在一次调用内推进多提交 rebase |
 | `mem_render` | `project` | 生成 `projects/<project>/README.md` |
 
-`mem_add_event` 的 `files` 是数组，元素字段与 `FileRecord` 一致：`file_name`（必填）、`action`（可选，只接受 `Created` / `Modified` / `Deleted`，缺省 `Modified`）、`size_bytes`、`hash`。若 `file_name` 传入的是绝对路径，会先规范化为 store / git 仓库相对路径再写入，保证跨设备可匹配。项目名必须是单一安全路径组件（非空、非 `.`/`..`、不含 `/`、`\`、无控制字符、≤200 字节），CLI 与 MCP 都会拒绝非法值。
+`mem_add_event` 的 `files` 是数组，元素字段与 `FileRecord` 一致：`file_name`（必填）、`action`（可选，只接受 `Created` / `Modified` / `Deleted`，缺省 `Modified`）、`size_bytes`、`hash`。若 `file_name` 传入的是绝对路径，会先规范化为 store / git 仓库相对路径再写入，保证跨设备可匹配；空白 `file_name` 与指向 store 根目录本身的 `file_name` 会被拒绝（`Invalid file_name: ...`）。项目名必须是单一安全路径组件（非空、非 `.`/`..`、不含 `/`、`\`、无控制字符、≤200 字节）；此外拒绝 Windows 保留设备名（`CON`、`PRN`、`AUX`、`NUL`、`COM1`–`COM9`、`LPT1`–`LPT9`，大小写不敏感，含 `con.txt`）、以 `.` 结尾的名字与 Windows 非法字符 `<>:"|?*`，CLI 与 MCP 都会拒绝非法值。
 
 协议层错误用 JSON-RPC error 返回（`-32700` 非法 JSON、`-32600` 非法请求如 `jsonrpc` 版本不对或单行超过 16 MiB、`-32601` 未知工具/方法、`-32602` 工具参数不匹配）；工具级业务失败（git 冲突、非法查询维度、不安全项目名、同步失败等）则返回正常响应并置 `result.isError = true`，Agent 可读取错误文本后自行纠正。单行请求上限 16 MiB，超限返回 `-32600` 且 server 继续服务。
 
@@ -415,6 +415,7 @@ YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ   // 恰好 30 个字符，UTC
 
 - **旧时间戳格式**：历史数据里可能存在两套旧格式（秒级 `...Z`、纳秒 `...+00:00`），仍可正常读取，时间排序按解析后的时间进行；新写入的数据统一使用固定宽度 UTC 纳秒 `...Z`。
 - **旧绝对路径记录**：早期版本可能把文件的绝对路径写进 `file_name`。这些记录仍可读取，但按相对路径名查询（`query -n`、MCP `mem_query` 的 `filename`）查不到它们。可以用 `mem compact -p <project>` 清理历史重复、并重新 `mem add` 记录一次相对路径身份，逐步收敛。
+- **项目名受限**：项目名必须是单一安全路径组件（非空、非 `.`/`..`、不含 `/`、`\`、无控制字符、≤200 字节）；此外拒绝 Windows 保留设备名（`CON`、`PRN`、`AUX`、`NUL`、`COM1`–`COM9`、`LPT1`–`LPT9`，大小写不敏感，含 `con.txt`）、以 `.` 结尾的名字与 Windows 非法字符 `<>:"|?*`，否则 CLI/MCP 以 `invalid project name` 拒绝。
 - **单一 `--fuzzy` 语义**：`--fuzzy` / MCP 的 `fuzzy` 是对事件行原始 JSON 文本做 Rust 正则匹配，不是全文分词搜索；正则无效或编译程序超过 10 MiB 会直接报错。
 - **Git 依赖**：`sync` / `resolve` 依赖本机 `git` 可用；`sync` 还要求仓库已配置可用的 `origin` 与推送凭据。
 - **并发写**：同一 store 的写操作（追加、`compact`、`resolve`、`sync`）由跨进程写锁串行化，单机并发安全；跨设备一致性仍是「最终一致 + 去重」，没有分布式事务。

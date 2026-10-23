@@ -2,7 +2,7 @@
 
 # Migration Guide
 
-> Audience: users upgrading an existing ACDM store to 0.1.2, or developers migrating from internal prerelease snapshots.
+> Audience: users upgrading an existing ACDM store to 0.1.3, or developers migrating from internal prerelease snapshots.
 > This document explains "which changes require action and which are already compatible on the read side", and provides a migration script that has been tested in practice.
 
 ## Data format and compatibility ground rules
@@ -59,6 +59,23 @@ Action items:
 1. Optional: run `mem compact -p <project>` once per project to rebuild the `files.jsonl` projection from the authoritative event log (also heals a stale or truncated projection).
 2. **Only if you sync to Windows**: rename any project whose name is a Windows-reserved device name (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, case-insensitive, including `con.txt`) or ends with `.` — 0.1.2 now rejects such names, and Windows cannot check them out. Rename the directory under `projects/` and update the `project` field of that project's records before syncing to Windows.
 3. No other action is needed; the 0.1.1 recommendations (running `compact` once) remain valid but are optional.
+
+## Upgrading from 0.1.2 to 0.1.3
+
+Nothing to migrate: **0.1.3 changes no data format** (the same `events/`, `files.jsonl`, `meta.json`, `.mem` files are read and written), so an existing store works as-is and every fix takes effect automatically after replacing the binaries.
+
+What you get for free after upgrading:
+
+- **Hardened `mem add` file handling**: `record_file_event` opens every path exactly once (Unix `O_NONBLOCK`, so a FIFO cannot block the command) and uses that single handle for the regular-file check and the streaming SHA-256 hash — no TOCTOU gap between the object checked and the object hashed. A file that disappears while being opened/hashed is recorded as `Deleted` instead of failing the command, and duplicate paths in one batch are collapsed to a single record.
+- **Atomic `init` marker**: `.mem` is written last via `.mem.tmp` + `fs::rename`, so any process that observes `.mem` observes a fully initialized store; the bootstrap fallback lock file and any leftover `.mem.tmp` are cleaned up.
+- **More robust `resolve`**: the empty-patch `git rebase --skip` decision now looks only at **tracked** changes (`--untracked-files=no`), so leftover scratch files in the store no longer stop the recovery; the unresolved-file list uses `git diff --name-only --diff-filter=U -z`, so paths with spaces or special characters are reported verbatim.
+- **MCP `file_name` validation**: `mem_add_event` rejects empty/whitespace-only file names and paths that normalize to the store root (`isError`, `Invalid file_name: ...`) instead of writing a bogus identity into the projection.
+- **Cross-platform warning coverage**: the CLI's absolute-path warning also covers Windows drive paths (`C:/...`).
+
+Action items:
+
+1. Optional: run `mem compact -p <project>` once per project to rebuild the `files.jsonl` projection from the authoritative event log (also heals a stale or truncated projection).
+2. No other action is needed; the 0.1.2 recommendations remain valid but are optional.
 
 ## Upgrade steps (single machine)
 

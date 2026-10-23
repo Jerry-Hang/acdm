@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/Jerry-Hang/acdm/actions/workflows/ci.yml/badge.svg)](https://github.com/Jerry-Hang/acdm/actions/workflows/ci.yml)
 
-*ACDM (Agent Cross-Device Memory System) is a serverless, cross-device memory layer for AI agents that work on the same project from different machines. It records project events as append-only, month-sharded JSONL and synchronizes them through Git, so every machine sees the same history without running a database or a hosted backend. One Rust workspace ships two entry points: the `mem` CLI for humans and scripts, and `mem-mcp`, a stdio MCP server for agents. Timestamps and IDs are fixed-width UTC, file paths are normalized into repo-relative identities, and JSONL merge conflicts are resolved automatically by `mem resolve` — preserve-first, never silently dropping data. The project is MIT-licensed and currently at v0.1.2.*
+*ACDM (Agent Cross-Device Memory System) is a serverless, cross-device memory layer for AI agents that work on the same project from different machines. It records project events as append-only, month-sharded JSONL and synchronizes them through Git, so every machine sees the same history without running a database or a hosted backend. One Rust workspace ships two entry points: the `mem` CLI for humans and scripts, and `mem-mcp`, a stdio MCP server for agents. Timestamps and IDs are fixed-width UTC, file paths are normalized into repo-relative identities, and JSONL merge conflicts are resolved automatically by `mem resolve` — preserve-first, never silently dropping data. The project is MIT-licensed and currently at v0.1.3.*
 
 ACDM gives cross-device AI agents a shared project memory through **Git sync + append-only JSONL**: an agent records events on any machine, and after syncing, another machine can look up the same history.
 
@@ -147,10 +147,10 @@ CI (`.github/workflows/ci.yml`) runs the following on every `push` / `pull_reque
 
 | Metric | Current value |
 | --- | --- |
-| Tests | **100 total, all passing**: 59 `mem-core` unit tests + 16 CLI integration tests + 6 MCP unit tests + 19 MCP integration tests |
+| Tests | **105 total, all passing**: 63 `mem-core` unit tests + 16 CLI integration tests + 6 MCP unit tests + 20 MCP integration tests |
 | Static checks | In local verification, `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo doc` (rustdoc) are all warning-free; CI covers fmt / clippy / test / release build |
-| Release binaries | `mem` 3.12 MB, `mem-mcp` 2.86 MB (release profile: `strip = true`, `lto = "thin"`, `codegen-units = 1`) |
-| Version / license | v0.1.2 / MIT |
+| Release binaries | `mem` 3.13 MB, `mem-mcp` 2.86 MB (release profile: `strip = true`, `lto = "thin"`, `codegen-units = 1`) |
+| Version / license | v0.1.3 / MIT |
 
 ## Store discovery rules
 
@@ -358,7 +358,7 @@ When neither `--path` nor `ACDM_STORE` is given, the store is discovered from th
 | `mem_resolve` | none | Automatically resolves JSONL conflicts, advancing a multi-commit rebase in one call |
 | `mem_render` | `project` | Generates `projects/<project>/README.md` |
 
-`mem_add_event`'s `files` is an array whose elements follow `FileRecord`: `file_name` (required), `action` (optional; exactly `Created` / `Modified` / `Deleted`, defaults to `Modified`), `size_bytes`, `hash`. If `file_name` is an absolute path, it is first normalized to a store / Git-repository-relative path before being written, so it can match across devices. Project names must be a single safe path component (non-empty, not `.`/`..`, no `/`, `\`, or control characters, at most 200 bytes); Windows-reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, case-insensitive, including `con.txt`) and names ending in `.` are rejected too, so a store synced from Unix always checks out on Windows. CLI and MCP both reject anything else.
+`mem_add_event`'s `files` is an array whose elements follow `FileRecord`: `file_name` (required), `action` (optional; exactly `Created` / `Modified` / `Deleted`, defaults to `Modified`), `size_bytes`, `hash`. If `file_name` is an absolute path, it is first normalized to a store / Git-repository-relative path before being written, so it can match across devices. Project names must be a single safe path component (non-empty, not `.`/`..`, no `/`, `\`, or control characters, at most 200 bytes); Windows-reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, case-insensitive, including `con.txt`), names ending in `.`, and the Windows-invalid characters `<>:"|?*` are rejected too, so a store synced from Unix always checks out on Windows. CLI and MCP both reject anything else.
 
 Protocol-level problems use JSON-RPC errors (`-32700` malformed JSON, `-32600` invalid request such as a wrong `jsonrpc` version or an over-long request line, `-32601` unknown tool/method, `-32602` invalid tool arguments). Tool-level failures (git conflict, invalid query dimension, unsafe project name, a failed sync, ...) are returned as a normal response with `result.isError = true` and a readable message, so an agent can correct itself and retry. A single request line is capped at 16 MiB; an oversized line is rejected with `-32600` and the server keeps serving.
 
@@ -417,7 +417,7 @@ The longest on-disk-existing prefix of a path is canonicalized (symbolic links r
 
 - **Legacy timestamp formats**: historical data may contain two legacy formats (second-precision `...Z` and nanosecond `...+00:00`). They are still readable, and time ordering is based on parsed time; newly written data uses the fixed-width UTC nanosecond `...Z` format exclusively.
 - **Legacy absolute-path records**: early versions may have written a file's absolute path into `file_name`. Those records remain readable, but queries by relative path name (`query -n`, MCP `mem_query` with `filename`) will not find them. Re-running `mem add` records a relative-path identity; `mem compact -p <project>` rebuilds the projection from the event log (which also heals a missing or truncated `files.jsonl`) but does not rewrite historical `file_name` values.
-- **Project names are constrained**: a project name must be one safe path component (non-empty, not `.`/`..`, no `/` or `\`, no control characters, at most 200 bytes); Windows-reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, case-insensitive, including `con.txt`) and names ending in `.` are rejected as well, otherwise the CLI and MCP reject it with `invalid project name`.
+- **Project names are constrained**: a project name must be one safe path component (non-empty, not `.`/`..`, no `/` or `\`, no control characters, at most 200 bytes); Windows-reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, case-insensitive, including `con.txt`), names ending in `.`, and the Windows-invalid characters `<>:"|?*` are rejected as well, otherwise the CLI and MCP reject it with `invalid project name`.
 - **Single `--fuzzy` semantics**: `--fuzzy` / MCP's `fuzzy` runs a Rust regex over the raw JSON text of event lines; it is not full-text tokenized search. Compiled regex programs are capped at 10 MiB, and an invalid regex errors out directly.
 - **Git dependency**: `sync` / `resolve` require `git` to be available locally; `sync` skips the pull when the branch has no upstream, aborts on a non-conflict pull failure, and needs a push target (remote/credentials) to succeed.
 - **No `--autostash`**: `sync` commits all changes before pulling and holds the store write lock, so there is nothing to stash; this avoids the hard-to-recover state where a stash pop conflicts in the middle of a rebase.

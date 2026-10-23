@@ -122,6 +122,9 @@ mem --path /path/to/store sync     # 再次同步
   `git -C <store> check-ignore -v events/2026-10.jsonl`，必要时 `git add -f` 后再运行 `mem resolve`。
 - 空补丁提交会自动 `git rebase --skip`：多轮冲突解决时，某个提交要应用的改动可能已经在目标分支里，
   `mem resolve` 会自动跳过它并继续推进 rebase，这是正常行为，不是冲突。
+- 未跟踪文件不再阻止空补丁恢复（0.1.3）：空补丁的 `git rebase --skip` 判定只看**已跟踪**变更
+  （`git status --porcelain --untracked-files=no`）；store 里存在未跟踪临时文件时 `mem resolve`
+  仍能正常跳过空补丁，不会再因此报错停下。
 - `git worktree` / submodule：`.git` 是**文件**而不是目录，0.1.2 起通过 `git rev-parse --git-path`
   定位 per-worktree 的 rebase 状态，可以直接在 worktree 内运行 `mem resolve`。
 - resolve 后仍然冲突：看 `git -C <store> status`；确认冲突文件在仓库内、`.jsonl` 后缀、
@@ -170,6 +173,10 @@ mem --path /path/to/store sync     # 再次同步
     而是成功响应 + `result.isError = true`，错误文本在 `result.content[].text`；
     `-32603` 保留给真正的服务端故障，当前版本不会出现。
 - **工具执行失败但 server 还活着**：这是预期行为，读 `isError` 文本、修正参数后重试即可。
+- **`mem_add_event` 报 Invalid file_name**：0.1.3 起空白 `file_name` 返回 `isError`，文本为
+  `Invalid file_name: must not be empty`；规范化后等于 store 根目录的 `file_name`（`""` / `.` / `./`）
+  返回 `isError`，文本为 `Invalid file_name: must not be the store root`。修正传入的 `file_name`
+  （使用具体文件路径）后重试即可。
 - **找不到 store / 事件写到奇怪位置**：MCP 启动时会 `init`（缺 store 时在解析出的根目录自建）。
   建议显式 `--path` 或设置 `ACDM_STORE`，避免依赖客户端进程的 CWD。
 - **多客户端并发**：每个客户端各自启动一个 `mem-mcp` 进程；写操作由**跨进程 store 写锁**（`fs2`）串行化。

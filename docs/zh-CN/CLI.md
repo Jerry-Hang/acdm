@@ -4,7 +4,7 @@
 
 > 读者：需要日常使用或脚本化调用 `mem` 的开发者与 AI Agent 操作者。本文覆盖全部 8 个子命令的参数、输出格式、退出码与真实边界行为；Agent 侧的 MCP 入口见 [MCP.md](MCP.md)，架构与设计动机见 [ARCHITECTURE.md](ARCHITECTURE.md) 与 [DESIGN.md](DESIGN.md)。
 
-本文以 `mem-cli/src/main.rs` 的 clap 定义为**唯一权威**（参数名、必填性、默认值均以源码为准）。文中示例输出在 v0.1.0 / v0.1.1 / v0.1.2 的实际二进制上运行得到（各版本行为变更处按该版本重新实测）；为可读性，示例中的 store 绝对路径统一替换为 `/path/to/store` 占位符，事件 ID、时间戳、SHA256 与其余文本保持原样。示例中执行 git 提交前均已配置 git 用户身份；涉及 git 错误信息的地方以 `LC_ALL=C` 运行，因此错误文本是英文（git 错误消息随 locale 变化）。
+本文以 `mem-cli/src/main.rs` 的 clap 定义为**唯一权威**（参数名、必填性、默认值均以源码为准）。文中示例输出在 v0.1.0 / v0.1.1 / v0.1.2 / v0.1.3 的实际二进制上运行得到（各版本行为变更处按该版本重新实测）；为可读性，示例中的 store 绝对路径统一替换为 `/path/to/store` 占位符，事件 ID、时间戳、SHA256 与其余文本保持原样。示例中执行 git 提交前均已配置 git 用户身份；涉及 git 错误信息的地方以 `LC_ALL=C` 运行，因此错误文本是英文（git 错误消息随 locale 变化）。
 
 ## 目录
 
@@ -260,9 +260,9 @@ mem add [OPTIONS] --project <PROJECT> --summary <SUMMARY> <FILES>...
 
 1. **在碰 store 之前**先校验项目名（必须是单一安全路径组件；否则 `Error: invalid project name ...` 退出 1）。
 2. **锁外预计算**（这一阶段刻意安排在取 store 写锁之前，慢速文件 IO 不会阻塞其他写者）：对每个 `<FILES>`：
-   - 规范化文件身份 `file_name`：优先相对 store 根；文件在 store 外时相对最近的 git 仓库根；再退回相对 CWD；都无法相对化时保留**绝对路径**并向 stderr 打印警告。已存在的前缀会做 `fs::canonicalize` 解析符号链接，因此软链形式的 store/项目目录仍得到稳定身份；
-   - `stat` **用户传入的原始路径**：文件不存在 → `Deleted` 候选（`size_bytes = 0`、`hash = ""`）；存在但**不是普通文件**（FIFO、设备节点、目录）→ 以 `Error: cannot record '<path>': not a regular file` 中止；
-   - 普通文件以 64 KiB 分块**流式**计算 SHA-256（不会整文件读入内存），在这一阶段准备好 `size_bytes` 与 `hash`。
+   - 规范化文件身份 `file_name`：优先相对 store 根；文件在 store 外时相对最近的 git 仓库根；再退回相对 CWD；都无法相对化时保留**绝对路径**并向 stderr 打印警告。已存在的前缀会做 `fs::canonicalize` 解析符号链接，因此软链形式的 store/项目目录仍得到稳定身份。同一批次里规范化后重复的 `file_name` 只保留第一次出现；
+   - 每个路径只 `open` 一次（Unix 上加 `O_NONBLOCK`，防止路径在检查后被换成 FIFO 而永久阻塞），用同一个句柄的 `metadata` 判断它是不是普通文件：目录、FIFO、设备节点 → 以 `Error: cannot record '<path>': not a regular file` 中止；打开时不存在、或在哈希过程中消失 → `Deleted` 候选（`size_bytes = 0`、`hash = ""`，不报错）；
+   - 普通文件用同一句柄以 64 KiB 分块**流式**计算 SHA-256（不会整文件读入内存），在这一阶段准备好 `size_bytes` 与 `hash`。
 3. 取 store 跨进程写锁，并在同一个临界区内把准备好的记录与 `files.jsonl` 最新快照相比较，判定 `Modified` / `Created`，再为每条记录生成独立的 `file_id`。因为哈希已提前算完，锁只覆盖快速的状态转换（核心 API `record_file_event`）：判定永远不会基于过期快照，元数据写失败会中止命令而不是被忽略，慢文件也不会卡住同机的 `compact` / `resolve` / `sync`。
 4. 生成事件：`event_id` 形如 `YYYYMMDDHHMMSS_nanos9_pid5_counter4`（UTC）；`ts` 为固定宽度 UTC 纳秒 `YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ`。
 5. 若 `projects/<project>/meta.json` 无法读取（缺失**或损坏**），在同一把锁内自动写入最小元数据：`description` 为 `"Project <name>"`、`github_url` 为 `null`、`created_at` 等于本次事件时间；被部分写坏的 store 因此在这里自愈。
@@ -351,11 +351,12 @@ Successfully recorded event: 20261022130629_780024199_23222_0001                
 
 **注意事项**
 
-- `<FILES>` 是必填的位置参数，至少传一个；路径可以是相对 CWD，也可以是绝对路径。
+- `<FILES>` 是必填的位置参数，至少传一个；路径可以是相对 CWD，也可以是绝对路径。同一批次里规范化后重复的路径只记录一次（保留第一次出现），因此 `mem add a.txt a.txt` 不会产生两条记录。
 - `-p/--project` 必须是单一安全路径组件：非空、不是 `.`/`..`、不含 `/` 或 `\`、无控制字符、≤200 字节；否则报 `Error: invalid project name ...` 并退出 1（在任何 store 操作之前校验）。0.1.2 起还拒绝 Windows 保留设备名（`CON` / `PRN` / `AUX` / `NUL` / `COM1`–`COM9` / `LPT1`–`LPT9`，大小写不敏感，`con.txt` 这类带扩展名的形式也算）、以 `.` 结尾的名字与 Windows 非法字符 `<>:"|?*`；CLI 与 MCP 都会拒绝，因此 Agent 传入的名字无法逃出 `projects/`，在 Unix 上创建的 store 也总能在 Windows 上 checkout。
 - `Created` / `Modified` 只根据 `file_name` 是否已出现在该项目的 `files.jsonl`（含历史记录，去重后）来判断；不比较内容 hash，因此对同一文件即使内容没变，第二次记录也会是 `Modified`。
 - SHA-256 在**取 store 锁之前**以 64 KiB 分块流式计算：记录大文件既不整文件读入内存，也不在慢 IO 期间持有 store 写锁；store 中只保存 hash 与字节数。
-- `add` 只记录**普通文件**：FIFO、设备节点或目录会以 `Error: cannot record '<path>': not a regular file` 被拒绝（退出码 1），因此阻塞/特殊文件永远不会卡住 store 写锁或产生无意义的 hash；不存在的路径仍会记录为 `Deleted`。
+- `add` 只记录**普通文件**：FIFO、设备节点或目录会以 `Error: cannot record '<path>': not a regular file` 被拒绝（退出码 1），因此阻塞/特殊文件永远不会卡住 store 写锁或产生无意义的 hash；不存在的路径仍会记录为 `Deleted`——包括「打开时存在、读取过程中消失」的文件（0.1.3 起不再让整批命令失败）。
+- 绝对路径告警覆盖 Windows 盘符路径：除 Unix 风格 `/...` 外，`C:/...` 这类 `Path::is_absolute()` 为真、但不以 `/` 开头的路径同样会被识别并收到跨设备警告。
 - 文件不存在也会产生一条 `Deleted` 记录，路径仍然按同样规则规范化。
 - 记录的绝对路径不会跨设备匹配，只适合临时本地记录；跨设备场景请让文件位于 store 内或某个 git 仓库内（见 [MIGRATION.md](MIGRATION.md) 的旧绝对路径记录说明）。
 - 文件内容本身不入库，只保存路径、大小和 SHA256。
@@ -762,8 +763,8 @@ mem resolve [OPTIONS]
    - 合法记录**原样重发原始行文本**，因此未知字段、字段顺序、格式都不会丢失。
 4. 写回解析后的文件（额外持排他文件锁）。
 5. store 根存在 `.git` 时，对每个被改写的文件执行 `git add -- <相对路径>`；**`git add` 失败是硬错误**（退出 1），不会带着未暂存文件继续推进 rebase。
-6. 通过 `git rev-parse --git-path` 解析 rebase 状态（普通仓库是 `.git/rebase-merge` / `.git/rebase-apply`；`git worktree` / submodule 中 `.git` 是文件，状态在 per-worktree 的 git 目录）：确实有 rebase 时执行 `git rebase --continue`（用 `GIT_EDITOR=true` 避免编辑器阻塞），然后回到第 1 步继续下一轮；一次调用最多循环 100 轮，多提交 rebase 也能一次推进完。检测不依赖 git 的本地化错误文本。
-7. 若 `git rebase --continue` 遇到**空补丁提交**（要应用的改动已经在目标分支中），自动执行 `git rebase --skip` 丢弃该提交并继续循环，不把空补丁当作失败。
+6. 通过 `git rev-parse --git-path` 解析 rebase 状态（普通仓库是 `.git/rebase-merge` / `.git/rebase-apply`；`git worktree` / submodule 中 `.git` 是文件，状态在 per-worktree 的 git 目录）：确实有 rebase 时执行 `git rebase --continue`（用 `GIT_EDITOR=true` 避免编辑器阻塞），然后回到第 1 步继续下一轮；一次调用最多循环 100 轮，多提交 rebase 也能一次推进完。检测不依赖 git 的本地化错误文本。未解决文件列表用 `git diff --name-only --diff-filter=U -z` 读取：NUL 分隔的原始路径不带状态前缀、不做引号转义，因此含空格或特殊字符的路径也能被正确识别。
+7. 若 `git rebase --continue` 遇到**空补丁提交**（要应用的改动已经在目标分支中），只在**已跟踪**变更全部暂存时（`git status --porcelain --untracked-files=no` 为空）自动执行 `git rebase --skip` 丢弃该提交并继续循环，不把空补丁当作失败；store 里未跟踪的临时文件不再阻止这一恢复。
 
 **真实输出（非 git 目录中的手工冲突文件：含 1 条无法解析的截断行）**
 
@@ -844,7 +845,7 @@ Synchronizing memory store at: /path/to/store-b
 - `resolve` 只处理 `.jsonl` 文件。**非 JSONL 的冲突不会处理**，例如 `projects/<p>/meta.json`（两台设备同时为同一新项目写入元数据时可能冲突）；这类冲突必须先手工解决并 `git add`。若循环中的 `git rebase --continue` 因这些文件失败，命令会打印一条可操作的错误，列出非 JSONL 文件和所有仍未解决的路径，并提示 `git add <file>` 后重试；故障排查参见 [TROUBLESHOOTING.md](TROUBLESHOOTING.md)。
 - 不在 git 仓库中也能运行：只是清理冲突标记，不会 `git add`、不会继续 rebase。
 - 支持 `git worktree` / submodule：`.git` 为文件时按 per-worktree git 目录定位 rebase 状态，可直接在 worktree 内运行 `mem resolve`。
-- 空补丁提交（改动已在目标分支）会自动 `git rebase --skip` 丢弃并继续，这只是 rebase 的正常推进，不是冲突。
+- 空补丁提交（改动已在目标分支）会自动 `git rebase --skip` 丢弃并继续，这只是 rebase 的正常推进，不是冲突；判定只看**已跟踪**变更，所以 store 里的未跟踪临时文件不会阻止恢复。
 - `Files updated` 中显示的是绝对路径。
 - 保留行（含非 UTF-8 字节与 CRLF）永远不会被静默丢弃；历史合法记录也不会被重写（除冲突标记、去重与排序外，行文本保持原样）。
 - 去重是「后出现者胜出」：rebase 场景中通常意味着 `theirs` 分支的记录覆盖 `ours` 中同 ID 的记录。

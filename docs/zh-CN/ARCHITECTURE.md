@@ -3,7 +3,7 @@
 # ACDM 架构
 
 > 读者：想理解 ACDM 如何工作、准备贡献代码或排查存储/同步问题的开发者。
-> 本文描述当前源码（v0.1.2）的实际行为；为什么这样设计见 [DESIGN.md](DESIGN.md)，命令用法见 [CLI.md](CLI.md) 与 [MCP.md](MCP.md)。
+> 本文描述当前源码（v0.1.3）的实际行为；为什么这样设计见 [DESIGN.md](DESIGN.md)，命令用法见 [CLI.md](CLI.md) 与 [MCP.md](MCP.md)。
 
 ## 1. 设计目标与约束
 
@@ -74,14 +74,14 @@ ACDM 要在多台机器、多个 AI Agent 之间共享「项目记忆」。它�
 入口在 [`mem-cli/src/main.rs`](../../mem-cli/src/main.rs) 的 `Commands::Add` 分支：
 
 1. clap 解析全局 `--path` 与 `add` 参数；[`validate_project_name`](../../mem-core/src/storage.rs) 在任何 store 操作前拒绝不安全的项目名；[`resolve_store_root`](../../mem-core/src/util.rs) 得到 store 根目录。
-2. 构造 `MemStore` 并调用 [`record_file_event`](../../mem-core/src/storage.rs)。它分两个阶段：**取 store 写锁之前**完成每个路径的规范化、`stat` 与 64 KiB 分块流式 SHA-256（慢速文件 IO 不会持锁；FIFO、设备节点、目录等非普通文件会以 `not a regular file` 直接失败）；随后才取锁，并在同一个临界区里完成「读最新记录 → 判定 `Created` / `Modified` → 确保元数据 → 追加」（见 3.3），因此并发写者既不能使判定基于过期快照，也不能与元数据写入交错。
+2. 构造 `MemStore` 并调用 [`record_file_event`](../../mem-core/src/storage.rs)。它分两个阶段：**取 store 写锁之前**完成每个路径的**单句柄**读取——每个路径只 `open` 一次（Unix 上加 `O_NONBLOCK`，防止路径在检查后被换成 FIFO 而永久阻塞），用同一个句柄的 `metadata` 判断它是不是普通文件，并用同一句柄做 64 KiB 分块流式 SHA-256（慢速文件 IO 不会持锁；目录、FIFO、设备节点会以 `not a regular file` 拒绝）。打开或哈希阶段遇到 `NotFound`（文件不存在、或在读取过程中消失）记为 `Deleted` 而不是报错；同一批次里规范化后重复的 `file_name` 只保留第一次出现，因此传 `a.txt a.txt` 不会产生两条都声称 `Created` 的记录。随后才取锁，并在同一个临界区里完成「读最新记录 → 判定 `Created` / `Modified` → 确保元数据 → 追加」（见 3.3），因此并发写者既不能使判定基于过期快照，也不能与元数据写入交错。
 3. 对每个待记录文件：
 
    | 步骤 | 行为 |
    | --- | --- |
    | 路径规范化 | [`normalize_file_name(file_path, &store.root)`](../../mem-core/src/util.rs)；若结果仍是绝对路径（既不在 store、也不在任何 git 仓库、也不在 CWD 之下），向 stderr 打一条警告 |
    | 存在性 | 用**用户传入的原始路径**判断，不用规范化名 |
-   | 不存在 | `action = Deleted`，`size_bytes = 0`，`hash = ""` |
+   | 不存在 | 打开时不存在、或在哈希过程中消失 → `action = Deleted`，`size_bytes = 0`，`hash = ""`（不报错） |
    | 存在 | 必须是**普通文件**；[`hash_file(path)`](../../mem-core/src/models.rs) 以 64 KiB 分块流式计算 → `size_bytes` = 字节数，`hash` = SHA256 十六进制；文件不会整体读入内存。FIFO、设备节点与目录会被拒绝：`cannot record '<path>': not a regular file` |
    | action | 规范化名在「最新文件记录」里已存在 → `Modified`，否则 `Created` |
    | file_id | [`generate_id()`](../../mem-core/src/id_gen.rs) 生成 |
@@ -245,6 +245,8 @@ ACDM 要在多台机器、多个 AI Agent 之间共享「项目记忆」。它�
 
 0.1.2 起 `.mem` 还兼作 store 跨进程写锁的目标：写操作只读打开该文件并 `flock`，因此加锁不会修改它、不会弄脏 Git 仓库，也不会在共享机器上被其他用户阻塞（见 6.1）。
 
+0.1.3 起 `.mem` 的创建本身也是原子的：`init` 先建好目录与 `.gitignore`，最后才把标记内容写到同目录的 `.mem.tmp` 再 `rename` 成 `.mem`。因此任何进程只要看到 `.mem`，看到的一定是完整初始化过、且内容完整的 store（不会读到半个标记文件），锁目标也从 bootstrap 阶段的 fallback 锁文件切换为 `.mem`；`init` 结束时还会清理本次引导用的 fallback 锁文件和可能残留的 `.mem.tmp`。
+
 ### 5.5 `.gitignore`
 
 `init` 时若 store 根尚无 `.gitignore`，写入默认内容：
@@ -316,7 +318,7 @@ YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ     # 恰好 30 字符，UTC
 
 ### Metadata
 - **Created At:** <meta.created_at>
-- **GitHub:** <github_url>           # when github_url is present
+- **GitHub:** [<url>](<url>)          # when github_url is present
 
 ## Tracked Files
 
@@ -346,7 +348,7 @@ YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ     # 恰好 30 字符，UTC
 | `append_event`（文件行） | 额外 `fs2` 排他锁 | 对 `files.jsonl` 同样处理 |
 | `resolve` 写回 | 额外 `fs2` 排他锁 | 重新整文件覆盖后 `git add` |
 
-store 跨进程写锁让**同一台机器上的多文件操作**在进程之间串行：追加不会与投影重建、冲突解决或 rebase 交错。`fs2` 锁是**建议锁（advisory）**，不跨设备生效；跨设备顺序由 Git 同步与 `mem resolve` 收敛。
+store 跨进程写锁让**同一台机器上的多文件操作**在进程之间串行：追加不会与投影重建、冲突解决或 rebase 交错。`fs2` 锁是**建议锁（advisory）**，不跨设备生效；跨设备顺序由 Git 同步与 `mem resolve` 收敛。首次 `init` 在 `.mem` 原子出现后会把引导用的 fallback 锁文件删掉，之后所有写者都锁 `.mem`。
 
 ### 6.2 读侧
 
@@ -452,8 +454,8 @@ Git 对文本行做三方合并，两个分片都追加了不同事件时，冲�
 8. 无法解析的行（含相同内容的重复行折叠一次）**追加在文件末尾**。
 9. 以排他锁 `truncate` 覆盖写回。
 10. 若 store 根存在 `.git`：`git add -- <相对路径>` 把解决后的文件暂存。**`git add` 失败是硬错误**：rebase 中继续执行会让后续 `git rebase --continue` 失败并留下半完成状态，所以直接返回错误、不继续推进。
-11. rebase 状态通过 Git 自身解析（`git rev-parse --git-path`）：普通仓库是 `.git/rebase-merge` / `.git/rebase-apply`；`git worktree` / submodule 中 `.git` 是**文件**，状态在 per-worktree 的 git 目录里。存在 rebase 时执行 `git rebase --continue`（`GIT_EDITOR=true` 防止阻塞），然后回到第 1 步继续下一轮；一次调用最多循环 100 轮，直到 rebase 结束。若剩余冲突包含非 JSONL 文件，则停止并打印可操作的错误（列出非 JSONL 文件与所有未解决路径）。
-12. 若 `git rebase --continue` 发现当前提交是**空补丁**（要应用的改动已经在目标分支中，常见于多轮冲突解决），自动执行 `git rebase --skip` 丢弃该提交并继续，而不是把空补丁误报为失败。
+11. rebase 状态通过 Git 自身解析（`git rev-parse --git-path`）：普通仓库是 `.git/rebase-merge` / `.git/rebase-apply`；`git worktree` / submodule 中 `.git` 是**文件**，状态在 per-worktree 的 git 目录里。存在 rebase 时执行 `git rebase --continue`（`GIT_EDITOR=true` 防止阻塞），然后回到第 1 步继续下一轮；一次调用最多循环 100 轮，直到 rebase 结束。未解决文件列表用 `git diff --name-only --diff-filter=U -z` 读取：NUL 分隔的原始路径不带状态前缀、不做引号转义，因此含空格或特殊字符的 `.jsonl` 路径也能被正确识别。若剩余冲突包含非 JSONL 文件，则停止并打印可操作的错误（列出非 JSONL 文件与所有未解决路径）。
+12. 若 `git rebase --continue` 发现当前提交是**空补丁**（要应用的改动已经在目标分支中，常见于多轮冲突解决），先确认**已跟踪**变更已全部暂存（`git status --porcelain --untracked-files=no` 为空），然后自动执行 `git rebase --skip` 丢弃该提交并继续，而不是把空补丁误报为失败。只看已跟踪变更是关键：store 里一个未跟踪的临时文件不应阻止空补丁恢复。
 
 `ResolveReport` 汇报：`resolved_files`、`total_conflicts_resolved`、`deduplicated_items`、`lines_preserved`。
 

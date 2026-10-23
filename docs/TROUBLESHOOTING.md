@@ -106,7 +106,8 @@ mem --path /path/to/store sync     # sync again
 - Parseable records are sorted by time and written back; **unparseable lines are preserved verbatim** (placed at the end of the file);
 - After writing back it runs `git add`; a failed `git add` is now a **hard error** (previously only a warning), because the following `git rebase --continue` could never succeed.
 - Rebase state is resolved with `git rev-parse --git-path` and repository detection with `git rev-parse --git-dir`, independent of the system language and working in `git worktree` / submodule checkouts where `.git` is a **file**.
-- It loops through a multi-commit rebase (up to 100 rounds) in one call; when a replayed commit becomes an **empty patch** after de-duplication, it is dropped automatically with `git rebase --skip` instead of aborting on git's "No changes" error.
+- It loops through a multi-commit rebase (up to 100 rounds) in one call; when a replayed commit becomes an **empty patch** after de-duplication, it is dropped automatically with `git rebase --skip` instead of aborting on git's "No changes" error. Since 0.1.3 that check looks only at **tracked** changes (`git status --porcelain --untracked-files=no`), so local scratch files in the store do not prevent recovery — you do not need to remove untracked files first.
+- The unresolved-file list is read via `git diff --name-only --diff-filter=U -z`, so a conflicted path containing spaces or special characters is reported (and treated as `.jsonl`) verbatim, without git's quote/escape rendering.
 
 Troubleshooting:
 
@@ -152,7 +153,7 @@ if you need extra notes, write them in a different file, or change the rendering
   no `Content-Length` header is needed.
 - **Exits immediately on startup**: unknown startup arguments print usage and `exit 2` (to prevent a typo from silently using the wrong store);
   make sure you only pass `--path`.
-- **The client keeps waiting for a response**: a message **without** `id` is a Notification and is never answered, by design. If your client sends a `notifications/*` method **with** an `id`, 0.1.2 answers it with `-32601 Method not found: notifications/...` rather than dropping it; if an older server left you waiting, upgrade to 0.1.2.
+- **The client keeps waiting for a response**: a message **without** `id` is a Notification and is never answered, by design. If your client sends a `notifications/*` method **with** an `id`, 0.1.3 answers it with `-32601 Method not found: notifications/...` rather than dropping it; if an older server left you waiting, upgrade to 0.1.3.
 - **Tool call returns an error**: distinguish the two channels:
   - JSON-RPC `error` means a protocol problem: `-32700` the request is not valid JSON; `-32600` the `jsonrpc` field is not `"2.0"` or the request line exceeds 16 MiB; `-32601` unknown method or unknown tool; `-32602` the `tools/call` parameters or the tool's arguments do not match the schema (including an invalid `action` value).
   - A **successful response with `result.isError = true`** means the tool ran but failed logically (Git conflict, failed sync, invalid query dimension, unsafe project name, failed compact/render); read `result.content[0].text` for the reason and retry after fixing it. `-32603` is reserved for genuine internal server faults.
@@ -160,7 +161,8 @@ if you need extra notes, write them in a different file, or change the rendering
 - **Store not found / events written to a strange location**: MCP runs `init` at startup (creating a store in the resolved root when it is missing).
   It is recommended to pass `--path` explicitly or set `ACDM_STORE`, to avoid depending on the client process's CWD.
 - **Multiple clients in parallel**: each client starts its own `mem-mcp` process; all writes (append, compact, render, init, resolve, sync) take the store-wide `fs2` cross-process lock, so concurrent writes on one machine are serialized, and reads are lock-free (`fs::read`, no mmap).
-- **Invalid project names**: `project` must be a single safe path component (no `/`, `\`, `.`/`..`, control characters; ≤200 bytes); Windows-reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, case-insensitive, including `con.txt`) and names ending in `.` are rejected as well. The name is validated **before anything is written**, so the tool returns `isError` with `Invalid project: invalid project name ...` and nothing is created.
+- **Invalid project names**: `project` must be a single safe path component (no `/`, `\`, `.`/`..`, control characters; ≤200 bytes); Windows-reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, case-insensitive, including `con.txt`), names ending in `.`, and the Windows-invalid characters `<>:"|?*` are rejected as well. The name is validated **before anything is written**, so the tool returns `isError` with `Invalid project: invalid project name ...` and nothing is created.
+- **Invalid `file_name` in `mem_add_event`**: since 0.1.3 an empty/whitespace-only `files[].file_name` returns `isError` with `Invalid file_name: must not be empty`, and a path that normalizes to the store root (for example `"."`/`"./"` when the client's CWD is the store, or an absolute path to the store) returns `Invalid file_name: must not be the store root`; pass the affected file's real path instead. Nothing is written in either case.
 
 ## 9. Performance issues
 
