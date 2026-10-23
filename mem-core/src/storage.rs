@@ -1,7 +1,8 @@
-use crate::models::{hash_file, Event, FileRecord, ProjectMeta};
+use crate::models::{hash_reader, Event, FileRecord, ProjectMeta};
 use crate::util;
 use fs2::FileExt;
 use ignore::WalkBuilder;
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
@@ -64,6 +65,15 @@ fn fallback_lock_file_path(root: &Path) -> PathBuf {
     ))
 }
 
+/// Sibling temp path used to create the `.mem` marker atomically.
+///
+/// The name is deliberately fixed (`<marker>.tmp`) so a crashed `init` leaves a
+/// file the next `init` recognises and removes, and the store's own `.gitignore`
+/// already ignores `*.tmp`.
+fn marker_temp_path(root: &Path) -> PathBuf {
+    root.join(format!("{}.tmp", util::STORE_MARKER))
+}
+
 /// Acquire the store-wide write lock (blocks while another writer holds it).
 ///
 /// The `.mem` marker is preferred as the lock target: it is opened **read-only**
@@ -93,6 +103,29 @@ pub fn lock_store(root: &Path) -> Result<StoreWriteLock, Box<dyn Error>> {
     let file = options.open(&path)?;
     file.lock_exclusive()?;
     Ok(StoreWriteLock { _file: file })
+}
+
+/// Open `path` once for both validation and hashing.
+///
+/// On Unix the handle is opened with `O_NONBLOCK`: opening a FIFO read-only
+/// normally blocks until a writer appears, so a path that was swapped for a FIFO
+/// after the caller's checks could otherwise hang the process forever. The flag
+/// has no effect on regular files, and the handle's own metadata decides whether
+/// *the object about to be hashed* is a regular file (no re-open, no TOCTOU
+/// window between the check and the bytes that are hashed).
+fn open_for_recording(path: &Path) -> std::io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        File::open(path)
+    }
 }
 
 /// DOS device names that Windows rejects as file or directory names, in any
@@ -223,28 +256,20 @@ impl MemStore {
     ///
     /// The `.mem` marker makes the store discoverable from any subdirectory by
     /// both the CLI and the MCP server (see [`crate::util::find_store_root`]).
+    ///
+    /// Runs under the store-wide write lock. A brand-new store has no marker
+    /// yet, so its first `init` serialises on the fallback lock file; the marker
+    /// is created **last** and atomically, so a process that sees `.mem` always
+    /// sees a fully initialised store and locks the marker from then on.
     pub fn init(&self) -> Result<(), Box<dyn Error>> {
         // Serialise concurrent inits and any init racing another writer. The
-        // very first init has no `.mem` yet, so it serialises on the fallback
-        // lock; every later writer finds the marker and locks that instead. The
-        // files written here are idempotent ("write only if missing"), so the
-        // brief overlap possible while bootstrapping is harmless.
+        // files written here are idempotent ("write only if missing").
         let _write_lock = self.lock_writes()?;
         fs::create_dir_all(self.events_dir())?;
         fs::create_dir_all(self.projects_dir())?;
 
-        let marker_path = self.root.join(util::STORE_MARKER);
-        if !marker_path.exists() {
-            let marker = serde_json::json!({
-                "format": 1,
-                "created_at": util::now_rfc3339(),
-            });
-            fs::write(
-                &marker_path,
-                format!("{}\n", serde_json::to_string_pretty(&marker)?),
-            )?;
-        }
-
+        // `.gitignore` first: by the time `.mem` becomes visible the store must
+        // be fully initialised.
         let gitignore_path = self.root.join(".gitignore");
         if !gitignore_path.exists() {
             let mut file = OpenOptions::new()
@@ -261,6 +286,43 @@ impl MemStore {
             file.flush()?;
             file.unlock()?;
         }
+
+        // The marker is created *last* and atomically: write a sibling temp file
+        // and rename it into place (atomic within one directory). A reader that
+        // observes `.mem` therefore always observes a complete marker, never a
+        // half-written file, and the lock-target switch (bootstrap fallback →
+        // `.mem`) only becomes visible once the store is fully initialised. The
+        // window is one `rename`: writers started after this point lock `.mem`,
+        // while a process that began bootstrapping before it may still hold the
+        // fallback lock for the microseconds needed for the cleanup below.
+        // Callers should therefore still let the first `init` complete before
+        // starting concurrent writers (as documented).
+        let marker_path = self.root.join(util::STORE_MARKER);
+        if !marker_path.is_file() {
+            let temp_path = marker_temp_path(&self.root);
+            let marker = serde_json::json!({
+                "format": 1,
+                "created_at": util::now_rfc3339(),
+            });
+            let marker_content = format!("{}\n", serde_json::to_string_pretty(&marker)?);
+            if let Err(error) = fs::write(&temp_path, marker_content) {
+                let _ = fs::remove_file(&temp_path);
+                return Err(error.into());
+            }
+            if let Err(error) = fs::rename(&temp_path, &marker_path) {
+                let _ = fs::remove_file(&temp_path);
+                return Err(error.into());
+            }
+        }
+
+        // `.mem` is visible now, so this process's bootstrap fallback lock file
+        // will never be the lock target again: remove it while still holding the
+        // flock (unlinking an open lock file is safe on Unix; the removal is
+        // best-effort, e.g. a no-op on Windows because the handle is open), and
+        // clean up a `.mem.tmp` possibly left behind by an earlier crashed init.
+        let _ = fs::remove_file(fallback_lock_file_path(&self.root));
+        let _ = fs::remove_file(marker_temp_path(&self.root));
+
         Ok(())
     }
 
@@ -311,13 +373,20 @@ impl MemStore {
     /// to do in several separate steps (read the latest records → decide
     /// `Created`/`Modified` → write metadata → append).
     ///
-    /// **File work happens before the store-wide lock is taken.** Metadata
-    /// checks and the streaming SHA-256 are pure reads that can be slow (a large
-    /// file) or even unbounded, so they run unlocked; holding the store lock
-    /// during them would block every other writer. Only regular files are
-    /// accepted: a directory, FIFO or device would either fail or never reach
-    /// EOF, so it is rejected with `cannot record '<path>': not a regular file`
-    /// before it is opened for reading.
+    /// **File work happens before the store-wide lock is taken.** Opening and
+    /// streaming SHA-256 are pure reads that can be slow (a large file), so they
+    /// run unlocked; holding the store lock during them would block every other
+    /// writer. Each path is opened **exactly once** and validated through that
+    /// handle: on Unix the handle uses `O_NONBLOCK`, so a path that was swapped
+    /// for a FIFO cannot block the open forever, and the handle's metadata
+    /// decides whether the object being hashed is a regular file. Directories,
+    /// FIFOs and devices are rejected with `cannot record '<path>': not a
+    /// regular file`; a path that does not exist (at open time, or that vanishes
+    /// during the hash) is recorded as `Deleted` instead of failing the batch.
+    ///
+    /// Duplicate file identities in one batch are collapsed: after normalisation
+    /// only the first occurrence of a `file_name` is recorded, so passing
+    /// `a.txt a.txt` cannot produce two records that both claim to be `Created`.
     ///
     /// **Only the state transition happens under the lock:** metadata healing,
     /// the latest-records snapshot, the `Created`/`Modified` decision, and the
@@ -325,12 +394,12 @@ impl MemStore {
     /// stale snapshot, and a metadata write failure aborts the whole operation
     /// instead of being ignored.
     ///
-    /// For each path: a missing file records `Deleted` (size 0, empty hash); an
-    /// existing regular file is recorded as `Modified` when its normalised name is
-    /// already tracked, `Created` otherwise. `file_name` identity is normalised
-    /// with [`crate::util::normalize_file_name`], so paths outside the store and
-    /// outside any Git work tree keep their absolute form (callers can surface
-    /// their own warning for that case).
+    /// For each distinct path: a missing file records `Deleted` (size 0, empty
+    /// hash); an existing regular file is recorded as `Modified` when its
+    /// normalised name is already tracked, `Created` otherwise. `file_name`
+    /// identity is normalised with [`crate::util::normalize_file_name`], so paths
+    /// outside the store and outside any Git work tree keep their absolute form
+    /// (callers can surface their own warning for that case).
     pub fn record_file_event(
         &self,
         project: &str,
@@ -343,23 +412,33 @@ impl MemStore {
 
         // --- Unlocked pre-computation: file names, sizes and hashes. ---
         // `None` content means "the path does not exist" → a Deleted record.
+        let mut seen: BTreeSet<String> = BTreeSet::new();
         let mut pending: Vec<(String, Option<(u64, String)>)> = Vec::with_capacity(paths.len());
         for path in paths {
             let file_name = util::normalize_file_name(path, &self.root);
-            match fs::metadata(path) {
-                Ok(metadata) => {
-                    if !metadata.is_file() {
-                        return Err(format!(
-                            "cannot record '{}': not a regular file",
-                            path.display()
-                        )
-                        .into());
-                    }
-                    // Streaming hash (64 KiB chunks): a large file is never
-                    // loaded into memory and never holds the store lock.
-                    let (size, hash) = hash_file(path)?;
-                    pending.push((file_name, Some((size, hash))));
+            if !seen.insert(file_name.clone()) {
+                // The same identity already handled in this batch: keep the first.
+                continue;
+            }
+
+            let mut file = match open_for_recording(path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    pending.push((file_name, None));
+                    continue;
                 }
+                Err(error) => return Err(error.into()),
+            };
+            if !file.metadata()?.is_file() {
+                return Err(
+                    format!("cannot record '{}': not a regular file", path.display()).into(),
+                );
+            }
+            // Streaming hash (64 KiB chunks) through the already-open handle: a
+            // large file is never loaded into memory and never holds the store
+            // lock. If it disappears mid-read, record it as Deleted.
+            match hash_reader(&mut file) {
+                Ok((size, hash)) => pending.push((file_name, Some((size, hash)))),
                 Err(error) if error.kind() == ErrorKind::NotFound => {
                     pending.push((file_name, None));
                 }
@@ -1469,5 +1548,92 @@ mod tests {
         assert_eq!(event.files[0].size_bytes, 256 * 1024);
 
         holder.join().expect("holder thread must not panic");
+    }
+
+    /// The same file identity passed twice in one batch must produce a single
+    /// record (otherwise both would claim to be `Created`); a later call sees the
+    /// tracked file and records `Modified`.
+    #[test]
+    fn test_record_file_event_deduplicates_paths_within_one_batch() {
+        let (_tmp, store) = create_temp_store();
+        let project = "batch_dedup";
+        let file_path = store.root.join("data").join("a.txt");
+        fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        fs::write(&file_path, b"hello").unwrap();
+
+        // The `./` spelling normalises to the same identity as the plain path.
+        let dotted = file_path.parent().unwrap().join(".").join("a.txt");
+        let event = store
+            .record_file_event(
+                project,
+                "add twice",
+                "device-x",
+                "agent-x",
+                &[file_path.clone(), dotted, file_path.clone()],
+            )
+            .unwrap();
+        assert_eq!(
+            event.files.len(),
+            1,
+            "duplicate paths must collapse to one record: {:?}",
+            event.files
+        );
+        assert_eq!(event.files[0].action, "Created");
+        assert_eq!(event.files[0].file_name, "data/a.txt");
+        assert_eq!(store.read_project_files(project).unwrap().len(), 1);
+
+        // A subsequent normal call sees the tracked file and records Modified.
+        let modified = store
+            .record_file_event(
+                project,
+                "touch again",
+                "device-x",
+                "agent-x",
+                std::slice::from_ref(&file_path),
+            )
+            .unwrap();
+        assert_eq!(modified.files.len(), 1);
+        assert_eq!(modified.files[0].action, "Modified");
+        assert_eq!(modified.files[0].file_name, "data/a.txt");
+    }
+
+    /// `.mem` appears atomically and only once the store is fully initialised;
+    /// a bootstrap `init` also cleans up its fallback lock file and stale temps.
+    #[test]
+    fn test_init_creates_marker_atomically() {
+        let tmp = TestDir::new();
+        let store = MemStore::new(tmp.path.clone());
+        let marker_path = tmp.path.join(crate::util::STORE_MARKER);
+        let marker_temp = tmp.path.join(format!("{}.tmp", crate::util::STORE_MARKER));
+        let fallback_path = fallback_lock_file_path(&store.root);
+
+        // Simulate a crashed init: a stale temp file and no marker.
+        fs::write(&marker_temp, "{stale").unwrap();
+        assert!(!marker_path.exists());
+
+        store.init().unwrap();
+
+        // The marker is complete and parseable, and no temp file is left over.
+        assert!(marker_path.is_file());
+        assert!(!marker_temp.exists(), "init must not leave .mem.tmp behind");
+        let marker: serde_json::Value =
+            serde_json::from_str(fs::read_to_string(&marker_path).unwrap().trim()).unwrap();
+        assert_eq!(marker["format"].as_u64(), Some(1));
+        assert!(marker["created_at"].is_string());
+
+        // The bootstrap fallback lock file is gone, and `.mem` is the lock
+        // target (taking the store lock again must succeed).
+        assert!(
+            !fallback_path.exists(),
+            "init must clean up its fallback lock file: {}",
+            fallback_path.display()
+        );
+        drop(store.lock_writes().unwrap());
+
+        // Re-running init is idempotent: an existing marker is not rewritten.
+        let first_content = fs::read_to_string(&marker_path).unwrap();
+        store.init().unwrap();
+        assert_eq!(fs::read_to_string(&marker_path).unwrap(), first_content);
+        assert!(!marker_temp.exists());
     }
 }

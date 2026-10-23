@@ -1,5 +1,5 @@
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 
@@ -180,9 +180,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             let event = store.record_file_event(&project, &summary, &dev, &agent, &files)?;
 
             // Absolute identity is kept only for paths outside both the store and
-            // any git work tree; keep warning the user about those.
+            // any git work tree; keep warning the user about those. Check both
+            // forms: `Path::is_absolute` catches a Windows drive path
+            // (`C:/...`, which does not start with a slash), the prefix check
+            // catches Unix-style absolute paths.
             for file in &event.files {
-                if file.file_name.starts_with('/') {
+                if Path::new(&file.file_name).is_absolute() || file.file_name.starts_with('/') {
                     eprintln!(
                         "Warning: '{}' is outside the memory store and outside any git repository; \
                          recording it under its absolute path, which will not match on other devices.",

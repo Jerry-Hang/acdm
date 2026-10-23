@@ -128,9 +128,10 @@ pub fn resolve_conflicts(root: &Path) -> Result<ResolveReport, Box<dyn Error>> {
                     // upstream, so the resolved content equals HEAD. Git refuses
                     // to commit that ("No changes - did you forget to use
                     // `git add`?") and the commit must be dropped with
-                    // `git rebase --skip`; the clean worktree is what tells this
-                    // apart from a Git failure the resolver cannot act on.
-                    if rebase_active(root) && crate::git::git_worktree_clean(root)? {
+                    // `git rebase --skip`. Only *tracked* changes are relevant
+                    // here: an untracked scratch file in the store must not
+                    // disable the recovery.
+                    if rebase_active(root) && crate::git::git_worktree_clean_tracked(root)? {
                         if let Err(skip_error) = crate::git::git_rebase_skip(root) {
                             // `--skip` exits non-zero again when the rebase
                             // immediately stops on the next commit's conflict;
@@ -483,17 +484,33 @@ fn rebase_active(root: &Path) -> bool {
 }
 
 /// Paths that are still unmerged in the Git index.
+///
+/// Uses `git diff --name-only --diff-filter=U -z`: NUL-separated output contains
+/// the raw paths, with no status-code prefix and no quoting/escaping. Parsing
+/// `git status --porcelain` instead broke on paths with spaces or unusual
+/// characters, because Git quotes those (e.g. `UU "events/with space.jsonl"`),
+/// which also defeated the `.jsonl` suffix check.
 fn unresolved_files(root: &Path) -> Result<Vec<String>, Box<dyn Error>> {
     let output = Command::new("git")
         .current_dir(root)
-        .args(["status", "--porcelain"])
+        .args(["diff", "--name-only", "--diff-filter=U", "-z"])
         .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "git diff --name-only --diff-filter=U -z failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+
     let mut files = Vec::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let code = line.get(..2).unwrap_or("");
-        if matches!(code, "UU" | "AA" | "UD" | "DU" | "DD" | "AU" | "UA") {
-            files.push(line.get(3..).unwrap_or("").trim().to_string());
+    for raw in output.stdout.split(|&byte| byte == 0) {
+        if raw.is_empty() {
+            continue;
         }
+        // Repository paths are UTF-8 in practice; a lossy conversion keeps a
+        // non-UTF-8 path reportable instead of hiding it.
+        files.push(String::from_utf8_lossy(raw).into_owned());
     }
     Ok(files)
 }
@@ -1337,6 +1354,259 @@ mod tests {
             "working tree must be clean after the rebase:\n{}",
             String::from_utf8_lossy(&status)
         );
+    }
+
+    /// The empty-patch recovery must not depend on untracked files: a local
+    /// scratch file in the store (`?? untracked.txt`) made `git status
+    /// --porcelain` non-empty, so the empty patch was never skipped and
+    /// `resolve_conflicts` gave up. Only tracked changes may decide it.
+    #[test]
+    fn test_resolve_empty_patch_succeeds_with_untracked_file_present() {
+        let tmp = TestDir::new();
+        let root = tmp.path.clone();
+        let event_file = "events/2026-10.jsonl";
+        let base_line = format!(
+            "{}\n",
+            event_json("eid_a", "2026-10-22T00:00:00.000000000Z", "base")
+        );
+        let x_line = format!(
+            "{}\n",
+            event_json("eid_x", "2026-10-22T05:00:00.000000000Z", "x")
+        );
+        let w_line = format!(
+            "{}\n",
+            event_json("eid_w", "2026-10-22T06:00:00.000000000Z", "w")
+        );
+
+        // A bare remote seeded with one base event.
+        let bare = root.join("remote.git");
+        git_ok(&root, &["init", "--bare", "-q", bare.to_str().unwrap()]);
+        let seed = root.join("seed");
+        fs::create_dir_all(&seed).unwrap();
+        init_repo(&seed);
+        commit_file(&seed, event_file, &base_line, "base");
+        let branch = current_branch(&seed);
+        git_ok(&seed, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git_ok(&seed, &["push", "-q", "-u", "origin", &branch]);
+        git_ok(
+            &bare,
+            &["symbolic-ref", "HEAD", &format!("refs/heads/{}", branch)],
+        );
+
+        // The same shape as the pure-duplicate scenario: an empty patch first,
+        // then a normal conflict.
+        let local = root.join("local");
+        git_ok(
+            &root,
+            &[
+                "clone",
+                "-q",
+                bare.to_str().unwrap(),
+                local.to_str().unwrap(),
+            ],
+        );
+        configure_repo(&local);
+        git_ok(&local, &["config", "rebase.backend", "apply"]);
+        commit_file(
+            &local,
+            event_file,
+            &format!("{base_line}{x_line}{x_line}"),
+            "local duplicate",
+        );
+        commit_file(
+            &local,
+            event_file,
+            &format!("{base_line}{x_line}{x_line}{w_line}"),
+            "local add",
+        );
+        // A local, untracked scratch file: it makes `git status --porcelain`
+        // non-empty while the tracked worktree stays clean.
+        let untracked = local.join("untracked.txt");
+        fs::write(&untracked, "local scratch\n").unwrap();
+
+        let writer = root.join("writer");
+        git_ok(
+            &root,
+            &[
+                "clone",
+                "-q",
+                bare.to_str().unwrap(),
+                writer.to_str().unwrap(),
+            ],
+        );
+        configure_repo(&writer);
+        commit_file(
+            &writer,
+            event_file,
+            &format!("{base_line}{x_line}"),
+            "remote add",
+        );
+        git_ok(&writer, &["push", "-q"]);
+
+        // Divergent history: the pull stops on the duplicate commit's conflict,
+        // with the untracked file still present.
+        let pull = git(&local, &["pull", "--rebase"]);
+        assert!(
+            !pull.status.success(),
+            "pull --rebase must stop on the duplicate commit's conflict:\n{}",
+            String::from_utf8_lossy(&pull.stdout)
+        );
+        assert!(
+            rebase_state_present(&local),
+            "expected an active rebase after the conflicting pull"
+        );
+        let status = git_ok(&local, &["status", "--porcelain"]).stdout;
+        let status = String::from_utf8_lossy(&status);
+        assert!(
+            status.contains("UU events/2026-10.jsonl"),
+            "the pull must leave a conflicted event log:\n{}",
+            status
+        );
+        assert!(
+            status.contains("?? untracked.txt"),
+            "the untracked file must be present before resolving:\n{}",
+            status
+        );
+
+        // One call must succeed even though an untracked file is present.
+        let report = resolve_conflicts(&local)
+            .expect("an untracked file must not stop the empty-patch (rebase --skip) recovery");
+        assert_eq!(
+            report.total_conflicts_resolved, 2,
+            "one conflict per replayed commit, got: {:?}",
+            report
+        );
+        assert!(
+            !rebase_state_present(&local),
+            "rebase must be finished after resolve_conflicts"
+        );
+
+        let resolved = fs::read_to_string(local.join(event_file)).unwrap();
+        assert!(
+            !resolved.contains("<<<<<<<") && !resolved.contains(">>>>>>>"),
+            "markers left behind:\n{}",
+            resolved
+        );
+        let events: Vec<Event> = resolved
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("resolved line is an event"))
+            .collect();
+        let ids: Vec<&str> = events.iter().map(|event| event.event_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["eid_a", "eid_x", "eid_w"],
+            "the duplicate event must neither be lost nor duplicated: {:?}",
+            ids
+        );
+
+        // The unresolved scratch file must survive untouched and stay untracked.
+        assert_eq!(
+            fs::read_to_string(&untracked).unwrap(),
+            "local scratch\n",
+            "the untracked file must not be modified"
+        );
+        let status = git_ok(&local, &["status", "--porcelain"]).stdout;
+        assert_eq!(
+            String::from_utf8_lossy(&status).trim(),
+            "?? untracked.txt",
+            "only the scratch file may remain untracked:\n{}",
+            String::from_utf8_lossy(&status)
+        );
+        let tracked = git(&local, &["ls-files", "--error-unmatch", "untracked.txt"]);
+        assert!(
+            !tracked.status.success(),
+            "the untracked file must not be committed by the rebase"
+        );
+
+        let log = git_ok(&local, &["log", "--oneline"]).stdout;
+        assert_eq!(
+            String::from_utf8_lossy(&log).lines().count(),
+            3,
+            "expected base + remote + one replayed commit:\n{}",
+            String::from_utf8_lossy(&log)
+        );
+    }
+
+    /// `unresolved_files` must return raw paths: Git's porcelain output quotes
+    /// paths with spaces (`UU "docs/notes with space.txt"`), which used to keep the
+    /// quotes in the error message and defeat the `.jsonl` suffix check.
+    #[test]
+    fn test_resolve_non_jsonl_conflict_with_space_in_path() {
+        let tmp = TestDir::new();
+        let root = tmp.path.clone();
+        init_repo(&root);
+
+        let events_dir = root.join("events");
+        let docs_dir = root.join("docs");
+        fs::create_dir_all(&events_dir).unwrap();
+        fs::create_dir_all(&docs_dir).unwrap();
+        let space_path = docs_dir.join("notes with space.txt");
+        fs::write(root.join(".gitignore"), "").unwrap();
+        fs::write(&space_path, "base\n").unwrap();
+        fs::write(
+            events_dir.join("2026-10.jsonl"),
+            format!(
+                "{}\n",
+                event_json("eid_base", "2026-10-22T00:00:00.000000000Z", "base")
+            ),
+        )
+        .unwrap();
+        git_ok(&root, &["add", "-A"]);
+        git_ok(&root, &["commit", "-qm", "base"]);
+        let base_branch = current_branch(&root);
+
+        // Both branches rewrite the same space-containing file and the same event.
+        git_ok(&root, &["checkout", "-qb", "other"]);
+        fs::write(&space_path, "theirs\n").unwrap();
+        fs::write(
+            events_dir.join("2026-10.jsonl"),
+            format!(
+                "{}\n",
+                event_json("eid_other", "2026-10-22T02:00:00.000000000Z", "other")
+            ),
+        )
+        .unwrap();
+        git_ok(&root, &["add", "-A"]);
+        git_ok(&root, &["commit", "-qm", "other"]);
+
+        git_ok(&root, &["checkout", "-q", base_branch.as_str()]);
+        fs::write(&space_path, "ours\n").unwrap();
+        fs::write(
+            events_dir.join("2026-10.jsonl"),
+            format!(
+                "{}\n",
+                event_json("eid_main", "2026-10-22T01:00:00.000000000Z", "main")
+            ),
+        )
+        .unwrap();
+        git_ok(&root, &["add", "-A"]);
+        git_ok(&root, &["commit", "-qm", "main"]);
+        let _ = git(&root, &["rebase", "other"]);
+        assert!(root.join(".git").join("rebase-merge").exists());
+
+        let error = resolve_conflicts(&root)
+            .expect_err("a non-JSONL conflict must be reported as an error");
+        let message = error.to_string();
+        assert!(
+            message.contains("docs/notes with space.txt"),
+            "the error must contain the raw path, got: {}",
+            message
+        );
+        assert!(
+            !message.contains("\"docs/notes with space.txt\""),
+            "the path must not keep Git's status/porcelain quotes: {}",
+            message
+        );
+        assert!(
+            message.matches("docs/notes with space.txt").count() >= 2,
+            "the raw path must appear in both the non-JSONL list and the complete list: {}",
+            message
+        );
+
+        // The JSONL conflict itself was resolved and staged.
+        let resolved = fs::read_to_string(events_dir.join("2026-10.jsonl")).unwrap();
+        assert!(!resolved.contains("<<<<<<<"));
     }
 
     /// Regression for `.git` being a *file* (linked worktree / submodule): the old

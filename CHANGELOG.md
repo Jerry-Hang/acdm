@@ -3,6 +3,46 @@
 本文件记录 ACDM 的显著变更。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.1.3] - 2026-10-23
+
+第三轮独立外部审查（10/10 项 PASS，另报 5 项边缘 P2/P3）与 2 处文档不一致的修复版本。
+**无数据格式变更**：既有 store 不需要迁移，升级后所有修复自动生效。
+
+### 数据安全
+
+- **`record_file_event` 改为单句柄哈希**：每个路径只 `open` 一次，用同一个文件句柄做
+  `is_file()` 校验与流式 SHA-256（Unix 上以 `O_NONBLOCK` 打开，FIFO 即使被换入也不会
+  永久阻塞），彻底消除「检查对象 ≠ 被哈希对象」的 TOCTOU。
+- **并发删除/替换不再整体报错**：打开或哈希阶段遇到 `NotFound` 时按 `Deleted` 记录；
+  同一次 `mem add` 重复传入同一路径（如 `a.txt a.txt`）会在批次内去重，只产生一条记录
+  （此前会生成两条 `Created`）。
+- **首次 `init` 的 marker 原子可见**：`.mem` 改为最后一步写 `.mem.tmp` 后 `fs::rename`，
+  任何进程看到 `.mem` 即看到初始化完成的 store；bootstrap fallback 锁文件在结束后清理。
+
+### 冲突解决
+
+- **空补丁判定忽略未跟踪文件**：多步 rebase 中空补丁的 `git rebase --skip` 判定改用
+  `git status --porcelain --untracked-files=no`，store 根目录的本地临时文件不再让恢复失效。
+- **未解决文件列表改用 `git diff --name-only --diff-filter=U -z`**：按 NUL 切分，路径含空格/
+  特殊字符时不再带引号转义，错误信息与 `.jsonl` 判定都使用原始路径。
+
+### 协议与跨平台
+
+- **MCP `mem_add_event` 校验 `files[].file_name`**：空/空白文件名，以及规范化后等于 store
+  根目录的路径（如 `""`、`.`）会立即返回 `isError`，不再退化为把 store 根路径写进投影。
+- **CLI 绝对路径告警覆盖 Windows 盘符路径**：`Path::is_absolute()` 与 Unix 的 `/` 判断并用，
+  `C:/...` 形式的回退路径也会提示「不会跨设备匹配」。
+- **文档一致性修正**：ARCHITECTURE 的 README 模板恢复 `- **GitHub:** [<url>](<url>)` 链接
+  形式；README 与 DESIGN 补齐项目名 Windows 非法字符 `<>:"|?*` 的说明。
+
+### 测试
+
+- **100 → 105 个测试**（63 core + 16 CLI 集成 + 6 MCP 单元 + 20 MCP 集成），新增覆盖：
+  批次内重复路径去重、`init` 原子 marker 与 fallback 锁清理、含未跟踪文件时的空补丁 rebase
+  恢复、含空格路径的非 JSONL 冲突错误信息、MCP 空/根 `file_name` 拒绝。
+- `fmt` / `clippy -D warnings` / `rustdoc -D warnings` 全绿；release 二进制 `mem` 3.13 MB、
+  `mem-mcp` 2.86 MB。
+
 ## [0.1.2] - 2026-10-23
 
 第二轮独立外部审查（3 项 PARTIAL 残留 + 7 项新 P2/P3 发现）的修复版本。

@@ -413,7 +413,16 @@ fn handle_add_event(store: &MemStore, args: AddEventArgs) -> Result<Value, Strin
 
     let raw_files = args.files.unwrap_or_default();
     let mut files = Vec::with_capacity(raw_files.len());
+    // Normalised store root (with `/` separators, matching `normalize_file_name`),
+    // used to reject a file_name that denotes the store directory itself.
+    let root_identity = store.root.to_string_lossy().replace('\\', "/");
     for f in raw_files {
+        // An empty/whitespace file_name normalises to the process working
+        // directory and would be recorded as a bogus absolute path.
+        if f.file_name.trim().is_empty() {
+            return Err("Invalid file_name: must not be empty".to_string());
+        }
+
         let action = f
             .action
             .map(|action| action.as_str().to_string())
@@ -423,6 +432,12 @@ fn handle_add_event(store: &MemStore, args: AddEventArgs) -> Result<Value, Strin
         // store-relative identity so that `mem_query by=filename` (which indexes
         // relative names) and cross-device matching keep working.
         let file_name = normalize_file_name(Path::new(&f.file_name), &store.root);
+        // `"."`/`"./"` (and the store root itself) normalise to the store
+        // directory: that is not a file identity, so reject it instead of
+        // recording a directory as a tracked file.
+        if file_name == root_identity || Path::new(&file_name) == store.root.as_path() {
+            return Err("Invalid file_name: must not be the store root".to_string());
+        }
         files.push(FileRecord {
             file_id,
             file_name,
@@ -734,7 +749,7 @@ fn handle_request(store: &MemStore, request: JsonRpcRequest) -> Option<JsonRpcRe
                 },
                 "serverInfo": {
                     "name": "mem-mcp",
-                    "version": "0.1.2"
+                    "version": "0.1.3"
                 }
             });
             Some(success_response(id, result))

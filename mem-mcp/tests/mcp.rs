@@ -1184,3 +1184,105 @@ fn invalid_project_name_returns_is_error_immediately() {
         "an invalid project must not create a project directory"
     );
 }
+
+/// v0.1.3 review finding: `files[].file_name` must not be empty/whitespace and
+/// must not normalise to the store root (e.g. `"."`), which would record a
+/// directory as a tracked file. A normal file name still works.
+#[test]
+fn mem_add_event_rejects_empty_file_name() {
+    let env = TestEnv::new("empty-file-name");
+    // Run the server from the store root so `"."` normalises to the store itself.
+    let mut server = McpServer::start(&env.store, &env.store);
+    server.initialize();
+
+    let response = server.call_tool(
+        "mem_add_event",
+        json!({
+            "project": "demo",
+            "summary": "empty name",
+            "files": [{"file_name": ""}],
+        }),
+    );
+    assert!(
+        response.get("error").is_none(),
+        "an invalid file_name is a tool business error: {}",
+        response
+    );
+    assert_eq!(
+        response["result"]["isError"],
+        json!(true),
+        "an empty file_name must set isError: {}",
+        response
+    );
+    let text = tool_text(&response);
+    assert!(
+        text.contains("file_name") && text.contains("empty"),
+        "the error must mention the empty file_name: {}",
+        text
+    );
+
+    let response = server.call_tool(
+        "mem_add_event",
+        json!({
+            "project": "demo",
+            "summary": "store root name",
+            "files": [{"file_name": "."}],
+        }),
+    );
+    assert!(
+        response.get("error").is_none(),
+        "a store-root file_name is a tool business error: {}",
+        response
+    );
+    assert_eq!(
+        response["result"]["isError"],
+        json!(true),
+        "`.` must set isError instead of recording the store root: {}",
+        response
+    );
+    assert!(
+        tool_text(&response).contains("store root"),
+        "the error must explain the store-root rejection: {}",
+        tool_text(&response)
+    );
+
+    // Rejected calls must not have recorded anything.
+    assert!(
+        store_events(&env.store).is_empty(),
+        "rejected file names must not record events"
+    );
+
+    // A normal file name still works.
+    fs::write(env.store.join("regular.txt"), "content\n").expect("write regular file");
+    let response = server.call_tool(
+        "mem_add_event",
+        json!({
+            "project": "demo",
+            "summary": "regular file",
+            "files": [{"file_name": "regular.txt"}],
+        }),
+    );
+    assert!(
+        response.get("error").is_none(),
+        "a normal add failed: {}",
+        response
+    );
+    assert!(
+        response["result"].get("isError").is_none(),
+        "a normal add must not be an error result: {}",
+        response
+    );
+    assert_eq!(
+        store_events(&env.store).len(),
+        1,
+        "the normal add must record exactly one event"
+    );
+    let records = read_jsonl(&env.store.join("projects").join("demo").join("files.jsonl"));
+    assert_eq!(records.len(), 1, "expected one file record: {:?}", records);
+    assert_eq!(
+        records[0]["file_name"],
+        json!("regular.txt"),
+        "the store-relative identity must be preserved: {}",
+        records[0]
+    );
+}

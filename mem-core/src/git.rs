@@ -49,13 +49,20 @@ pub fn git_status_clean(root: &Path) -> Result<bool, Box<dyn Error>> {
     git_worktree_clean(root)
 }
 
-/// Whether the working tree is completely clean.
-///
-/// A rebase stopped on a now-empty patch has no staged, unstaged or untracked
-/// changes, which is how [`crate::resolve`] distinguishes "the commit became an
-/// empty patch" from "the resolver still has work to do".
+/// Whether the working tree is completely clean (tracked and untracked files).
 pub fn git_worktree_clean(root: &Path) -> Result<bool, Box<dyn Error>> {
     let stdout = run_git(root, &["status", "--porcelain"])?;
+    Ok(stdout.trim().is_empty())
+}
+
+/// Whether the *tracked* working tree is clean; untracked files are ignored.
+///
+/// The empty-patch recovery in [`crate::resolve`] must ignore untracked files: a
+/// local scratch file (`notes.bak`, `*.tmp`, …) says nothing about whether the
+/// replayed commit still has changes, and counting it would disable the
+/// `git rebase --skip` recovery for that commit.
+pub fn git_worktree_clean_tracked(root: &Path) -> Result<bool, Box<dyn Error>> {
+    let stdout = run_git(root, &["status", "--porcelain", "--untracked-files=no"])?;
     Ok(stdout.trim().is_empty())
 }
 
