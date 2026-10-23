@@ -128,10 +128,14 @@ pub fn resolve_conflicts(root: &Path) -> Result<ResolveReport, Box<dyn Error>> {
                     // upstream, so the resolved content equals HEAD. Git refuses
                     // to commit that ("No changes - did you forget to use
                     // `git add`?") and the commit must be dropped with
-                    // `git rebase --skip`. Only *tracked* changes are relevant
-                    // here: an untracked scratch file in the store must not
-                    // disable the recovery.
-                    if rebase_active(root) && crate::git::git_worktree_clean_tracked(root)? {
+                    // `git rebase --skip`.
+                    //
+                    // The empty-patch signature is an *index* identical to HEAD
+                    // (`git diff --cached --quiet`), not a clean working tree:
+                    // unstaged edits to unrelated tracked files (or untracked
+                    // scratch files) do not change the replayed patch and must
+                    // not disable the recovery.
+                    if rebase_active(root) && crate::git::git_index_clean(root)? {
                         if let Err(skip_error) = crate::git::git_rebase_skip(root) {
                             // `--skip` exits non-zero again when the rebase
                             // immediately stops on the next commit's conflict;
@@ -1524,6 +1528,192 @@ mod tests {
             String::from_utf8_lossy(&log).lines().count(),
             3,
             "expected base + remote + one replayed commit:\n{}",
+            String::from_utf8_lossy(&log)
+        );
+    }
+
+    /// The empty-patch recovery must not depend on *unrelated tracked* changes:
+    /// with the `apply` backend a dirty tracked file makes `git status
+    /// --porcelain` non-empty, which used to disable the `git rebase --skip`
+    /// recovery. Whether a replayed commit is empty is an index-vs-HEAD question
+    /// only.
+    #[test]
+    fn test_resolve_empty_patch_succeeds_with_dirty_unrelated_tracked_file() {
+        let tmp = TestDir::new();
+        let root = tmp.path.clone();
+        let event_file = "events/2026-10.jsonl";
+        let other_file = "other.txt";
+        let base_line = format!(
+            "{}\n",
+            event_json("eid_a", "2026-10-22T00:00:00.000000000Z", "base")
+        );
+        let x_line = format!(
+            "{}\n",
+            event_json("eid_x", "2026-10-22T05:00:00.000000000Z", "x")
+        );
+        let w_line = format!(
+            "{}\n",
+            event_json("eid_w", "2026-10-22T06:00:00.000000000Z", "w")
+        );
+
+        // A bare remote seeded with one base event.
+        let bare = root.join("remote.git");
+        git_ok(&root, &["init", "--bare", "-q", bare.to_str().unwrap()]);
+        let seed = root.join("seed");
+        fs::create_dir_all(&seed).unwrap();
+        init_repo(&seed);
+        commit_file(&seed, event_file, &base_line, "base");
+        let branch = current_branch(&seed);
+        git_ok(&seed, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git_ok(&seed, &["push", "-q", "-u", "origin", &branch]);
+        git_ok(
+            &bare,
+            &["symbolic-ref", "HEAD", &format!("refs/heads/{}", branch)],
+        );
+
+        // The local clone first commits an unrelated tracked file, then the same
+        // pure-duplicate + normal-conflict commits as the other empty-patch
+        // tests.
+        let local = root.join("local");
+        git_ok(
+            &root,
+            &[
+                "clone",
+                "-q",
+                bare.to_str().unwrap(),
+                local.to_str().unwrap(),
+            ],
+        );
+        configure_repo(&local);
+        // The apply backend still stops on an empty patch after conflict
+        // resolution (newer merge backends may drop it by themselves), so pinning
+        // it here exercises the `git rebase --skip` recovery deterministically.
+        git_ok(&local, &["config", "rebase.backend", "apply"]);
+        commit_file(&local, other_file, "tracked base\n", "unrelated file");
+        commit_file(
+            &local,
+            event_file,
+            &format!("{base_line}{x_line}{x_line}"),
+            "local duplicate",
+        );
+        commit_file(
+            &local,
+            event_file,
+            &format!("{base_line}{x_line}{x_line}{w_line}"),
+            "local add",
+        );
+
+        // Meanwhile another clone pushes the change that already contains X.
+        let writer = root.join("writer");
+        git_ok(
+            &root,
+            &[
+                "clone",
+                "-q",
+                bare.to_str().unwrap(),
+                writer.to_str().unwrap(),
+            ],
+        );
+        configure_repo(&writer);
+        commit_file(
+            &writer,
+            event_file,
+            &format!("{base_line}{x_line}"),
+            "remote add",
+        );
+        git_ok(&writer, &["push", "-q"]);
+
+        // Divergent history: the pull stops on the duplicate commit's conflict.
+        let pull = git(&local, &["pull", "--rebase"]);
+        assert!(
+            !pull.status.success(),
+            "pull --rebase must stop on the duplicate commit's conflict:\n{}",
+            String::from_utf8_lossy(&pull.stdout)
+        );
+        assert!(
+            rebase_state_present(&local),
+            "expected an active rebase after the conflicting pull"
+        );
+
+        // Make `other.txt` dirty without staging it: `git status --porcelain`
+        // now reports a tracked ` M other.txt` next to the conflicted JSONL,
+        // while the index (which decides the empty patch) is untouched.
+        fs::write(local.join(other_file), "tracked base\ndirty edit\n").unwrap();
+        let status =
+            String::from_utf8_lossy(&git_ok(&local, &["status", "--porcelain"]).stdout).to_string();
+        assert!(
+            status.contains(" M other.txt"),
+            "the unrelated tracked file must be dirty but unstaged before resolving:\n{}",
+            status
+        );
+        assert!(
+            status.contains("UU events/2026-10.jsonl"),
+            "the event log must still be conflicted before resolving:\n{}",
+            status
+        );
+
+        // A single call must recover: resolve the first real conflict, skip the
+        // empty patch that follows (even though `other.txt` is dirty), then
+        // resolve the next conflict and finish the rebase.
+        let report = resolve_conflicts(&local)
+            .expect("a dirty unrelated tracked file must not stop the empty-patch recovery");
+        assert_eq!(
+            report.total_conflicts_resolved, 2,
+            "one conflict per replayed commit, got: {:?}",
+            report
+        );
+        assert!(
+            !rebase_state_present(&local),
+            "rebase must be finished after resolve_conflicts"
+        );
+
+        // The event log is correct: the duplicate is neither lost nor duplicated.
+        let resolved = fs::read_to_string(local.join(event_file)).unwrap();
+        assert!(
+            !resolved.contains("<<<<<<<") && !resolved.contains(">>>>>>>"),
+            "markers left behind:\n{}",
+            resolved
+        );
+        let events: Vec<Event> = resolved
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("resolved line is an event"))
+            .collect();
+        let ids: Vec<&str> = events.iter().map(|event| event.event_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["eid_a", "eid_x", "eid_w"],
+            "the duplicate event must neither be lost nor duplicated: {:?}",
+            ids
+        );
+
+        // The unrelated edit must never be committed. Note: with the `apply`
+        // rebase backend Git's own `rebase --skip` resets the worktree before
+        // dropping the empty patch, so the *unstaged* edit itself is discarded by
+        // Git (verified on Git 2.56) — the resolver's guarantee is that the
+        // recovery completes and that no user change is silently committed.
+        let committed = git_ok(&local, &["show", &format!("HEAD:{}", other_file)]).stdout;
+        assert_eq!(
+            String::from_utf8_lossy(&committed),
+            "tracked base\n",
+            "the dirty edit must not be committed by the rebase"
+        );
+        let status = String::from_utf8_lossy(&git_ok(&local, &["status", "--porcelain"]).stdout)
+            .trim()
+            .to_string();
+        assert!(
+            status.is_empty() || status == " M other.txt",
+            "after the recovery the worktree may only contain the unrelated edit: {:?}",
+            status
+        );
+
+        // History: upstream base + remote change + replayed unrelated commit +
+        // one replayed event commit (the duplicate was skipped).
+        let log = git_ok(&local, &["log", "--oneline"]).stdout;
+        assert_eq!(
+            String::from_utf8_lossy(&log).lines().count(),
+            4,
+            "expected base + remote + unrelated + one replayed commit:\n{}",
             String::from_utf8_lossy(&log)
         );
     }

@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
@@ -393,6 +394,47 @@ struct AddEventArgs {
     files: Option<Vec<AddEventFileArg>>,
 }
 
+/// Key used for "is this a directory root" comparisons: `/`-separated path text.
+fn slash_identity(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+/// Every string form under which `path` may appear as a normalised identity.
+///
+/// `normalize_file_name` resolves paths lexically, but the process may have been
+/// started through a symlinked directory, so the canonical form is included too.
+fn directory_root_identities(path: &Path) -> Vec<String> {
+    let mut identities = vec![slash_identity(path)];
+    if let Ok(canonical) = path.canonicalize() {
+        let canonical = slash_identity(&canonical);
+        if identities.first() != Some(&canonical) {
+            identities.push(canonical);
+        }
+    }
+    identities
+}
+
+/// The enclosing git work tree of `cwd`, discovered through the git CLI.
+///
+/// `mem_core::util::find_git_root` is not re-exported by the crate root and
+/// mem-core is outside this task's write scope, so use the same probe git exposes.
+/// Any failure (no git binary, not a repository) simply means "no git anchor".
+fn discover_git_root(cwd: &Path) -> Option<PathBuf> {
+    let output = std::process::Command::new("git")
+        .current_dir(cwd)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(text))
+}
+
 fn handle_add_event(store: &MemStore, args: AddEventArgs) -> Result<Value, String> {
     // Fail fast on an unsafe project name instead of waiting for the append to
     // reject it: the dispatcher turns this error into an isError tool result.
@@ -413,9 +455,25 @@ fn handle_add_event(store: &MemStore, args: AddEventArgs) -> Result<Value, Strin
 
     let raw_files = args.files.unwrap_or_default();
     let mut files = Vec::with_capacity(raw_files.len());
-    // Normalised store root (with `/` separators, matching `normalize_file_name`),
-    // used to reject a file_name that denotes the store directory itself.
-    let root_identity = store.root.to_string_lossy().replace('\\', "/");
+
+    // Directory roots that must never be recorded as a file: when the normalised
+    // identity of a path would be empty (the root itself), `normalize_file_name`
+    // falls back to the absolute path. Compare against every root the normaliser
+    // knows about: the store, the working directory and the enclosing git work
+    // tree (`mem_core::util::find_git_root` is private, so git is asked directly).
+    let cwd = std::env::current_dir().ok();
+    let mut directory_roots = directory_root_identities(&store.root);
+    if let Some(ref cwd) = cwd {
+        directory_roots.extend(directory_root_identities(cwd));
+        if let Some(git_root) = discover_git_root(cwd) {
+            directory_roots.extend(directory_root_identities(&git_root));
+        }
+    }
+
+    // Batch de-duplication, matching the CLI's `record_file_event`: the same
+    // normalised identity (`./a.rs` vs `a.rs`) is recorded only once.
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+
     for f in raw_files {
         // An empty/whitespace file_name normalises to the process working
         // directory and would be recorded as a bogus absolute path.
@@ -432,11 +490,25 @@ fn handle_add_event(store: &MemStore, args: AddEventArgs) -> Result<Value, Strin
         // store-relative identity so that `mem_query by=filename` (which indexes
         // relative names) and cross-device matching keep working.
         let file_name = normalize_file_name(Path::new(&f.file_name), &store.root);
-        // `"."`/`"./"` (and the store root itself) normalise to the store
-        // directory: that is not a file identity, so reject it instead of
-        // recording a directory as a tracked file.
-        if file_name == root_identity || Path::new(&file_name) == store.root.as_path() {
-            return Err("Invalid file_name: must not be the store root".to_string());
+        // `"."`/`"./"` and the store/cwd/git root themselves normalise to an
+        // absolute directory root: that is not a file identity.
+        if directory_roots.contains(&file_name) {
+            return Err(
+                "Invalid file_name: must not be a directory root (store root, working directory \
+                 or enclosing git work tree)"
+                    .to_string(),
+            );
+        }
+        // An existing directory is never a file record, even when its normalised
+        // identity is relative (e.g. a tracked subdirectory).
+        if Path::new(&f.file_name).is_dir() {
+            return Err(format!(
+                "Invalid file_name: '{}' is a directory, not a file",
+                f.file_name
+            ));
+        }
+        if !seen.insert(file_name.clone()) {
+            continue;
         }
         files.push(FileRecord {
             file_id,
@@ -749,7 +821,7 @@ fn handle_request(store: &MemStore, request: JsonRpcRequest) -> Option<JsonRpcRe
                 },
                 "serverInfo": {
                     "name": "mem-mcp",
-                    "version": "0.1.3"
+                    "version": "0.1.4"
                 }
             });
             Some(success_response(id, result))

@@ -1286,3 +1286,147 @@ fn mem_add_event_rejects_empty_file_name() {
         records[0]
     );
 }
+
+/// v0.1.4 review finding: with the MCP process CWD inside an external git work
+/// tree, `"."` and the work-tree root normalise to a bare absolute path (not the
+/// store root). They must be rejected as directory roots instead of recording a
+/// whole directory as a tracked file.
+#[test]
+fn mem_add_event_rejects_directory_root_file_name() {
+    let env = TestEnv::new("directory-root");
+    let repo = env.base.join("external-repo");
+    fs::create_dir_all(repo.join("src")).expect("create repo dirs");
+    assert_git_ok(&git(&repo, &["init", "--quiet"]));
+
+    // Start the server from the external repository, not from the store.
+    let mut server = McpServer::start(&env.store, &repo);
+    server.initialize();
+
+    let repo_path = repo.to_str().expect("UTF-8 path").to_string();
+    for file_name in [".", repo_path.as_str()] {
+        let response = server.call_tool(
+            "mem_add_event",
+            json!({
+                "project": "demo",
+                "summary": "directory root",
+                "files": [{"file_name": file_name}],
+            }),
+        );
+        assert!(
+            response.get("error").is_none(),
+            "a directory-root file_name is a tool business error: {}",
+            response
+        );
+        assert_eq!(
+            response["result"]["isError"],
+            json!(true),
+            "directory-root file_name {:?} must set isError: {}",
+            file_name,
+            response
+        );
+        assert!(
+            tool_text(&response).contains("Invalid file_name"),
+            "the error must explain the invalid file_name: {}",
+            tool_text(&response)
+        );
+    }
+
+    assert!(
+        store_events(&env.store).is_empty(),
+        "rejected directory roots must not record events"
+    );
+
+    // A normal file inside the external repository still works and keeps its
+    // repository-relative identity.
+    fs::write(repo.join("src").join("main.rs"), "fn main() {}\n").expect("write main.rs");
+    let response = server.call_tool(
+        "mem_add_event",
+        json!({
+            "project": "demo",
+            "summary": "regular file",
+            "files": [{"file_name": "src/main.rs"}],
+        }),
+    );
+    assert!(
+        response.get("error").is_none(),
+        "the normal add failed: {}",
+        response
+    );
+    assert!(
+        response["result"].get("isError").is_none(),
+        "the normal add must succeed: {}",
+        response
+    );
+    let events = store_events(&env.store);
+    assert_eq!(
+        events.len(),
+        1,
+        "the normal add must record exactly one event: {:?}",
+        events
+    );
+    let files = events[0]["files"]
+        .as_array()
+        .unwrap_or_else(|| panic!("event has no files array: {}", events[0]));
+    assert_eq!(files.len(), 1, "expected one file record: {:?}", files);
+    assert_eq!(
+        files[0]["file_name"],
+        json!("src/main.rs"),
+        "repository-relative identity expected: {}",
+        events[0]
+    );
+}
+
+/// v0.1.4 review finding: duplicate file identities within one batch collapse to
+/// the first occurrence, matching the CLI (`./a/b.rs` and `a/b.rs` are the same
+/// file and must not be recorded twice).
+#[test]
+fn mem_add_event_deduplicates_file_names_within_one_batch() {
+    let env = TestEnv::new("batch-dedup");
+    // cwd = store, so `./a/b.rs` and `a/b.rs` normalise to the same identity.
+    let mut server = McpServer::start(&env.store, &env.store);
+    server.initialize();
+
+    let response = server.call_tool(
+        "mem_add_event",
+        json!({
+            "project": "demo",
+            "summary": "duplicate names",
+            "files": [
+                {"file_name": "a/b.rs"},
+                {"file_name": "./a/b.rs"},
+            ],
+        }),
+    );
+    assert!(
+        response.get("error").is_none(),
+        "the add failed: {}",
+        response
+    );
+    assert!(
+        response["result"].get("isError").is_none(),
+        "de-duplication must not be an error: {}",
+        response
+    );
+
+    let events = store_events(&env.store);
+    assert_eq!(events.len(), 1, "expected exactly one event: {:?}", events);
+    let files = events[0]["files"]
+        .as_array()
+        .unwrap_or_else(|| panic!("event has no files array: {}", events[0]));
+    assert_eq!(
+        files.len(),
+        1,
+        "duplicate file names must collapse to one: {}",
+        events[0]
+    );
+    assert_eq!(files[0]["file_name"], json!("a/b.rs"));
+
+    let records = read_jsonl(&env.store.join("projects").join("demo").join("files.jsonl"));
+    assert_eq!(
+        records.len(),
+        1,
+        "expected one projection record: {:?}",
+        records
+    );
+    assert_eq!(records[0]["file_name"], json!("a/b.rs"));
+}

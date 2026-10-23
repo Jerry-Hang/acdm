@@ -57,13 +57,44 @@ pub fn git_worktree_clean(root: &Path) -> Result<bool, Box<dyn Error>> {
 
 /// Whether the *tracked* working tree is clean; untracked files are ignored.
 ///
-/// The empty-patch recovery in [`crate::resolve`] must ignore untracked files: a
-/// local scratch file (`notes.bak`, `*.tmp`, …) says nothing about whether the
-/// replayed commit still has changes, and counting it would disable the
-/// `git rebase --skip` recovery for that commit.
+/// Kept for callers that need a worktree view; the empty-patch recovery in
+/// [`crate::resolve`] uses [`git_index_clean`] instead, because only the index
+/// (not the working tree) decides whether a replayed commit is an empty patch.
 pub fn git_worktree_clean_tracked(root: &Path) -> Result<bool, Box<dyn Error>> {
     let stdout = run_git(root, &["status", "--porcelain", "--untracked-files=no"])?;
     Ok(stdout.trim().is_empty())
+}
+
+/// Whether the Git index matches `HEAD` (no staged changes).
+///
+/// This is the authoritative *empty patch* signal for the rebase recovery in
+/// [`crate::resolve`]: `git rebase --continue` refuses a replayed commit whose
+/// resolved result has no staged changes relative to `HEAD` ("No changes - did
+/// you forget to use `git add`?"), so it must be dropped with `git rebase
+/// --skip`. Unstaged modifications to unrelated tracked files and untracked
+/// scratch files say nothing about the replayed patch and must not disable that
+/// recovery.
+///
+/// `git diff --cached --quiet` exits `0` when the index matches `HEAD`, `1` when
+/// staged changes exist (**a normal result, not an error**), and anything else is
+/// a real failure.
+pub fn git_index_clean(root: &Path) -> Result<bool, Box<dyn Error>> {
+    let output = Command::new("git")
+        .current_dir(root)
+        .args(["diff", "--cached", "--quiet"])
+        .output()?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(format!(
+                "git command 'git diff --cached --quiet' failed: {}",
+                stderr.trim()
+            )
+            .into())
+        }
+    }
 }
 
 /// Stage all changes in the repository (`git add -A`).

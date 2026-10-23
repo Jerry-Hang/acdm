@@ -389,7 +389,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "mem-cli"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "clap",
  "libc",
@@ -398,7 +398,7 @@ dependencies = [
 
 [[package]]
 name = "mem-core"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "chrono",
  "fs2",
@@ -413,7 +413,7 @@ dependencies = [
 
 [[package]]
 name = "mem-mcp"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "mem-core",
  "serde",

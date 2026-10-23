@@ -3,6 +3,36 @@
 本文件记录 ACDM 的显著变更。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.1.4] - 2026-10-23
+
+第四轮独立外部审查（7/7 项 PASS，另报 3 项边缘 P2/P3）的修复版本。
+**无数据格式变更**：既有 store 不需要迁移，升级后所有修复自动生效。
+
+### 跨平台与数据身份
+
+- **MCP `mem_add_event` 拒绝目录根锚点**：`file_name` 规范化后若等于 store 根、进程工作目录或
+  所在 Git 仓库根（例如外部仓库下传 `"."` 或仓库绝对路径），或原路径本身是目录，立即返回
+  `isError`，不再把整个目录写成一条文件记录。
+- **MCP 文件列表批次去重**：同一事件内重复的规范化 `file_name`（如 `a/b.rs` 与 `./a/b.rs`）
+  只保留第一条，与 CLI `record_file_event` 语义一致。
+- **保留仓库内符号链接文件的相对身份**：`normalize_file_name` 只对符号链接的**父目录**做
+  canonicalize，再把链接自身名字拼回；指向文件的仓内软链不再被解引用到仓库外而退化为绝对
+  路径（指向目录的软链保持原有 canonicalize 语义，store root/CWD 的解析不受影响）。
+
+### 冲突解决
+
+- **空补丁判定改用 index 干净**：`git rebase --skip` 的条件改为 `git diff --cached --quiet`
+  （index 与 HEAD 无 staged 差异）且无未解决文件；工作区中与本补丁无关文件的未暂存修改
+  （` M other.txt`）不再阻止空补丁恢复，同时保留脏工作区内容不被提交。
+
+### 测试
+
+- **105 → 109 个测试**（65 core + 16 CLI 集成 + 6 MCP 单元 + 22 MCP 集成），新增覆盖：
+  MCP 目录根 `file_name` 拒绝（外部 git 仓库 CWD）、MCP 批次重复文件名去重、仓库内文件型
+  符号链接身份保持、带无关脏文件的空补丁 rebase 恢复。
+- `fmt` / `clippy -D warnings` / `rustdoc -D warnings` 全绿；release 二进制 `mem` 3.13 MB、
+  `mem-mcp` 2.86 MB。
+
 ## [0.1.3] - 2026-10-23
 
 第三轮独立外部审查（10/10 项 PASS，另报 5 项边缘 P2/P3）与 2 处文档不一致的修复版本。

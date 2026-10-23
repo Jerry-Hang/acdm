@@ -229,12 +229,14 @@ fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
             .unwrap_or_else(|_| lexical_clean(path))
     };
 
-    // Walk from the full path up to the filesystem root until canonicalisation
-    // succeeds; `existing` ends up as the longest prefix that is really on disk.
+    // Walk from the full path up to the filesystem root until the deepest on-disk
+    // prefix is found. `symlink_metadata` is used instead of `fs::canonicalize`
+    // because the deepest existing component may itself be a symbolic link file:
+    // following it would move the identity outside the work tree.
     let mut existing: &Path = &absolute;
     let canonical = loop {
-        if let Ok(canonical) = fs::canonicalize(existing) {
-            break Some(canonical);
+        if let Ok(metadata) = fs::symlink_metadata(existing) {
+            break canonicalize_existing_keep_file_symlink(existing, &metadata);
         }
         match existing.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => existing = parent,
@@ -255,6 +257,38 @@ fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
         // Nothing on disk could be canonicalised (e.g. no usable parent at all):
         // keep the lexical result rather than failing.
         None => absolute,
+    }
+}
+
+/// Canonicalise an on-disk path while keeping a final symbolic link **to a file**
+/// as a name instead of following it.
+///
+/// A tracked symlink file (e.g. `repo/src/config.json -> ../dotfiles/config.json`)
+/// is part of the repository's identity: resolving it would point outside the work
+/// tree and `strip_prefix(git_root)` would fail, degrading the record to an
+/// absolute path that no other device can match. Symlinks **to directories** are
+/// ordinary path indirection (a symlinked store root, a symlinked parent
+/// directory), so they are still resolved; dangling file symlinks are kept by name
+/// as well, which is also what resolving them used to fall back to.
+fn canonicalize_existing_keep_file_symlink(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Option<PathBuf> {
+    if !metadata.file_type().is_symlink() {
+        return fs::canonicalize(path).ok();
+    }
+    if fs::metadata(path).is_ok_and(|target| target.is_dir()) {
+        return fs::canonicalize(path).ok();
+    }
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())?;
+    match fs::canonicalize(parent) {
+        Ok(canonical_parent) => path.file_name().map(|name| canonical_parent.join(name)),
+        // The parent is on disk (the link exists), so this only happens on an I/O
+        // error: fall back to the previous "follow the link" behaviour.
+        Err(_) => fs::canonicalize(path).ok(),
     }
 }
 
@@ -457,6 +491,75 @@ mod tests {
         assert_eq!(
             normalize_file_name(&link.join("src").join("a.rs"), &real),
             "src/a.rs"
+        );
+    }
+
+    /// A symbolic link *file* tracked inside a repository (for example
+    /// `repo/src/link.txt -> <outside>/shared-target.txt`) must keep its
+    /// repository-relative identity. Canonicalising the final component used to
+    /// follow the link outside the work tree and degrade the identity to an
+    /// absolute path that no other device can match.
+    #[cfg(unix)]
+    #[test]
+    fn test_normalize_file_name_preserves_symlink_file_inside_repo() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TestDir::new();
+        let repo = tmp.path.join("repo");
+        let store = tmp.path.join("store");
+        let outside = tmp.path.join("outside");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::create_dir_all(&store).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(store.join(STORE_MARKER), "{}\n").unwrap();
+        // `find_git_root` only needs a `.git` entry; a full repository is not needed.
+        fs::write(repo.join(".git"), "").unwrap();
+
+        let target = outside.join("shared-target.txt");
+        fs::write(&target, "shared\n").unwrap();
+        let link = repo.join("src").join("link.txt");
+        symlink(&target, &link).unwrap();
+
+        let name = normalize_file_name(&link, &store);
+        assert_eq!(
+            name, "src/link.txt",
+            "a tracked symlink file must keep its repository-relative identity"
+        );
+        assert!(
+            !name.starts_with('/'),
+            "identity degraded to an absolute path: {}",
+            name
+        );
+
+        // A regular file in the same repository keeps its relative identity too.
+        let regular = repo.join("src").join("regular.rs");
+        fs::write(&regular, "fn main() {}\n").unwrap();
+        assert_eq!(normalize_file_name(&regular, &store), "src/regular.rs");
+
+        // Symlinked directories are still path indirection: the existing
+        // symlinked-directory behaviour is unchanged.
+        let real = tmp.path.join("real");
+        fs::create_dir_all(real.join("src")).unwrap();
+        let dir_link = tmp.path.join("dir-link");
+        symlink(&real, &dir_link).unwrap();
+        assert_eq!(
+            normalize_file_name(&dir_link.join("src").join("a.rs"), &real),
+            "src/a.rs",
+            "symlinked-directory normalisation must stay as before"
+        );
+
+        // A file that exists below a symlinked directory is still resolved
+        // through the link (it is not a symlink itself).
+        let outside_dir = tmp.path.join("outside-dir");
+        fs::create_dir_all(&outside_dir).unwrap();
+        fs::write(outside_dir.join("f.txt"), "f\n").unwrap();
+        let link_dir = repo.join("linkdir");
+        symlink(&outside_dir, &link_dir).unwrap();
+        let through_dir = normalize_file_name(&link_dir.join("f.txt"), &store);
+        assert!(
+            !through_dir.contains("linkdir") && through_dir.ends_with("outside-dir/f.txt"),
+            "a file below a symlinked directory must still be resolved through the link, got: {}",
+            through_dir
         );
     }
 
