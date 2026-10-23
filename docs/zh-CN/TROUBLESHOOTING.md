@@ -236,7 +236,9 @@ ls -la /path/to/store /path/to/store/events
 - 没有内置的鉴权与加密：store 的安全性依赖 Git 远端权限与磁盘权限；项目名经过安全校验，文件路径与摘要仍需自行审查。
 - **项目名校验扩展（0.1.2）**：除路径安全外，项目名还拒绝 Windows 保留设备名（`CON` / `PRN` / `AUX` / `NUL` /
   `COM1`–`COM9` / `LPT1`–`LPT9`，大小写不敏感，`con.txt` 这类带扩展名形式也算）、以 `.` 结尾的名字，
-  以及 Windows 非法字符 `<>:"|?*`（错误信息含 "would be invalid on Windows"）。
-  原因：store 会在 Linux/macOS/Windows 设备之间同步，Windows 无法创建或 checkout 这些目录/名字。
-  历史数据里若已有这类项目名，先本地改名（`git mv projects/<old> projects/<new>`，并清理外部脚本引用）再同步；
-  已有事件记录不会被自动改写。
+  以及 Windows 非法字符 `<>:"|?*`（错误信息含 "would be invalid on Windows"），CLI 与 MCP 都会拒绝。
+  **若已有 store 中存在这类项目名**：在同步到 Windows 之前先改名——`git mv projects/<old> projects/<new>`，
+  并更新其记录里的 `project` 字段（以及事件行中的名字），或直接启用一个新的项目名；否则该 store 在 Windows 上 checkout 会失败。
+- `mem add` 只记录**普通文件**：FIFO、设备节点与目录会被拒绝，报 `Error: cannot record '<path>': not a regular file`（退出码 1）；
+  哈希在取 store 写锁之前计算，因此阻塞/特殊文件不会卡住其他写者。不存在的路径仍记录为 `Deleted`；
+  无法通过 FIFO 给 `mem add` 提供内容——请先把数据复制成普通文件。

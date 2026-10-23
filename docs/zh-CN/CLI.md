@@ -252,21 +252,21 @@ mem add [OPTIONS] --project <PROJECT> --summary <SUMMARY> <FILES>...
 | `-s` | `--summary <SUMMARY>` | **是** | — | 本次改动摘要 |
 | `-d` | `--device <DEVICE>` | 否 | 本机 hostname | 设备名；取不到 hostname 时依次回退 `$HOSTNAME`、`$COMPUTERNAME`、`localhost` |
 | `-a` | `--agent <AGENT>` | 否 | `human` | 记录者名称 |
-| — | `<FILES>...` | **是**（≥1 个） | — | 文件路径（相对 CWD 或绝对路径） |
+| — | `<FILES>...` | **是**（≥1 个） | — | 文件路径（相对 CWD 或绝对路径）；每个必须是**普通文件**（FIFO、设备节点与目录会被拒绝） |
 | — | `--path <DIR>` | 否 | 自动定位 | 全局参数：store 根目录 |
 | `-h` | `--help` | 否 | — | 打印帮助 |
 
 **行为**
 
-1. 读取该项目 `projects/<project>/files.jsonl` 中现有的 `file_name` 集合（每个文件名只取最新记录）。
-2. 对每个 `<FILES>`：
-   - 规范化文件身份 `file_name`：优先相对 store 根；文件在 store 外时相对最近的 git 仓库根；再退回相对 CWD；都无法相对化时保留**绝对路径**，并向 stderr 打印警告（已存在的前缀会做 `fs::canonicalize` 解析符号链接，不存在的尾部按词法拼接）；
-   - 文件存在：先确认是普通文件（目录、FIFO、字符/块设备等非普通输入会以 `not a regular file` 拒绝），再以 64 KiB 分块流式计算 SHA256，`size_bytes` = 字节数，`hash` = 十六进制摘要；若 `file_name` 已在该项目的已知文件名中则为 `Modified`，否则为 `Created`；
-   - 文件不存在：记为 `Deleted`，`size_bytes = 0`，`hash = ""`；
-   - 为每条记录生成独立的 `file_id`。
-3. 生成事件：`event_id` 形如 `YYYYMMDDHHMMSS_nanos9_pid5_counter4`（UTC）；`ts` 为固定宽度 UTC 纳秒 `YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ`。
-4. 若 `projects/<project>/meta.json` 读取失败（不存在），自动写入最小元数据：`description` 为 `"Project <name>"`、`github_url` 为 `null`、`created_at` 等于本次事件时间。
-5. 校验项目名；文件名规范化、普通文件检查与哈希计算都在**获取 store 写锁之前**完成（不持锁做慢 IO）。随后持 store 跨进程写锁完成元数据修复、最新记录快照与 `Created` / `Modified` 判定，并把事件行追加到 `events/YYYY-MM.jsonl`、把本次的每条 `FileRecord` 追加到 `projects/<project>/files.jsonl`（追加时另持排他文件锁）。
+1. **在碰 store 之前**先校验项目名（必须是单一安全路径组件；否则 `Error: invalid project name ...` 退出 1）。
+2. **锁外预计算**（这一阶段刻意安排在取 store 写锁之前，慢速文件 IO 不会阻塞其他写者）：对每个 `<FILES>`：
+   - 规范化文件身份 `file_name`：优先相对 store 根；文件在 store 外时相对最近的 git 仓库根；再退回相对 CWD；都无法相对化时保留**绝对路径**并向 stderr 打印警告。已存在的前缀会做 `fs::canonicalize` 解析符号链接，因此软链形式的 store/项目目录仍得到稳定身份；
+   - `stat` **用户传入的原始路径**：文件不存在 → `Deleted` 候选（`size_bytes = 0`、`hash = ""`）；存在但**不是普通文件**（FIFO、设备节点、目录）→ 以 `Error: cannot record '<path>': not a regular file` 中止；
+   - 普通文件以 64 KiB 分块**流式**计算 SHA-256（不会整文件读入内存），在这一阶段准备好 `size_bytes` 与 `hash`。
+3. 取 store 跨进程写锁，并在同一个临界区内把准备好的记录与 `files.jsonl` 最新快照相比较，判定 `Modified` / `Created`，再为每条记录生成独立的 `file_id`。因为哈希已提前算完，锁只覆盖快速的状态转换（核心 API `record_file_event`）：判定永远不会基于过期快照，元数据写失败会中止命令而不是被忽略，慢文件也不会卡住同机的 `compact` / `resolve` / `sync`。
+4. 生成事件：`event_id` 形如 `YYYYMMDDHHMMSS_nanos9_pid5_counter4`（UTC）；`ts` 为固定宽度 UTC 纳秒 `YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ`。
+5. 若 `projects/<project>/meta.json` 无法读取（缺失**或损坏**），在同一把锁内自动写入最小元数据：`description` 为 `"Project <name>"`、`github_url` 为 `null`、`created_at` 等于本次事件时间；被部分写坏的 store 因此在这里自愈。
+6. 把事件行追加到 `events/YYYY-MM.jsonl`，并把本次的每条 `FileRecord` 追加到 `projects/<project>/files.jsonl`；两次追加都在 store 跨进程写锁内完成。
 
 **真实输出（Created）**
 
@@ -351,10 +351,11 @@ Successfully recorded event: 20261022130629_780024199_23222_0001                
 
 **注意事项**
 
-- `-p/--project` 必须是单一安全路径组件：非空、不是 `.`/`..`、不含 `/` 或 `\`、无控制字符、≤200 字节；否则报 `Error: invalid project name ...` 并退出 1（在任何 store 操作之前校验）。0.1.2 起还拒绝 Windows 保留设备名（`CON` / `PRN` / `AUX` / `NUL` / `COM1`–`COM9` / `LPT1`–`LPT9`，大小写不敏感，`con.txt` 这类带扩展名的形式也算）与以 `.` 结尾的名字，避免 store 同步到 Windows 后无法创建目录。
 - `<FILES>` 是必填的位置参数，至少传一个；路径可以是相对 CWD，也可以是绝对路径。
-- 只接受普通文件：目录、FIFO、字符/块设备等会报 `Error: cannot record '<path>': not a regular file` 并退出 1（在读文件前检查，避免永不 EOF 的输入）。文件大小与 SHA256 在 store 写锁之外计算（64 KiB 分块流式），不会持锁做大文件 IO。
+- `-p/--project` 必须是单一安全路径组件：非空、不是 `.`/`..`、不含 `/` 或 `\`、无控制字符、≤200 字节；否则报 `Error: invalid project name ...` 并退出 1（在任何 store 操作之前校验）。0.1.2 起还拒绝 Windows 保留设备名（`CON` / `PRN` / `AUX` / `NUL` / `COM1`–`COM9` / `LPT1`–`LPT9`，大小写不敏感，`con.txt` 这类带扩展名的形式也算）、以 `.` 结尾的名字与 Windows 非法字符 `<>:"|?*`；CLI 与 MCP 都会拒绝，因此 Agent 传入的名字无法逃出 `projects/`，在 Unix 上创建的 store 也总能在 Windows 上 checkout。
 - `Created` / `Modified` 只根据 `file_name` 是否已出现在该项目的 `files.jsonl`（含历史记录，去重后）来判断；不比较内容 hash，因此对同一文件即使内容没变，第二次记录也会是 `Modified`。
+- SHA-256 在**取 store 锁之前**以 64 KiB 分块流式计算：记录大文件既不整文件读入内存，也不在慢 IO 期间持有 store 写锁；store 中只保存 hash 与字节数。
+- `add` 只记录**普通文件**：FIFO、设备节点或目录会以 `Error: cannot record '<path>': not a regular file` 被拒绝（退出码 1），因此阻塞/特殊文件永远不会卡住 store 写锁或产生无意义的 hash；不存在的路径仍会记录为 `Deleted`。
 - 文件不存在也会产生一条 `Deleted` 记录，路径仍然按同样规则规范化。
 - 记录的绝对路径不会跨设备匹配，只适合临时本地记录；跨设备场景请让文件位于 store 内或某个 git 仓库内（见 [MIGRATION.md](MIGRATION.md) 的旧绝对路径记录说明）。
 - 文件内容本身不入库，只保存路径、大小和 SHA256。

@@ -384,7 +384,7 @@ Project demo
 
 | 参数 | 类型 | 必填 | 默认 | 说明 |
 | --- | --- | --- | --- | --- |
-| `project` | string | **是** | — | 项目名；必须是单一安全路径组件（非空、非 `.`/`..`、不含 `/`、`\`、无控制字符、≤200 字节），0.1.2 起还拒绝 Windows 保留设备名（`CON`/`PRN`/`AUX`/`NUL`/`COM1`–`COM9`/`LPT1`–`LPT9`，大小写不敏感，`con.txt` 也算）、以 `.` 结尾的名字与 Windows 非法字符 `<>:"|?*` |
+| `project` | string | **是** | — | 项目名；**写入前校验**为单一安全路径组件（非空、非 `.`/`..`、不含 `/`、`\`、无控制字符、≤200 字节），0.1.2 起还拒绝 Windows 保留设备名（`CON`/`PRN`/`AUX`/`NUL`/`COM1`–`COM9`/`LPT1`–`LPT9`，大小写不敏感，`con.txt` 也算）、以 `.` 结尾的名字与 Windows 非法字符 `<>:"|?*` |
 | `summary` | string | **是** | — | 事件摘要 |
 | `device` | string | 否 | 本机 hostname | 设备名；`null`/空白字符串视为未给，回退 hostname（规则同 CLI） |
 | `agent` | string | 否 | `mcp-agent` | 记录者名称；空白字符串回退默认值 |
@@ -853,7 +853,7 @@ Agent 侧推荐节奏（`mem-mcp` 启动时不需要做任何额外初始化）�
 与 CLI 共用的注意事项：
 
 - **同一个 store**：CLI 的 `mem list` / `mem query` 能立即看到 MCP 写入的事件，反之亦然；两边是不同进程，靠 `fs2` 文件锁串行化追加写。
-- **并发写入**：多个 MCP 进程 / CLI 同时写是安全的（store 跨进程写锁串行化追加、`compact`、`resolve`、`sync`）；跨设备一致性仍靠显式 `mem_sync`。
+- **并发写入**：多个 MCP 进程 / CLI 同时写是安全的——追加（含原子的 `Created` / `Modified` 判定与元数据兜底）、`compact`、`render`、`init`、`resolve`、`sync` 都持 store 跨进程写锁，因此同机操作完全串行（读无锁）。这只保证同一台机器；不同设备通过 `mem_sync` 收敛。
 - **同步不自动**：写事件只落本地文件；跨设备可见需要显式调用 `mem_sync`（或 CLI `mem sync`）。
 - **命名一致**：`project` 直接映射为 `projects/<project>/` 目录名，必须是单一安全路径组件（非空、不含 `/`、`\`、控制字符、≤200 字节），与 CLI 侧保持一致；两边不要给同一项目起不同名字。
 - **文件身份一致**：两边都按同一套规则规范化 `file_name`，跨设备/跨入口才能互相匹配。
@@ -867,10 +867,10 @@ Agent 侧推荐节奏（`mem-mcp` 启动时不需要做任何额外初始化）�
 - **不做文件校验**：`mem_add_event` 不读取文件、不计算 SHA256，`size_bytes` / `hash` 完全由调用方提供，写入时不做校验；但 `action` 只接受 `Created` / `Modified` / `Deleted`。
 - **无分页**：`mem_query` / `mem_get_context` 一次性返回结果；大 store 下查询会较慢（每次重建内存索引）。
 - **上下文截断**：`mem_get_context` 只取最近 5 条事件，`mem_render` 时间线只取最近 10 条。
-- **同步前置条件**：`mem_sync` 要求 store 是 git 仓库、有可用 remote/upstream 与 git 用户身份；否则返回 `isError`。
+- **同步前置条件**：`mem_sync` 要求 store 是 git 仓库且可推送（remote + 凭据）；upstream 可选（没有时跳过 pull）。冲突与失败以 `isError` 结果返回，而不是 `-32603`。
 - **冲突解决只覆盖 JSONL**：`mem_resolve` 不处理 `meta.json` 等非 JSONL 文件的冲突（可能需要手工解决后 `git rebase --continue`）。
 - **协议版本固定**：固定返回 `2024-11-05`，不校验客户端版本、不支持批处理数组、不支持服务端主动通知。
-- **项目名已校验**：`project` 必须是单一安全路径组件（非空、非 `.`/`..`、不含 `/`、`\`、无控制字符、≤200 字节）；CLI 与 MCP 都会拒绝非法值。
+- **项目名已校验**：`project` 必须是单一安全路径组件（非空、非 `.`/`..`、不含 `/`、`\`、无控制字符、≤200 字节；Windows 保留设备名如 `CON`/`NUL`/`LPT1`/`con.txt`、尾点名字与 Windows 非法字符 `<>:"|?*` 同样被拒绝）；非法名在校验阶段就作为 `isError` 结果返回，因此 Agent 传入的名字无法逃出 `projects/`，也不会破坏 Windows checkout。
 
 ## 8. 相关文档
 

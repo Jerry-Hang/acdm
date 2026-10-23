@@ -74,7 +74,7 @@ ACDM 要在多台机器、多个 AI Agent 之间共享「项目记忆」。它�
 入口在 [`mem-cli/src/main.rs`](../../mem-cli/src/main.rs) 的 `Commands::Add` 分支：
 
 1. clap 解析全局 `--path` 与 `add` 参数；[`validate_project_name`](../../mem-core/src/storage.rs) 在任何 store 操作前拒绝不安全的项目名；[`resolve_store_root`](../../mem-core/src/util.rs) 得到 store 根目录。
-2. 构造 `MemStore`，用 `get_latest_files(project)` 取该项目当前的文件最新状态（用于判断 `Created` / `Modified`）。
+2. 构造 `MemStore` 并调用 [`record_file_event`](../../mem-core/src/storage.rs)。它分两个阶段：**取 store 写锁之前**完成每个路径的规范化、`stat` 与 64 KiB 分块流式 SHA-256（慢速文件 IO 不会持锁；FIFO、设备节点、目录等非普通文件会以 `not a regular file` 直接失败）；随后才取锁，并在同一个临界区里完成「读最新记录 → 判定 `Created` / `Modified` → 确保元数据 → 追加」（见 3.3），因此并发写者既不能使判定基于过期快照，也不能与元数据写入交错。
 3. 对每个待记录文件：
 
    | 步骤 | 行为 |
@@ -82,29 +82,30 @@ ACDM 要在多台机器、多个 AI Agent 之间共享「项目记忆」。它�
    | 路径规范化 | [`normalize_file_name(file_path, &store.root)`](../../mem-core/src/util.rs)；若结果仍是绝对路径（既不在 store、也不在任何 git 仓库、也不在 CWD 之下），向 stderr 打一条警告 |
    | 存在性 | 用**用户传入的原始路径**判断，不用规范化名 |
    | 不存在 | `action = Deleted`，`size_bytes = 0`，`hash = ""` |
-   | 存在 | [`hash_file(path)`](../../mem-core/src/models.rs) 以 64 KiB 分块流式计算 → `size_bytes = 字节数`，`hash` = SHA256 十六进制；文件不会整体读入内存 |
+   | 存在 | 必须是**普通文件**；[`hash_file(path)`](../../mem-core/src/models.rs) 以 64 KiB 分块流式计算 → `size_bytes` = 字节数，`hash` = SHA256 十六进制；文件不会整体读入内存。FIFO、设备节点与目录会被拒绝：`cannot record '<path>': not a regular file` |
    | action | 规范化名在「最新文件记录」里已存在 → `Modified`，否则 `Created` |
    | file_id | [`generate_id()`](../../mem-core/src/id_gen.rs) 生成 |
 
 4. 生成事件字段：`ts = now_rfc3339()`、`event_id = generate_id()`、`device` 取 `-d/--device` 或 [`default_device_name()`](../../mem-core/src/util.rs)、`agent` 由 clap 缺省为 `human`。
-5. 若 `read_project_meta(project)` 失败（`meta.json` 缺失或不可读），写一份最小 `meta.json`（`description = "Project <name>"`，`created_at = ts`）。这里用「meta 是否可读」而不是「目录是否存在」判断，避免 `mem render` 先创建了 `projects/<name>/` 目录、导致 `add` 误以为项目已完整初始化。
-6. 调用 [`MemStore::append_event`](../../mem-core/src/storage.rs) 落盘（见 3.4）。
+5. 元数据在同一把锁内兜底：若 `read_project_meta(project)` 失败（缺失**或损坏**），在同一临界区写一份最小 `meta.json`（`description = "Project <name>"`、`created_at = ts`）。元数据写失败会中止整个命令（不再被忽略）；`mem render` 先前创建了目录但未写元数据的项目也会在这里被自愈。
+6. 把事件与各 `FileRecord` 落盘（见 3.3）并打印摘要；规范化身份仍是绝对路径的文件照常收到 stderr 警告。
 
 ### 3.2 `mem_add_event`（MCP）
 
 入口在 [`mem-mcp/src/main.rs`](../../mem-mcp/src/main.rs) 的 `tools/call` 分发与 `handle_add_event`：
 
 1. 从 JSON-RPC `params.arguments` 反序列化 `AddEventArgs`：`project`、`summary` 必填；`device`、`agent`、`files` 可选。
-2. 缺省值：`device = default_device_name()`，`agent = "mcp-agent"`；每个文件 `action = "Modified"`、`size_bytes = 0`、`hash = ""`。
-3. 每个 `file_name` 同样经 `normalize_file_name` 规范化（MCP 客户端常传绝对路径），`file_id` 由 `generate_id()` 生成。
-4. 项目元数据检查用 `read_project_meta(&project).is_err()` 而不是目录存在性——这样即使 `mem render` 先创建了目录、尚未写 `meta.json`，也会补写元数据。
-5. `append_event` 落盘，返回文本：「`Event <event_id> recorded with <n> files`」。
+2. **先校验项目名**并立即返回工具级错误（`Invalid project: ...`）——在任何 ID 生成或目录创建之前，被拒绝的名字不会在磁盘上留下任何东西。
+3. 缺省值：`device = default_device_name()`，`agent = "mcp-agent"`；每个文件 `action = "Modified"`、`size_bytes = 0`、`hash = ""`。
+4. 每个 `file_name` 同样经 `normalize_file_name` 规范化（MCP 客户端常传绝对路径），`file_id` 由 `generate_id()` 生成。
+5. 调用 [`append_event_with_meta`](../../mem-core/src/storage.rs) 并带上兜底元数据：元数据检查/写入与两次追加在同一把 store 写锁内完成，元数据写失败会中止工具调用（不再被吞掉）；缺失或损坏的 `meta.json` 在同一临界区被自愈。
+6. 返回文本：「`Event <event_id> recorded with <n> files`」。
 
 ### 3.3 `append_event` 的落盘细节
 
-[`MemStore::append_event`](../../mem-core/src/storage.rs) 是唯一的写事件入口：
+[`MemStore::append_event`](../../mem-core/src/storage.rs) 是 [`append_event_with_meta`](../../mem-core/src/storage.rs) 的薄包装，后者是唯一的事件写入入口：
 
-1. 校验项目名，然后取 **store 写锁**，并在下面两次追加期间一直持有。
+1. 校验项目名，然后取 **store 写锁**，并在可选的元数据写入与下面两次追加期间一直持有。
 2. 计算分片名：`ts` 长度 ≥ 7 且第 5 个字节是 `-` → 取 `ts[..7]`（即 `YYYY-MM`）；否则退化为 `default`。
 3. 确保 `events/` 存在，以 `create + append` 打开 `events/YYYY-MM.jsonl`。
 4. `fs2` 排他锁 → `serde_json::to_string(event)` 序列化为**单行** JSON → `writeln!` 追加 → `flush` → 解锁。
@@ -340,7 +341,7 @@ YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ     # 恰好 30 字符，UTC
 
 | 操作 | 锁 | 说明 |
 | --- | --- | --- |
-| 所有 store 写操作：`MemStore::init`、`append_event`、`compact`、`resolve`、`sync`、`write_project_meta`、`write_project_readme` | store 跨进程写锁（`fs2`） | 有 `.mem` 标记时以标记文件为锁目标：**只读打开 + `flock`**，不写临时文件、不弄脏 Git 仓库，锁权限自然继承 store 文件权限；仅在还没有标记的首次 `init` 期间回退到按用户隔离的 `0600` 锁文件（放在 `$XDG_RUNTIME_DIR` 或系统临时目录，修复多用户共享机器上的 `EACCES`） |
+| 所有 store 写操作：`MemStore::init`、`append_event` / `append_event_with_meta` / `record_file_event`、`compact`、`resolve`、`sync`、`write_project_meta`、`write_project_readme` | store 跨进程写锁（`fs2`） | 有 `.mem` 标记时以标记文件为锁目标：**只读打开 + `flock`**，不写临时文件、不弄脏 Git 仓库，锁权限自然继承 store 文件权限；仅在还没有标记的首次 `init` 期间回退到按用户隔离的 `0600` 锁文件（放在 `$XDG_RUNTIME_DIR` 或系统临时目录，修复多用户共享机器上的 `EACCES`） |
 | `append_event`（事件行） | 额外 `fs2` 排他锁 | 打开 `events/<ym>.jsonl` 后加锁，写一行、`flush`、解锁 |
 | `append_event`（文件行） | 额外 `fs2` 排他锁 | 对 `files.jsonl` 同样处理 |
 | `resolve` 写回 | 额外 `fs2` 排他锁 | 重新整文件覆盖后 `git add` |
