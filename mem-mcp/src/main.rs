@@ -394,6 +394,12 @@ struct AddEventArgs {
 }
 
 fn handle_add_event(store: &MemStore, args: AddEventArgs) -> Result<Value, String> {
+    // Fail fast on an unsafe project name instead of waiting for the append to
+    // reject it: the dispatcher turns this error into an isError tool result.
+    if let Err(error) = mem_core::validate_project_name(&args.project) {
+        return Err(format!("Invalid project: {}", error));
+    }
+
     let event_id = generate_id();
     let ts = now_rfc3339();
     let device = args
@@ -426,19 +432,6 @@ fn handle_add_event(store: &MemStore, args: AddEventArgs) -> Result<Value, Strin
         });
     }
 
-    // Auto-create minimal project meta if it doesn't exist. Checking the file
-    // itself (not the directory) keeps working after `mem_render` created
-    // `projects/<name>/` without metadata.
-    if store.read_project_meta(&args.project).is_err() {
-        let meta = ProjectMeta {
-            name: args.project.clone(),
-            description: format!("Project {}", args.project),
-            github_url: None,
-            created_at: ts.clone(),
-        };
-        let _ = store.write_project_meta(&args.project, &meta);
-    }
-
     let file_count = files.len();
     let event = Event {
         event_id: event_id.clone(),
@@ -450,8 +443,18 @@ fn handle_add_event(store: &MemStore, args: AddEventArgs) -> Result<Value, Strin
         files,
     };
 
+    // Bootstrap minimal project metadata in the same critical section as the
+    // append: a metadata failure now aborts the tool call instead of being
+    // swallowed, while projects whose directory was created by `mem_render`
+    // without a meta.json are still healed correctly.
+    let meta = ProjectMeta {
+        name: event.project.clone(),
+        description: format!("Project {}", event.project),
+        github_url: None,
+        created_at: event.ts.clone(),
+    };
     store
-        .append_event(&event)
+        .append_event_with_meta(&event, Some(&meta))
         .map_err(|e| format!("Failed to append event: {}", e))?;
 
     Ok(mcp_text_content(format!(
@@ -716,14 +719,10 @@ fn handle_request(store: &MemStore, request: JsonRpcRequest) -> Option<JsonRpcRe
         ));
     }
 
-    // Protocol notifications: do not send any response
-    if request.method == "notifications/initialized"
-        || request.method == "initialized"
-        || request.method.starts_with("notifications/")
-    {
-        return None;
-    }
-
+    // JSON-RPC 2.0: a request without an id is a notification and gets no
+    // response, while a request *with* an id must always be answered. Unknown
+    // `notifications/*` methods therefore fall through to the -32601 branch
+    // instead of leaving the client waiting forever.
     let id = request.id?;
 
     match request.method.as_str() {
@@ -735,7 +734,7 @@ fn handle_request(store: &MemStore, request: JsonRpcRequest) -> Option<JsonRpcRe
                 },
                 "serverInfo": {
                     "name": "mem-mcp",
-                    "version": "0.1.1"
+                    "version": "0.1.2"
                 }
             });
             Some(success_response(id, result))

@@ -1,5 +1,5 @@
 use std::error::Error;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
@@ -7,9 +7,8 @@ use mem_core::compact::compact_project_files;
 use mem_core::render::write_project_readme;
 use mem_core::resolve::resolve_conflicts;
 use mem_core::{
-    default_device_name, generate_id, normalize_file_name, now_rfc3339, resolve_store_root,
-    sync_store, validate_project_name, Event, FileRecord, MemIndex, MemStore, ProjectMeta,
-    SyncOutcome, STORE_MARKER,
+    default_device_name, resolve_store_root, sync_store, validate_project_name, Event, MemIndex,
+    MemStore, SyncOutcome, STORE_MARKER,
 };
 
 #[derive(Parser)]
@@ -172,74 +171,25 @@ fn run() -> Result<(), Box<dyn Error>> {
 
             let root = resolve_store_root(cli.path.as_deref())?;
             let store = MemStore::new(root);
+            let dev = device.unwrap_or_else(default_device_name);
 
-            let existing_files = store.get_latest_files(&project).unwrap_or_default();
-            let mut file_records = Vec::new();
+            // One lock-protected core call replaces the old
+            // "read latest → decide Created/Modified → write meta → append"
+            // sequence: the decision can no longer be based on a stale snapshot
+            // and a metadata write failure aborts instead of being ignored.
+            let event = store.record_file_event(&project, &summary, &dev, &agent, &files)?;
 
-            for file_path in &files {
-                // File identity is normalised (store-relative, then git-relative) so
-                // the same file matches across devices; existence uses the raw path.
-                let file_name = normalize_file_name(file_path, &store.root);
-                if Path::new(&file_name).is_absolute() {
+            // Absolute identity is kept only for paths outside both the store and
+            // any git work tree; keep warning the user about those.
+            for file in &event.files {
+                if file.file_name.starts_with('/') {
                     eprintln!(
                         "Warning: '{}' is outside the memory store and outside any git repository; \
                          recording it under its absolute path, which will not match on other devices.",
-                        file_path.display()
+                        file.file_name
                     );
                 }
-
-                let exists = file_path.exists();
-                let (action, size_bytes, hash) = if !exists {
-                    ("Deleted".to_string(), 0u64, String::new())
-                } else {
-                    // Stream the file through SHA-256 (64 KiB chunks in mem-core):
-                    // `mem add` must never load a whole large file into memory.
-                    let (size, hash) = mem_core::hash_file(file_path).map_err(|e| {
-                        format!("Failed to hash file '{}': {}", file_path.display(), e)
-                    })?;
-                    let is_known = existing_files.iter().any(|f| f.file_name == file_name);
-                    let act = if is_known { "Modified" } else { "Created" };
-                    (act.to_string(), size, hash)
-                };
-
-                let file_id = generate_id();
-                file_records.push(FileRecord {
-                    file_id,
-                    file_name,
-                    action,
-                    size_bytes,
-                    hash,
-                });
             }
-
-            let ts = now_rfc3339();
-            let event_id = generate_id();
-            let dev_name = device.unwrap_or_else(default_device_name);
-
-            let event = Event {
-                event_id,
-                ts: ts.clone(),
-                device: dev_name,
-                agent,
-                project: project.clone(),
-                summary,
-                files: file_records,
-            };
-
-            // Check the metadata itself, not the directory: `mem render` may
-            // already have created `projects/<name>/`, which would otherwise make
-            // `add` believe the project was fully initialised.
-            if store.read_project_meta(&project).is_err() {
-                let meta = ProjectMeta {
-                    name: project.clone(),
-                    description: format!("Project {}", project),
-                    github_url: None,
-                    created_at: ts,
-                };
-                store.write_project_meta(&project, &meta)?;
-            }
-
-            store.append_event(&event)?;
 
             println!("Successfully recorded event: {}", event.event_id);
             println!("  Project:   {}", event.project);

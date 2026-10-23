@@ -3,6 +3,56 @@
 本文件记录 ACDM 的显著变更。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.1.2] - 2026-10-23
+
+第二轮独立外部审查（3 项 PARTIAL 残留 + 7 项新 P2/P3 发现）的修复版本。
+**无数据格式变更**：既有 store 不需要迁移，升级后所有修复自动生效。
+
+### 数据安全与并发
+
+- **`mem render` / `MemStore::init` 现在持全库写锁**：README 再生成不会在 `mem sync` 的
+  commit → `pull --rebase` 之间弄脏工作区（此前与 ARCHITECTURE / DESIGN 的声明不一致）。
+- **写锁锁目标改进**：`.mem` 标记存在时直接以只读方式 `flock` 它（不写临时文件、不污染 Git、
+  天然按 store 文件权限隔离）；无标记时回退到运行时/临时目录下**按用户隔离、0600 权限**的
+  锁文件，修复多用户共享机上的 `EACCES`。
+- **新增原子核心 API**：`append_event_with_meta` 与 `record_file_event`——`mem add` 的
+  「读最新文件 → 判 Created/Modified → 初始化 meta → 追加事件」现在在**同一把锁内**完成，
+  消除并发 `Created` 误判与 meta 覆写；meta.json 缺失或损坏都会在持锁路径内自愈。
+- **MCP `mem_add_event` 先校验项目名再动手**，并且不再吞掉 meta 写入错误（`let _ =` 已移除），
+  非法项目立即以 `isError` 返回且不在磁盘留下任何目录。
+
+### 冲突解决
+
+- **多步 rebase 空补丁自动跳过**：某个被重放提交在去重后变成空补丁时，resolver 自动执行
+  `git rebase --skip` 继续推进，而不是以 "No changes" 中断（混合空补丁/正常冲突的多提交
+  rebase 一次 `mem resolve` 完成）。
+- **支持 `git worktree` / submodule**（`.git` 为文件）：rebase 状态与暂存判断改用
+  `git rev-parse --git-path` / `--git-dir`，不再假设 `.git` 是目录；`git add` 失败从警告
+  改为硬错误（避免掩盖 `rebase --continue` 必败的真因）。
+- **compact 排序语义写入文档**：增量投影与 resolve 遵循物理追加顺序；`compact` 重放按事件
+  `ts`（再 `event_id`）排序并 last-write-wins，这是有意的设计权衡。
+
+### 跨平台与协议
+
+- **项目名跨平台加固**：拒绝 Windows 保留设备名（`CON`、`PRN`、`AUX`、`NUL`、`COM1`–`COM9`、
+  `LPT1`–`LPT9`，大小写不敏感，含 `con.txt` 形式）与以 `.` 结尾的名字，避免 Unix 创建的项目
+  在 Windows 上 checkout 失败。
+- **项目名拒绝 Windows 非法字符**：除保留设备名与尾点外，`<>:"|?*` 也会在任意平台上被拒绝，避免 Unix 上建出的项目名在 Windows 检出失败。
+- **`mem add` 不再持锁做慢 IO，并拒绝非普通文件**：文件哈希移到获取 store 写锁之前完成；FIFO、设备节点、目录等非普通文件直接报错（`not a regular file`），因此 `mem add /dev/zero` 之类输入不会长期占用全库写锁、阻塞其它写操作（0.1.2 复验发现的安全侧加固）。
+- **MCP JSON-RPC 通知语义修正**：无 `id` 的消息仍是 Notification（不响应）；**带 `id` 的
+  `notifications/*` 是普通 Request**，现在返回 `-32601 Method not found` 而不是被静默丢弃
+  （此前客户端会永久等待该 `id` 的响应）。
+- **文档统一**：CLI 与 MCP 的同步提交信息统一为 `Auto-sync from <device> at <ts>`；
+  写锁覆盖范围、排序语义、项目名校验规则与 worktree 支持同步更新到中英文文档。
+
+### 测试
+
+- **84 → 100 个测试**（59 core + 16 CLI 集成 + 6 MCP 单元 + 19 MCP 集成），新增覆盖：
+  纯重复/空补丁多提交 rebase（pin apply backend，附 GIT_TRACE2 证据）、`git worktree` rebase
+  冲突解决、Windows 保留名与尾点项目名（core + CLI）、并发 meta 初始化、损坏 meta 自愈、
+  `record_file_event` 三种动作、`render` 与全库锁互斥、MCP 带 id 通知与非法项目即时 `isError`；
+  以及非普通文件拒绝（FIFO/设备/目录）与 Windows 非法字符项目名（`<>:"|?*`）的拒绝。
+
 ## [0.1.1] - 2026-10-23
 
 针对独立外部代码审查（15 项发现，含 2 个 P0）的安全与健壮性加固版本。

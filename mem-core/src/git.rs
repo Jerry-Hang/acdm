@@ -46,6 +46,15 @@ pub fn git_add_remote(root: &Path, name: &str, url: &str) -> Result<(), Box<dyn 
 
 /// Check if git working directory is clean (no uncommitted or untracked changes).
 pub fn git_status_clean(root: &Path) -> Result<bool, Box<dyn Error>> {
+    git_worktree_clean(root)
+}
+
+/// Whether the working tree is completely clean.
+///
+/// A rebase stopped on a now-empty patch has no staged, unstaged or untracked
+/// changes, which is how [`crate::resolve`] distinguishes "the commit became an
+/// empty patch" from "the resolver still has work to do".
+pub fn git_worktree_clean(root: &Path) -> Result<bool, Box<dyn Error>> {
     let stdout = run_git(root, &["status", "--porcelain"])?;
     Ok(stdout.trim().is_empty())
 }
@@ -91,7 +100,11 @@ pub fn git_has_upstream(root: &Path) -> Result<bool, Box<dyn Error>> {
 }
 
 /// Resolve a path inside the repository's git directory (`git rev-parse --git-path`).
-fn git_path(root: &Path, name: &str) -> Result<PathBuf, Box<dyn Error>> {
+///
+/// `git rev-parse --git-path` is worktree-aware: in a linked worktree or a
+/// submodule it resolves the path inside the *per-worktree* git directory
+/// instead of naively joining `<root>/.git`.
+pub(crate) fn git_path(root: &Path, name: &str) -> Result<PathBuf, Box<dyn Error>> {
     let output = run_git(root, &["rev-parse", "--git-path", name])?;
     let path = PathBuf::from(output.trim());
     Ok(if path.is_absolute() {
@@ -99,6 +112,22 @@ fn git_path(root: &Path, name: &str) -> Result<PathBuf, Box<dyn Error>> {
     } else {
         root.join(path)
     })
+}
+
+/// Whether `root` is a Git repository.
+///
+/// Uses `git rev-parse --git-dir`, which also succeeds when `.git` is a *file*
+/// (a linked worktree or a submodule) and therefore works in every checkout
+/// layout, unlike checking `root.join(".git").is_dir()`.
+pub fn git_is_repo(root: &Path) -> bool {
+    match Command::new("git")
+        .current_dir(root)
+        .args(["rev-parse", "--git-dir"])
+        .output()
+    {
+        Ok(output) => output.status.success(),
+        Err(_) => false,
+    }
 }
 
 /// Whether the repository is in a conflicted state (unmerged entries, conflict
@@ -135,10 +164,20 @@ pub fn git_has_conflicts(root: &Path) -> Result<bool, Box<dyn Error>> {
     Ok(false)
 }
 
-/// Continue rebase after resolving conflicts (`git rebase --continue`).
+/// Resume a rebase after resolving conflicts (`git rebase --continue`).
 /// Uses non-interactive editor to prevent blocking.
 pub fn git_rebase_continue(root: &Path) -> Result<(), Box<dyn Error>> {
     run_git_with_env(root, &["rebase", "--continue"], &[("GIT_EDITOR", "true")])?;
+    Ok(())
+}
+
+/// Drop the commit currently being replayed (`git rebase --skip`).
+///
+/// Needed when conflict resolution produced a patch with no changes: such a
+/// commit can never be committed (git says "No changes - did you forget to use
+/// `git add`?"), so it has to be skipped for the rebase to finish.
+pub fn git_rebase_skip(root: &Path) -> Result<(), Box<dyn Error>> {
+    run_git_with_env(root, &["rebase", "--skip"], &[("GIT_EDITOR", "true")])?;
     Ok(())
 }
 

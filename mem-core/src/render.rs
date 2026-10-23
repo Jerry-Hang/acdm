@@ -112,8 +112,15 @@ pub fn render_project_readme(store: &MemStore, project: &str) -> Result<String, 
     Ok(md)
 }
 
-/// Render and write `README.md` to `projects/<name>/README.md` with exclusive file lock.
+/// Render and write `README.md` to `projects/<name>/README.md`.
+///
+/// Holds the store-wide write lock for the whole render + write. The generated
+/// README lives inside the Git work tree, and `sync_store` commits then pulls
+/// with `--rebase`, so writing it outside that lock could dirty the tree in the
+/// middle of a rebase. `render_project_readme` is read-only and never re-acquires
+/// the lock, so calling it here cannot dead-lock.
 pub fn write_project_readme(store: &MemStore, project: &str) -> Result<(), Box<dyn Error>> {
+    let _write_lock = store.lock_writes()?;
     let md = render_project_readme(store, project)?;
     let proj_dir = store.project_dir(project);
     std::fs::create_dir_all(&proj_dir)?;
@@ -331,5 +338,56 @@ mod tests {
             "normal summaries stay readable: {:?}",
             bullets
         );
+    }
+
+    /// `write_project_readme` writes into the Git work tree, so it must hold the
+    /// store-wide write lock for the whole operation; the old implementation
+    /// only locked the README file itself and could dirty the work tree during a
+    /// `sync_store` commit → pull --rebase window.
+    #[test]
+    fn test_write_project_readme_waits_for_store_lock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let tmp = TestDir::new();
+        let store = MemStore::new(tmp.path.clone());
+        store.init().unwrap();
+
+        // Thread A holds the store-wide write lock for 400 ms.
+        let holder_root = tmp.path.clone();
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let store = MemStore::new(holder_root);
+            let guard = store.lock_writes().expect("acquire store lock");
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(400));
+            drop(guard);
+        });
+
+        // Thread B renders and writes only after A has signalled that it holds
+        // the lock; it must then wait for A to release it.
+        let writer_root = tmp.path.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            locked_rx.recv().expect("holder must signal");
+            let store = MemStore::new(writer_root);
+            write_project_readme(&store, "blocked-project").expect("write readme");
+            done_tx.send(()).unwrap();
+        });
+
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(150)).is_err(),
+            "write_project_readme must wait for the store-wide write lock"
+        );
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("write must finish once the lock is released");
+
+        holder.join().expect("holder thread must not panic");
+        writer.join().expect("writer thread must not panic");
+        assert!(store
+            .project_dir("blocked-project")
+            .join("README.md")
+            .is_file());
     }
 }

@@ -8,8 +8,9 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 /// Path of the `mem` binary built by cargo for this test run.
 const MEM_BIN: &str = env!("CARGO_BIN_EXE_mem");
@@ -68,6 +69,40 @@ fn run(cwd: &Path, args: &[&str]) -> Output {
         .args(args)
         .output()
         .expect("failed to run the mem binary")
+}
+
+/// Run the `mem` binary, failing instead of hanging if it never exits.
+///
+/// Needed for the non-regular-file test: opening a FIFO with no writer blocks
+/// forever, and a blocking child would hang the whole test binary (std has no
+/// built-in `wait_timeout` without extra dependencies).
+fn run_with_timeout(cwd: &Path, args: &[&str], timeout: Duration) -> Output {
+    let mut child = mem(cwd)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn the mem binary");
+    let started = Instant::now();
+    loop {
+        match child.try_wait().expect("failed to wait for the mem binary") {
+            Some(_) => return child.wait_with_output().expect("collect mem output"),
+            None if started.elapsed() > timeout => {
+                let _ = child.kill();
+                let output = child
+                    .wait_with_output()
+                    .expect("collect output of the timed-out mem binary");
+                panic!(
+                    "mem {:?} did not exit within {:?}\nstdout:\n{}\nstderr:\n{}",
+                    args,
+                    timeout,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
 }
 
 fn stdout(output: &Output) -> String {
@@ -862,5 +897,198 @@ fn add_streams_eight_megabyte_file() {
         records[0].contains(&format!("\"hash\":\"{}\"", expected)),
         "the streaming hash must match the independent SHA-256: {}",
         records[0]
+    );
+}
+
+/// Second-round review: project names that Windows cannot represent (DOS device
+/// names, trailing dot) must be rejected on every platform so a store stays
+/// portable across devices.
+#[test]
+fn add_rejects_windows_reserved_and_trailing_dot_project_names() {
+    let tmp = TempDir::new("windows-names");
+    let store = tmp.init_store("store");
+    fs::write(store.join("tracked.txt"), "content\n").expect("write tracked file");
+
+    for name in ["CON", "nul", "com1", "con.txt", "demo."] {
+        let output = run(
+            &store,
+            &["add", "-p", name, "-s", "must fail", "tracked.txt"],
+        );
+        assert!(
+            !output.status.success(),
+            "project name {name:?} must be rejected"
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "project name {name:?} must exit 1"
+        );
+        let err = stderr(&output);
+        assert!(
+            err.contains("invalid project name"),
+            "error must name the invalid project for {name:?}: {err}"
+        );
+        assert!(
+            err.contains("Windows"),
+            "the error for {name:?} must explain the Windows rule: {err}"
+        );
+    }
+
+    // Rejected names must not create any project directory (not even `demo`).
+    let projects = fs::read_dir(store.join("projects")).expect("read projects dir");
+    assert_eq!(
+        projects.count(),
+        0,
+        "rejected project names must not create directories"
+    );
+    assert!(!store.join("projects").join("demo").exists());
+}
+
+/// v0.1.2 verifier finding: characters Windows forbids in file names
+/// (`<>:"|?*`) must be rejected in project names on every platform, otherwise a
+/// synchronized store cannot be checked out on Windows.
+#[test]
+fn add_rejects_windows_invalid_chars_in_project_names() {
+    let tmp = TempDir::new("windows-invalid-chars");
+    let store = tmp.init_store("store");
+    fs::write(store.join("tracked.txt"), "content\n").expect("write tracked file");
+
+    for name in ["a:b", "a*b", "a?b", "a|b", "a\"b", "a<b", "a>b"] {
+        let output = run(
+            &store,
+            &["add", "-p", name, "-s", "must fail", "tracked.txt"],
+        );
+        assert!(
+            !output.status.success(),
+            "project name {name:?} must be rejected"
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "project name {name:?} must exit 1"
+        );
+        let err = stderr(&output);
+        assert!(
+            err.contains("invalid project name"),
+            "error must name the invalid project for {name:?}: {err}"
+        );
+        assert!(
+            err.contains("Windows"),
+            "the error for {name:?} must explain the Windows rule: {err}"
+        );
+    }
+
+    let projects = fs::read_dir(store.join("projects")).expect("read projects dir");
+    assert_eq!(
+        projects.count(),
+        0,
+        "rejected project names must not create directories"
+    );
+}
+
+/// v0.1.2 verifier finding: `mem add` must reject FIFOs/devices (and other
+/// non-regular files) instead of trying to hash them — opening a FIFO would
+/// block forever — while regular files keep working.
+#[test]
+fn add_rejects_non_regular_files() {
+    let tmp = TempDir::new("non-regular");
+    let store = tmp.init_store("store");
+    fs::write(store.join("regular.txt"), "regular content\n").expect("write regular file");
+
+    let events_before = event_lines(&store).len();
+
+    // A directory is not a regular file either and must be rejected everywhere.
+    fs::create_dir_all(store.join("some-dir")).expect("create directory");
+    let dir_output = run_with_timeout(
+        &store,
+        &["add", "-p", "demo", "-s", "dir", "-a", "test", "some-dir"],
+        Duration::from_secs(10),
+    );
+    assert!(
+        !dir_output.status.success(),
+        "adding a directory must fail: stdout:\n{}\nstderr:\n{}",
+        stdout(&dir_output),
+        stderr(&dir_output)
+    );
+    assert!(
+        stderr(&dir_output).contains("not a regular file"),
+        "directory error must explain regular files: {}",
+        stderr(&dir_output)
+    );
+    assert_eq!(
+        event_lines(&store).len(),
+        events_before,
+        "a rejected directory add must not record an event"
+    );
+
+    // Unix: a FIFO must be rejected *without being opened*, which used to block.
+    #[cfg(unix)]
+    {
+        let fifo_path = store.join("input.fifo");
+        let fifo_created = Command::new("mkfifo")
+            .arg(&fifo_path)
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if fifo_created {
+            let fifo_output = run_with_timeout(
+                &store,
+                &[
+                    "add",
+                    "-p",
+                    "demo",
+                    "-s",
+                    "fifo",
+                    "-a",
+                    "test",
+                    "input.fifo",
+                ],
+                Duration::from_secs(10),
+            );
+            assert!(
+                !fifo_output.status.success(),
+                "adding a FIFO must fail: stdout:\n{}\nstderr:\n{}",
+                stdout(&fifo_output),
+                stderr(&fifo_output)
+            );
+            assert_eq!(
+                fifo_output.status.code(),
+                Some(1),
+                "a rejected FIFO add must exit with 1"
+            );
+            assert!(
+                stderr(&fifo_output).contains("not a regular file"),
+                "FIFO error must explain regular files: {}",
+                stderr(&fifo_output)
+            );
+            assert_eq!(
+                event_lines(&store).len(),
+                events_before,
+                "a rejected FIFO add must not record an event"
+            );
+        }
+        // If `mkfifo` is unavailable, the directory assertion above is the
+        // documented fallback: both are non-regular files.
+    }
+
+    // The rejection must not be over-broad: a regular file still records an event.
+    let ok = run(
+        &store,
+        &[
+            "add",
+            "-p",
+            "demo",
+            "-s",
+            "regular",
+            "-a",
+            "test",
+            "regular.txt",
+        ],
+    );
+    assert_success(&ok);
+    assert_eq!(
+        event_lines(&store).len(),
+        events_before + 1,
+        "a regular file add must still record exactly one event"
     );
 }

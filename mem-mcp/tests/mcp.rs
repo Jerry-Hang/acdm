@@ -1094,3 +1094,93 @@ fn mem_sync_conflict_reports_is_error_and_mentions_resolve() {
         text
     );
 }
+
+/// Second-round review: a `notifications/*` method *with* an id is an ordinary
+/// request (JSON-RPC 2.0) and must be answered with -32601, otherwise the client
+/// waits forever. Only id-less notifications are silent.
+#[test]
+fn notifications_with_id_are_answered() {
+    let env = TestEnv::new("notification-with-id");
+    let mut server = McpServer::start(&env.store, &env.cwd);
+    server.initialize();
+
+    server
+        .send_raw(&json!({"jsonrpc": "2.0", "id": 99, "method": "notifications/foo"}).to_string());
+    let response = server.read_response();
+    assert_eq!(
+        error_code(&response),
+        -32601,
+        "a notifications/* request with an id must be answered with -32601: {}",
+        response
+    );
+    assert_eq!(response["id"], json!(99));
+
+    server.send_raw(
+        &json!({"jsonrpc": "2.0", "id": 100, "method": "notifications/initialized"}).to_string(),
+    );
+    let response = server.read_response();
+    assert_eq!(
+        error_code(&response),
+        -32601,
+        "even the standard initialized notification must answer -32601 when it has an id: {}",
+        response
+    );
+    assert_eq!(response["id"], json!(100));
+
+    // A notification without an id is still silent: the next response the client
+    // reads must belong to the following ping.
+    server.send_notification("notifications/initialized");
+    let pong = server.send_request("ping", None);
+    assert_eq!(
+        pong["result"],
+        json!({}),
+        "an id-less notification must not produce a response: {}",
+        pong
+    );
+}
+
+/// Second-round review: an invalid project name must be rejected immediately by
+/// the handler (isError), before any directory or record is created.
+#[test]
+fn invalid_project_name_returns_is_error_immediately() {
+    let env = TestEnv::new("invalid-project");
+    let mut server = McpServer::start(&env.store, &env.cwd);
+    server.initialize();
+
+    let response = server.call_tool(
+        "mem_add_event",
+        json!({"project": "../etc", "summary": "must be rejected"}),
+    );
+    assert!(
+        response.get("error").is_none(),
+        "an invalid project is a tool business error, not a JSON-RPC error: {}",
+        response
+    );
+    assert_eq!(
+        response["result"]["isError"],
+        json!(true),
+        "an invalid project must set isError: {}",
+        response
+    );
+    let text = tool_text(&response);
+    assert!(
+        text.contains("invalid project name"),
+        "the error text must name the invalid project: {}",
+        text
+    );
+
+    // Nothing may be recorded and no project directory may be created.
+    assert!(
+        store_events(&env.store).is_empty(),
+        "an invalid project must not record an event"
+    );
+    let projects_dir = env.store.join("projects");
+    assert!(projects_dir.is_dir(), "store init creates projects/");
+    assert_eq!(
+        fs::read_dir(&projects_dir)
+            .expect("read projects dir")
+            .count(),
+        0,
+        "an invalid project must not create a project directory"
+    );
+}

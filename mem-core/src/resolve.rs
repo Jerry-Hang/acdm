@@ -123,6 +123,24 @@ pub fn resolve_conflicts(root: &Path) -> Result<ResolveReport, Box<dyn Error>> {
             Err(error) => {
                 let unresolved = unresolved_files(root)?;
                 if unresolved.is_empty() {
+                    // A replayed commit can become an empty patch after
+                    // de-duplication: every record it added already exists
+                    // upstream, so the resolved content equals HEAD. Git refuses
+                    // to commit that ("No changes - did you forget to use
+                    // `git add`?") and the commit must be dropped with
+                    // `git rebase --skip`; the clean worktree is what tells this
+                    // apart from a Git failure the resolver cannot act on.
+                    if rebase_active(root) && crate::git::git_worktree_clean(root)? {
+                        if let Err(skip_error) = crate::git::git_rebase_skip(root) {
+                            // `--skip` exits non-zero again when the rebase
+                            // immediately stops on the next commit's conflict;
+                            // that is progress and the next round resolves it.
+                            if unresolved_files(root)?.is_empty() {
+                                return Err(skip_error);
+                            }
+                        }
+                        continue;
+                    }
                     // Git failed for a reason the resolver cannot act on (a bad
                     // patch, an index problem, ...): surface its own message.
                     return Err(error);
@@ -157,6 +175,7 @@ fn resolve_conflicted_jsonl_files(
     jsonl_files.sort();
 
     let mut resolved_files = 0;
+    let is_git_repo = crate::git::git_is_repo(root);
     for file_path in jsonl_files {
         let raw = fs::read(&file_path)?;
         if !contains_conflict_start(&raw) {
@@ -169,7 +188,7 @@ fn resolve_conflicted_jsonl_files(
 
         write_resolved(&file_path, &resolved.content)?;
 
-        if root.join(".git").exists() {
+        if is_git_repo {
             stage_file(root, &file_path)?;
         }
 
@@ -425,6 +444,10 @@ fn write_resolved(path: &Path, content: &[u8]) -> Result<(), Box<dyn Error>> {
 }
 
 /// `git add` the resolved file (non-UTF-8 paths are handled lossily).
+///
+/// A failed `git add` is a hard error: during a rebase the following
+/// `git rebase --continue` can never succeed, and a warning would hide the real
+/// cause (e.g. an index lock, a filter failure or a deleted file).
 fn stage_file(root: &Path, file_path: &Path) -> Result<(), Box<dyn Error>> {
     let relative = file_path.strip_prefix(root).unwrap_or(file_path);
     let relative = relative.to_string_lossy().into_owned();
@@ -433,26 +456,30 @@ fn stage_file(root: &Path, file_path: &Path) -> Result<(), Box<dyn Error>> {
         .args(["add", "--", &relative])
         .output()?;
     if !output.status.success() {
-        eprintln!(
-            "Warning: git add {} failed: {}",
+        return Err(format!(
+            "git add failed for {}: {}",
             relative,
             String::from_utf8_lossy(&output.stderr).trim()
-        );
+        )
+        .into());
     }
     Ok(())
 }
 
 /// Whether a rebase is actually in progress.
 ///
-/// Detection uses git's own state directories (`.git/rebase-merge`,
-/// `.git/rebase-apply`). It deliberately does **not** inspect git's error text:
-/// that message is localized, so matching on English ("no rebase in progress")
-/// fails on any non-English locale and turned a successful resolution into a
-/// hard error.
+/// Detection uses git's own state paths (`rebase-merge`, `rebase-apply`) and
+/// deliberately does **not** inspect git's error text: that message is
+/// localized, so matching on English ("no rebase in progress") fails on any
+/// non-English locale and turned a successful resolution into a hard error.
+///
+/// The paths are resolved through `git rev-parse --git-path` rather than
+/// `root.join(".git")`: in a linked worktree or a submodule `.git` is a *file*,
+/// and the rebase state lives in the per-worktree git directory.
 fn rebase_active(root: &Path) -> bool {
-    let git_dir = root.join(".git");
-    git_dir.is_dir()
-        && (git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists())
+    ["rebase-merge", "rebase-apply"]
+        .into_iter()
+        .any(|state| crate::git::git_path(root, state).is_ok_and(|path| path.exists()))
 }
 
 /// Paths that are still unmerged in the Git index.
@@ -1141,6 +1168,338 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&status).trim().is_empty(),
             "working tree must be clean after the rebase:\n{}",
+            String::from_utf8_lossy(&status)
+        );
+    }
+
+    /// Whether a rebase is in progress, resolved the same worktree-aware way as
+    /// the production code.
+    fn rebase_state_present(root: &Path) -> bool {
+        ["rebase-merge", "rebase-apply"]
+            .into_iter()
+            .any(|state| crate::git::git_path(root, state).is_ok_and(|path| path.exists()))
+    }
+
+    /// Regression for the empty-patch failure: a replayed commit can be reduced to
+    /// no changes at all by de-duplication (all of its records already exist
+    /// upstream). Git then refuses to commit it with "No changes - did you forget
+    /// to use `git add`?", leaving a clean worktree and an active rebase. A single
+    /// `resolve_conflicts` call must `git rebase --skip` that commit and continue
+    /// with the next replayed commit's conflict.
+    #[test]
+    fn test_resolve_multi_commit_rebase_with_pure_duplicate_commit() {
+        let tmp = TestDir::new();
+        let root = tmp.path.clone();
+        let event_file = "events/2026-10.jsonl";
+        let base_line = format!(
+            "{}\n",
+            event_json("eid_a", "2026-10-22T00:00:00.000000000Z", "base")
+        );
+        let x_line = format!(
+            "{}\n",
+            event_json("eid_x", "2026-10-22T05:00:00.000000000Z", "x")
+        );
+        let w_line = format!(
+            "{}\n",
+            event_json("eid_w", "2026-10-22T06:00:00.000000000Z", "w")
+        );
+
+        // A bare remote seeded with one base event.
+        let bare = root.join("remote.git");
+        git_ok(&root, &["init", "--bare", "-q", bare.to_str().unwrap()]);
+        let seed = root.join("seed");
+        fs::create_dir_all(&seed).unwrap();
+        init_repo(&seed);
+        commit_file(&seed, event_file, &base_line, "base");
+        let branch = current_branch(&seed);
+        git_ok(&seed, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git_ok(&seed, &["push", "-q", "-u", "origin", &branch]);
+        git_ok(
+            &bare,
+            &["symbolic-ref", "HEAD", &format!("refs/heads/{}", branch)],
+        );
+
+        // The local clone commits event X twice, then a commit that conflicts.
+        let local = root.join("local");
+        git_ok(
+            &root,
+            &[
+                "clone",
+                "-q",
+                bare.to_str().unwrap(),
+                local.to_str().unwrap(),
+            ],
+        );
+        configure_repo(&local);
+        // The apply backend still stops on an empty patch after conflict
+        // resolution (newer merge backends may drop it by themselves), so pinning
+        // it here exercises the `git rebase --skip` recovery deterministically.
+        git_ok(&local, &["config", "rebase.backend", "apply"]);
+        // Replaying this commit onto the remote change (which already contains X)
+        // conflicts; de-duplication collapses the result back to the upstream
+        // content, so the commit becomes an empty patch.
+        commit_file(
+            &local,
+            event_file,
+            &format!("{base_line}{x_line}{x_line}"),
+            "local duplicate",
+        );
+        // A normal conflicting commit after the empty one, so the rebase becomes
+        // multi-step: skip first, then resolve a real conflict.
+        commit_file(
+            &local,
+            event_file,
+            &format!("{base_line}{x_line}{x_line}{w_line}"),
+            "local add",
+        );
+
+        // Meanwhile another clone pushes the change that already contains X.
+        let writer = root.join("writer");
+        git_ok(
+            &root,
+            &[
+                "clone",
+                "-q",
+                bare.to_str().unwrap(),
+                writer.to_str().unwrap(),
+            ],
+        );
+        configure_repo(&writer);
+        commit_file(
+            &writer,
+            event_file,
+            &format!("{base_line}{x_line}"),
+            "remote add",
+        );
+        git_ok(&writer, &["push", "-q"]);
+
+        // Divergent history: the pull stops on the duplicate commit's conflict.
+        let pull = git(&local, &["pull", "--rebase"]);
+        assert!(
+            !pull.status.success(),
+            "pull --rebase must stop on the duplicate commit's conflict:\n{}",
+            String::from_utf8_lossy(&pull.stdout)
+        );
+        assert!(
+            rebase_state_present(&local),
+            "expected an active rebase after the conflicting pull"
+        );
+        let conflicted = fs::read_to_string(local.join(event_file)).unwrap();
+        assert!(
+            conflicted.contains("<<<<<<<"),
+            "expected conflict markers, got:\n{}",
+            conflicted
+        );
+
+        // One call: skip the empty patch, then resolve the next real conflict.
+        let report = resolve_conflicts(&local)
+            .expect("resolve must handle a rebase containing an empty patch");
+        assert_eq!(
+            report.total_conflicts_resolved, 2,
+            "one conflict per replayed commit, got: {:?}",
+            report
+        );
+        assert!(
+            !rebase_state_present(&local),
+            "rebase must be finished after resolve_conflicts"
+        );
+
+        let resolved = fs::read_to_string(local.join(event_file)).unwrap();
+        assert!(
+            !resolved.contains("<<<<<<<") && !resolved.contains(">>>>>>>"),
+            "markers left behind:\n{}",
+            resolved
+        );
+        let events: Vec<Event> = resolved
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("resolved line is an event"))
+            .collect();
+        let ids: Vec<&str> = events.iter().map(|event| event.event_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["eid_a", "eid_x", "eid_w"],
+            "the duplicate event must neither be lost nor duplicated: {:?}",
+            ids
+        );
+
+        // The empty commit was skipped, not committed: base + remote + one replayed.
+        let log = git_ok(&local, &["log", "--oneline"]).stdout;
+        assert_eq!(
+            String::from_utf8_lossy(&log).lines().count(),
+            3,
+            "expected base + remote + one replayed commit:\n{}",
+            String::from_utf8_lossy(&log)
+        );
+        let status = git_ok(&local, &["status", "--porcelain"]).stdout;
+        assert!(
+            String::from_utf8_lossy(&status).trim().is_empty(),
+            "working tree must be clean after the rebase:\n{}",
+            String::from_utf8_lossy(&status)
+        );
+    }
+
+    /// Regression for `.git` being a *file* (linked worktree / submodule): the old
+    /// `root.join(".git").is_dir()` check never detected the rebase there, so the
+    /// resolved file was never staged and `git rebase --continue` was never run.
+    #[test]
+    fn test_resolve_works_with_git_worktree_or_gitfile() {
+        let tmp = TestDir::new();
+        let root = tmp.path.clone();
+        let event_file = "events/2026-10.jsonl";
+
+        // A bare remote seeded with one base event.
+        let bare = root.join("remote.git");
+        git_ok(&root, &["init", "--bare", "-q", bare.to_str().unwrap()]);
+        let seed = root.join("seed");
+        fs::create_dir_all(&seed).unwrap();
+        init_repo(&seed);
+        commit_file(
+            &seed,
+            event_file,
+            &format!(
+                "{}\n",
+                event_json("eid_a", "2026-10-22T00:00:00.000000000Z", "base")
+            ),
+            "base",
+        );
+        let branch = current_branch(&seed);
+        git_ok(&seed, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git_ok(&seed, &["push", "-q", "-u", "origin", &branch]);
+        git_ok(
+            &bare,
+            &["symbolic-ref", "HEAD", &format!("refs/heads/{}", branch)],
+        );
+
+        // A primary checkout plus a linked worktree: `.git` in the linked worktree
+        // is a plain file pointing into the primary repository.
+        let primary = root.join("primary");
+        git_ok(
+            &root,
+            &[
+                "clone",
+                "-q",
+                bare.to_str().unwrap(),
+                primary.to_str().unwrap(),
+            ],
+        );
+        configure_repo(&primary);
+        let worktree = root.join("worktree");
+        git_ok(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            worktree.join(".git").is_file(),
+            "a linked worktree must have a .git file, not a directory"
+        );
+        assert!(!worktree.join(".git").is_dir());
+        assert!(
+            crate::git::git_is_repo(&worktree),
+            "git_is_repo must work when .git is a file"
+        );
+        let plain_dir = root.join("not-a-repo");
+        fs::create_dir_all(&plain_dir).unwrap();
+        assert!(!crate::git::git_is_repo(&plain_dir));
+
+        // The worktree's commit rewrites the base event; another clone pushes a
+        // conflicting rewrite of the same line.
+        commit_file(
+            &worktree,
+            event_file,
+            &format!(
+                "{}\n",
+                event_json("eid_a", "2026-10-22T02:00:00.000000000Z", "local")
+            ),
+            "local change",
+        );
+        let writer = root.join("writer");
+        git_ok(
+            &root,
+            &[
+                "clone",
+                "-q",
+                bare.to_str().unwrap(),
+                writer.to_str().unwrap(),
+            ],
+        );
+        configure_repo(&writer);
+        commit_file(
+            &writer,
+            event_file,
+            &format!(
+                "{}\n",
+                event_json("eid_a", "2026-10-22T01:00:00.000000000Z", "remote")
+            ),
+            "remote change",
+        );
+        git_ok(&writer, &["push", "-q"]);
+
+        // Rebase the worktree's feature branch onto the fetched upstream tip.
+        git_ok(&worktree, &["fetch", "-q", "origin"]);
+        let upstream = format!("origin/{}", branch);
+        let rebase = git(&worktree, &["rebase", &upstream]);
+        assert!(
+            !rebase.status.success(),
+            "the worktree rebase must stop on the JSONL conflict:\n{}",
+            String::from_utf8_lossy(&rebase.stdout)
+        );
+        assert!(
+            rebase_state_present(&worktree),
+            "the worktree's rebase must be found through `git rev-parse --git-path`"
+        );
+        let conflicted = fs::read_to_string(worktree.join(event_file)).unwrap();
+        assert!(
+            conflicted.contains("<<<<<<<"),
+            "expected conflict markers in the worktree, got:\n{}",
+            conflicted
+        );
+
+        let report =
+            resolve_conflicts(&worktree).expect("resolve must handle a .git-file worktree");
+        assert_eq!(report.total_conflicts_resolved, 1);
+        assert!(
+            !rebase_state_present(&worktree),
+            "rebase must be finished after resolve_conflicts"
+        );
+
+        // `git add` took effect and the replayed commit was created.
+        let resolved = fs::read_to_string(worktree.join(event_file)).unwrap();
+        assert!(
+            !resolved.contains("<<<<<<<") && !resolved.contains(">>>>>>>"),
+            "markers left behind:\n{}",
+            resolved
+        );
+        let events: Vec<Event> = resolved
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("resolved line is an event"))
+            .collect();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_id, "eid_a");
+        assert_eq!(
+            events[0].summary, "local",
+            "last write wins: the replayed side must be kept"
+        );
+
+        let log = git_ok(&worktree, &["log", "--oneline"]).stdout;
+        assert_eq!(
+            String::from_utf8_lossy(&log).lines().count(),
+            3,
+            "expected base + remote + one replayed commit:\n{}",
+            String::from_utf8_lossy(&log)
+        );
+        let status = git_ok(&worktree, &["status", "--porcelain"]).stdout;
+        assert!(
+            String::from_utf8_lossy(&status).trim().is_empty(),
+            "worktree must be clean after the rebase:\n{}",
             String::from_utf8_lossy(&status)
         );
     }
