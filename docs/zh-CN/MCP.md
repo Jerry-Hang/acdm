@@ -4,7 +4,7 @@
 
 > 读者：要把 ACDM 接入 Claude Desktop、Cursor 或自研 MCP 客户端的开发者。本文覆盖 `mem-mcp` 的启动方式、stdio 上的 JSON-RPC 2.0 会话、8 个工具的参数/返回/边界行为和错误码；CLI 侧参考见 [CLI.md](CLI.md)，整体设计见 [ARCHITECTURE.md](ARCHITECTURE.md) 与 [DESIGN.md](DESIGN.md)。
 
-本文以 `mem-mcp/src/main.rs` 中 `tools/list` 返回的 `inputSchema` 与各 handler 的实际行为为**唯一权威**。文中报文与返回文本都在 v0.1.0 / v0.1.1 / v0.1.2 / v0.1.3 的实际二进制上通过管道喂 stdin 实测得到（各版本行为变更处按该版本重新实测）；为可读性，示例中的本机绝对路径替换为 `/path/to/...` 占位符，事件 ID、时间戳、hash 保持原样。实际响应是**单行 JSON**；文中保留原始单行报文的示例直接引用实测输出，少数结构示意（如 `tools/list` 的树形展开）会明确标注为示意。
+本文以 `mem-mcp/src/main.rs` 中 `tools/list` 返回的 `inputSchema` 与各 handler 的实际行为为**唯一权威**。文中报文与返回文本都在 v0.1.0 / v0.1.1 / v0.1.2 / v0.1.3 / v0.1.4 的实际二进制上通过管道喂 stdin 实测得到（各版本行为变更处按该版本重新实测）；为可读性，示例中的本机绝对路径替换为 `/path/to/...` 占位符，事件 ID、时间戳、hash 保持原样。实际响应是**单行 JSON**；文中保留原始单行报文的示例直接引用实测输出，少数结构示意（如 `tools/list` 的树形展开）会明确标注为示意。
 
 ## 目录
 
@@ -44,7 +44,7 @@
 - **传输层**：stdio 上的**换行分隔 JSON-RPC 2.0**。stdin 每行一个 JSON 对象；stdout 每行一个响应对象。不是 LSP 那种 `Content-Length` 分帧。
 - **单行上限**：一行请求最多 16 MiB；超限行被丢弃（保持输入流同步）并返回 `-32600`，server 继续服务。
 - **错误分两类**：协议问题返回 JSON-RPC error（`-32700` / `-32600` / `-32601` / `-32602`）；工具级业务失败返回**成功响应 + `result.isError = true`** 与可读的错误文本，Agent 可据此自我纠正并重试（见 [5. 错误码与语义](#5-错误码与语义)）。
-- **协议版本**：`initialize` 固定返回 `protocolVersion: "2024-11-05"`，`serverInfo` 为 `{"name":"mem-mcp","version":"0.1.3"}`。
+- **协议版本**：`initialize` 固定返回 `protocolVersion: "2024-11-05"`，`serverInfo` 为 `{"name":"mem-mcp","version":"0.1.4"}`。
 - **能力**：只声明 `capabilities.tools = {}`；没有 resources、prompts、logging、sampling 等能力。
 - **单线程串行**：主循环逐行读取 stdin，同步处理完一个请求、写回一个响应并 flush 后才读下一行；没有并发处理。
 - **启动即初始化 store**：启动时按与 CLI 相同的规则定位 store，并调用 `MemStore::init()`——目录结构或 `.mem` 缺失时自动创建（等价于 `mem init`）。
@@ -171,13 +171,13 @@ mem-mcp: unrecognized argument "--help"; usage: mem-mcp [--path <store-root>]
 请求（真实报文）：
 
 ```json
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"docs-client","version":"0.1.3"}}}
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"docs-client","version":"0.1.4"}}}
 ```
 
 响应（真实报文）：
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"tools":{}},"protocolVersion":"2024-11-05","serverInfo":{"name":"mem-mcp","version":"0.1.3"}}}
+{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"tools":{}},"protocolVersion":"2024-11-05","serverInfo":{"name":"mem-mcp","version":"0.1.4"}}}
 ```
 
 ### 3.3 notifications/initialized
@@ -186,16 +186,16 @@ mem-mcp: unrecognized argument "--help"; usage: mem-mcp [--path <store-root>]
 
 ```text
 # stdin（3 行）
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"docs-client","version":"0.1.3"}}}
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"docs-client","version":"0.1.4"}}}
 {"jsonrpc":"2.0","method":"notifications/initialized"}
 {"jsonrpc":"2.0","id":2,"method":"ping"}
 
 # stdout（2 行）
-{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"tools":{}},"protocolVersion":"2024-11-05","serverInfo":{"name":"mem-mcp","version":"0.1.3"}}}
+{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"tools":{}},"protocolVersion":"2024-11-05","serverInfo":{"name":"mem-mcp","version":"0.1.4"}}}
 {"jsonrpc":"2.0","id":2,"result":{}}
 ```
 
-任何**没有 `id`** 的 `notifications/*` 报文都按通知静默处理（上面的 `notifications/initialized` 不产生输出）。**带 `id` 的 `notifications/*` 是普通 Request**：服务端必须应答，未注册的方法返回 `-32601 Method not found`。0.1.3 实测：无 id 的 `notifications/foo` 无响应；带 id 的 `notifications/foo`（id 99）返回 `{"jsonrpc":"2.0","id":99,"error":{"code":-32601,"message":"Method not found: notifications/foo"}}`。
+任何**没有 `id`** 的 `notifications/*` 报文都按通知静默处理（上面的 `notifications/initialized` 不产生输出）。**带 `id` 的 `notifications/*` 是普通 Request**：服务端必须应答，未注册的方法返回 `-32601 Method not found`。0.1.4 实测：无 id 的 `notifications/foo` 无响应；带 id 的 `notifications/foo`（id 99）返回 `{"jsonrpc":"2.0","id":99,"error":{"code":-32601,"message":"Method not found: notifications/foo"}}`。
 
 ### 3.4 ping
 
@@ -389,7 +389,7 @@ Project demo
 | `device` | string | 否 | 本机 hostname | 设备名；`null`/空白字符串视为未给，回退 hostname（规则同 CLI） |
 | `agent` | string | 否 | `mcp-agent` | 记录者名称；空白字符串回退默认值 |
 | `files` | array | 否 | `[]` | 受影响的文件列表；省略表示本次事件没有文件变更 |
-| `files[].file_name` | string | **是** | — | 文件路径；**绝对路径会被规范化**为 store / git 仓库 / CWD 相对路径。空白值（`""`/纯空白）与指向 store 根目录本身的值（`""`、`.`、`./` 规范化后等于 store 根）会被拒绝 |
+| `files[].file_name` | string | **是** | — | 文件路径；**绝对路径会被规范化**为 store / git 仓库 / CWD 相对路径。空白值、规范化后等于 **store 根 / 进程工作目录 / 所在 git 工作树根**的值、以及原路径本身是目录的值都会被拒绝；同一事件内按规范化名去重 |
 | `files[].action` | string | 否 | `Modified` | 只接受 `Created` / `Modified` / `Deleted`（大小写敏感）；其它值返回 `-32602` |
 | `files[].size_bytes` | integer | 否 | `0` | 文件字节数 |
 | `files[].hash` | string | 否 | `""` | 调用方提供的 SHA256 十六进制摘要；服务端**不计算也不校验** |
@@ -457,7 +457,7 @@ Project demo
 - `project` 第一次被记录时，若 `projects/<project>/meta.json` 不存在，会**自动写入**最小元数据（`description` = `"Project <name>"`、`github_url` = null、`created_at` = 事件时间），与 CLI `add` 一致。
 - `files` 省略或为空数组时事件仍会写入（`recorded with 0 files`），且不会追加 `files.jsonl` 记录。
 - `file_name` 规范化规则与 CLI 相同：相对 store 根 → 相对 git 仓库根 → 相对 CWD → 绝对路径（MCP 侧**不会**像 CLI 那样打印绝对路径警告）。
-- 0.1.3 起 `file_name` 有额外校验：空白值返回 `isError`，文本为 `Invalid file_name: must not be empty`；规范化后等于 store 根目录（`""` / `.` / `./`）返回 `isError`，文本为 `Invalid file_name: must not be the store root`。
+- 0.1.4 起 `file_name` 有完整校验（0.1.3 已有空白检查）：空白值 → `isError`，文本 `Invalid file_name: must not be empty`；规范化后等于 **store 根、进程工作目录或所在 git 工作树根**（例如客户端 CWD 恰在其外部 git 仓库里时传 `"."`，或直接传该仓库根的绝对路径）→ `isError`，文本 `Invalid file_name: must not be a directory root (store root, working directory or enclosing git work tree)`；原路径本身是目录 → `isError`，文本 `Invalid file_name: '<path>' is a directory, not a file`。同一事件的 `files[]` 内按规范化 `file_name` **批次去重**（保留第一条），与 CLI 一致：`b.rs` + `./b.rs` 只记录 1 个文件（返回文本为 `recorded with 1 files`）。
 - `action` 只接受 `Created` / `Modified` / `Deleted`（缺省 `Modified`）；传 `"Renamed"` 等其它值会返回 `-32602`（`Invalid arguments for mem_add_event: unknown variant ...`）；`size_bytes` / `hash` 仍然透传，不校验文件是否存在。
 - 事件 ID 由服务端生成（`YYYYMMDDHHMMSS_nanos9_pid5_counter4`，UTC）；`ts` 为固定宽度 UTC 纳秒。
 - `project` 必须是单一安全路径组件（同 CLI 校验，0.1.2 起还拒绝 Windows 保留名、尾点与非法字符 `<>:"|?*`）；非法值（如 `../evil`、`CON`、`con.txt`、`foo.`、`a<b`）在写入前被拒绝，返回 `isError` 结果：`Invalid project: invalid project name "CON": reserved Windows device name (would be invalid on Windows)`。MCP 的 `files[]` 是调用方提供的元数据（服务端不读文件），因此没有 CLI 那样的「非普通文件」检查。
@@ -826,7 +826,7 @@ Projects in memory store (<N>):
   （分别是坏 JSON 之后的 ping、未知工具之后的 ping。）
 - 成功响应与错误响应互斥：成功不含 `error`，错误不含 `result`；**但成功响应可能带 `result.isError = true`**（业务失败），客户端应优先检查该字段，再读 `result.content[].text`。
 - 无法解析/超长/超限的行只影响该行：`-32700` / `-32600` 后循环继续（`id` 为 `null`）。
-- **通知与请求的区别**：没有 `id` 的报文是 Notification，**不会产生响应**（包括 `notifications/initialized`）；带 `id` 的 `notifications/*` 方法是 Request，服务端会应答 `-32601 Method not found`，而不是静默丢弃。已用 0.1.3 二进制实测：`{"jsonrpc":"2.0","id":99,"method":"notifications/foo"}` → `Method not found: notifications/foo`。
+- **通知与请求的区别**：没有 `id` 的报文是 Notification，**不会产生响应**（包括 `notifications/initialized`）；带 `id` 的 `notifications/*` 方法是 Request，服务端会应答 `-32601 Method not found`，而不是静默丢弃。已用 0.1.4 二进制实测：`{"jsonrpc":"2.0","id":99,"method":"notifications/foo"}` → `Method not found: notifications/foo`。
 - `tools/call` 的 `params` 形状错误与工具参数 schema 不匹配是 `-32602`；工具执行期的业务失败一律是 `result.isError = true`，不再使用 `-32603`。
 - 单行请求上限 16 MiB（`MAX_REQUEST_LINE_BYTES`），超限返回 `-32600` 并丢弃整行。
 
@@ -871,8 +871,8 @@ Agent 侧推荐节奏（`mem-mcp` 启动时不需要做任何额外初始化）�
 - **上下文截断**：`mem_get_context` 只取最近 5 条事件，`mem_render` 时间线只取最近 10 条。
 - **同步前置条件**：`mem_sync` 要求 store 是 git 仓库且可推送（remote + 凭据）；upstream 可选（没有时跳过 pull）。冲突与失败以 `isError` 结果返回，而不是 `-32603`。
 - **冲突解决只覆盖 JSONL**：`mem_resolve` 不处理 `meta.json` 等非 JSONL 文件的冲突（可能需要手工解决后 `git rebase --continue`）。
-- **协议版本固定**：固定返回 `2024-11-05`，不校验客户端版本、不支持批处理数组、不支持服务端主动通知。
-- **项目名已校验**：`project` 必须是单一安全路径组件（非空、非 `.`/`..`、不含 `/`、`\`、无控制字符、≤200 字节；Windows 保留设备名如 `CON`/`NUL`/`LPT1`/`con.txt`、尾点名字与 Windows 非法字符 `<>:"|?*` 同样被拒绝）；非法名在校验阶段就作为 `isError` 结果返回，因此 Agent 传入的名字无法逃出 `projects/`，也不会破坏 Windows checkout。
+- **协议版本固定 / 通知语义**：固定返回 `2024-11-05`，不校验客户端版本、不支持批处理数组、不发送服务端主动通知。客户端通知按 JSON-RPC 语义支持：没有 `id` 的报文永不响应，带 `id` 的 `notifications/*` 是普通 Request，会得到 `-32601`。
+- **项目名与文件名已校验**：`project` 必须是单一安全路径组件（非空、非 `.`/`..`、不含 `/`、`\`、无控制字符、≤200 字节；Windows 保留设备名如 `CON`/`NUL`/`LPT1`/`con.txt`、尾点名字与 Windows 非法字符 `<>:"|?*` 同样被拒绝）；非法名在校验阶段就作为 `isError` 结果返回，因此 Agent 传入的名字无法逃出 `projects/`，也不会破坏 Windows checkout。`files[].file_name` 必须非空、规范化后不能是目录根（store 根、进程 CWD 或所在 git 工作树根）、也不能指向已存在的目录——对应 `Invalid file_name: must not be empty` / `must not be a directory root (...)` / `'<path>' is a directory, not a file`；同一事件内重复的规范化名只保留第一条。
 
 ## 8. 相关文档
 

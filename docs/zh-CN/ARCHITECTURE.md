@@ -3,7 +3,7 @@
 # ACDM 架构
 
 > 读者：想理解 ACDM 如何工作、准备贡献代码或排查存储/同步问题的开发者。
-> 本文描述当前源码（v0.1.3）的实际行为；为什么这样设计见 [DESIGN.md](DESIGN.md)，命令用法见 [CLI.md](CLI.md) 与 [MCP.md](MCP.md)。
+> 本文描述当前源码（v0.1.4）的实际行为；为什么这样设计见 [DESIGN.md](DESIGN.md)，命令用法见 [CLI.md](CLI.md) 与 [MCP.md](MCP.md)。
 
 ## 1. 设计目标与约束
 
@@ -79,7 +79,7 @@ ACDM 要在多台机器、多个 AI Agent 之间共享「项目记忆」。它�
 
    | 步骤 | 行为 |
    | --- | --- |
-   | 路径规范化 | [`normalize_file_name(file_path, &store.root)`](../../mem-core/src/util.rs)；若结果仍是绝对路径（既不在 store、也不在任何 git 仓库、也不在 CWD 之下），向 stderr 打一条警告 |
+   | 路径规范化 | [`normalize_file_name(file_path, &store.root)`](../../mem-core/src/util.rs)；若结果仍是绝对路径（既不在 store、也不在任何 git 仓库、也不在 CWD 之下），向 stderr 打一条警告。**文件型符号链接**只规范化父目录、保留链接名；**目录型软链**以及软链形式的 store 根 / CWD 仍被解析 |
    | 存在性 | 用**用户传入的原始路径**判断，不用规范化名 |
    | 不存在 | 打开时不存在、或在哈希过程中消失 → `action = Deleted`，`size_bytes = 0`，`hash = ""`（不报错） |
    | 存在 | 必须是**普通文件**；[`hash_file(path)`](../../mem-core/src/models.rs) 以 64 KiB 分块流式计算 → `size_bytes` = 字节数，`hash` = SHA256 十六进制；文件不会整体读入内存。FIFO、设备节点与目录会被拒绝：`cannot record '<path>': not a regular file` |
@@ -302,7 +302,9 @@ YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ     # 恰好 30 字符，UTC
 
 实现细节：
 
-- 先做词法绝对化与 `.` / `..` 解析，再对**已存在的最长前缀**做 `fs::canonicalize`（解析符号链接），不存在的尾部按词法拼接（被删除的文件也保持确定的身份）；
+- 先做词法绝对化与 `.` / `..` 解析，再对**已存在的最长前缀**做 canonicalize，不存在的尾部按词法拼接（被删除的文件也保持确定的身份）；
+- **文件型符号链接**只 canonicalize 其父目录并保留链接自身名字：仓库内指向仓库外的软链文件（如 `src/config.json -> ../dotfiles/config.json`）仍是仓库相对身份，不会因为被解析到仓库外而退化成绝对路径；dangling（悬空）文件软链同样保留名字；
+- **目录型符号链接**（软链形式的 store 根、父目录、CWD）仍按真实路径解析——它们是普通路径间接；
 - 每次 `strip_prefix` 比较的两侧都做同样的规范化，因此经由软链访问的 store 与真实路径得到相同的相对身份；
 - 组件统一用 `/`（Windows 的 `\` 会被替换）；
 - 非 UTF-8 路径经 `to_string_lossy` 处理，可能有损。
@@ -455,7 +457,7 @@ Git 对文本行做三方合并，两个分片都追加了不同事件时，冲�
 9. 以排他锁 `truncate` 覆盖写回。
 10. 若 store 根存在 `.git`：`git add -- <相对路径>` 把解决后的文件暂存。**`git add` 失败是硬错误**：rebase 中继续执行会让后续 `git rebase --continue` 失败并留下半完成状态，所以直接返回错误、不继续推进。
 11. rebase 状态通过 Git 自身解析（`git rev-parse --git-path`）：普通仓库是 `.git/rebase-merge` / `.git/rebase-apply`；`git worktree` / submodule 中 `.git` 是**文件**，状态在 per-worktree 的 git 目录里。存在 rebase 时执行 `git rebase --continue`（`GIT_EDITOR=true` 防止阻塞），然后回到第 1 步继续下一轮；一次调用最多循环 100 轮，直到 rebase 结束。未解决文件列表用 `git diff --name-only --diff-filter=U -z` 读取：NUL 分隔的原始路径不带状态前缀、不做引号转义，因此含空格或特殊字符的 `.jsonl` 路径也能被正确识别。若剩余冲突包含非 JSONL 文件，则停止并打印可操作的错误（列出非 JSONL 文件与所有未解决路径）。
-12. 若 `git rebase --continue` 发现当前提交是**空补丁**（要应用的改动已经在目标分支中，常见于多轮冲突解决），先确认**已跟踪**变更已全部暂存（`git status --porcelain --untracked-files=no` 为空），然后自动执行 `git rebase --skip` 丢弃该提交并继续，而不是把空补丁误报为失败。只看已跟踪变更是关键：store 里一个未跟踪的临时文件不应阻止空补丁恢复。
+12. 若 `git rebase --continue` 发现当前提交是**空补丁**（要应用的改动已经在目标分支中，常见于多轮冲突解决），先确认 **index 与 HEAD 一致**（`git diff --cached --quiet`，即没有已暂存改动）且没有未解决文件，然后自动执行 `git rebase --skip` 丢弃该提交并继续，而不是把空补丁误报为失败。判定只看 index 是否等于 HEAD：无关文件的**未暂存修改**或未跟踪临时文件都不改变被重放的补丁，不应阻止恢复。注意 `git rebase --skip` 可能重置工作树里无关的未暂存修改——这是 Git 自身行为，resolver 不承诺保留；需要保留的未暂存改动请先 commit 或 stash。
 
 `ResolveReport` 汇报：`resolved_files`、`total_conflicts_resolved`、`deduplicated_items`、`lines_preserved`。
 
@@ -467,6 +469,8 @@ Git 对文本行做三方合并，两个分片都追加了不同事件时，冲�
 - `.git/rebase-apply/`（`am` / 非交互式 rebase 进行中）
 
 这是 Git 的内部状态，与语言环境无关，判断严格且稳定。
+
+空补丁的判定与工作树是否干净无关，只与 **index 是否等于 HEAD** 有关（`git diff --cached --quiet`）：无关文件的未暂存修改或未跟踪文件不影响「重放的补丁是否为空」，因此不再阻止 `git rebase --skip` 恢复。
 
 ### 7.5 冲突解决之后的流程
 

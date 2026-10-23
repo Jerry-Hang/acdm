@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/Jerry-Hang/acdm/actions/workflows/ci.yml/badge.svg)](https://github.com/Jerry-Hang/acdm/actions/workflows/ci.yml)
 
-*ACDM (Agent Cross-Device Memory System) is a serverless, cross-device memory layer for AI agents that work on the same project from different machines. It records project events as append-only, month-sharded JSONL and synchronizes them through Git, so every machine sees the same history without running a database or a hosted backend. One Rust workspace ships two entry points: the `mem` CLI for humans and scripts, and `mem-mcp`, a stdio MCP server for agents. Timestamps and IDs are fixed-width UTC, file paths are normalized into repo-relative identities, and JSONL merge conflicts are resolved automatically by `mem resolve` — preserve-first, never silently dropping data. The project is MIT-licensed and currently at v0.1.3.*
+*ACDM (Agent Cross-Device Memory System) is a serverless, cross-device memory layer for AI agents that work on the same project from different machines. It records project events as append-only, month-sharded JSONL and synchronizes them through Git, so every machine sees the same history without running a database or a hosted backend. One Rust workspace ships two entry points: the `mem` CLI for humans and scripts, and `mem-mcp`, a stdio MCP server for agents. Timestamps and IDs are fixed-width UTC, file paths are normalized into repo-relative identities, and JSONL merge conflicts are resolved automatically by `mem resolve` — preserve-first, never silently dropping data. The project is MIT-licensed and currently at v0.1.4.*
 
 ACDM gives cross-device AI agents a shared project memory through **Git sync + append-only JSONL**: an agent records events on any machine, and after syncing, another machine can look up the same history.
 
@@ -147,10 +147,10 @@ CI (`.github/workflows/ci.yml`) runs the following on every `push` / `pull_reque
 
 | Metric | Current value |
 | --- | --- |
-| Tests | **105 total, all passing**: 63 `mem-core` unit tests + 16 CLI integration tests + 6 MCP unit tests + 20 MCP integration tests |
+| Tests | **109 total, all passing**: 65 `mem-core` unit tests + 16 CLI integration tests + 6 MCP unit tests + 22 MCP integration tests |
 | Static checks | In local verification, `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo doc` (rustdoc) are all warning-free; CI covers fmt / clippy / test / release build |
-| Release binaries | `mem` 3.13 MB, `mem-mcp` 2.86 MB (release profile: `strip = true`, `lto = "thin"`, `codegen-units = 1`) |
-| Version / license | v0.1.3 / MIT |
+| Release binaries | `mem` 3.13 MB, `mem-mcp` 2.88 MB (release profile: `strip = true`, `lto = "thin"`, `codegen-units = 1`) |
+| Version / license | v0.1.4 / MIT |
 
 ## Store discovery rules
 
@@ -393,7 +393,7 @@ Fixed width means string order equals time order, so plain string sorting is chr
 3. Relative to the current working directory;
 4. When none of the above applies, fall back to an absolute path.
 
-The longest on-disk-existing prefix of a path is canonicalized (symbolic links resolved), and the still-missing tail is appended lexically, so a store or file reached through a symlink keeps the same identity as its real path. A `\` in a path is replaced with `/`, and `.` / `..` are resolved lexically (the file need not exist).
+The longest on-disk-existing prefix of a path is canonicalized (symbolic links resolved), and the still-missing tail is appended lexically, so a store or file reached through a symlink keeps the same identity as its real path. One deliberate exception: a final symbolic link **to a file** keeps its own name (only its parent directory is canonicalized), so a tracked in-repo symlink pointing outside the repository is still recorded under its repo-relative path instead of degrading to an absolute path; symlinks to directories (a symlinked store root or parent directory) are still resolved. A `\` in a path is replaced with `/`, and `.` / `..` are resolved lexically (the file need not exist).
 
 ### Conflict resolution guarantees
 

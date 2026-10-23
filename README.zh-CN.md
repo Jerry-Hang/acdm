@@ -146,10 +146,10 @@ CI（`.github/workflows/ci.yml`）在每次 `push` / `pull_request` 时依次执
 
 | 指标 | 当前值 |
 | --- | --- |
-| 测试 | **105 个全部通过**：63 个 `mem-core` 单元测试 + 16 个 CLI 集成测试 + 6 个 MCP 单元测试 + 20 个 MCP 集成测试 |
+| 测试 | **109 个全部通过**：65 个 `mem-core` 单元测试 + 16 个 CLI 集成测试 + 6 个 MCP 单元测试 + 22 个 MCP 集成测试 |
 | 静态检查 | 本地校验中 `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo doc`（rustdoc）均无警告；CI 覆盖 fmt / clippy / test / release build |
-| Release 二进制 | `mem` 3.13 MB、`mem-mcp` 2.86 MB（release profile：`strip = true`、`lto = "thin"`、`codegen-units = 1`） |
-| 版本 / 许可 | v0.1.3 / MIT |
+| Release 二进制 | `mem` 3.13 MB、`mem-mcp` 2.88 MB（release profile：`strip = true`、`lto = "thin"`、`codegen-units = 1`） |
+| 版本 / 许可 | v0.1.4 / MIT |
 
 ## store 定位规则
 
@@ -392,7 +392,7 @@ YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ   // 恰好 30 个字符，UTC
 3. 相对当前工作目录；
 4. 以上都不满足时退化为绝对路径。
 
-路径中**已存在的最长前缀**会做 `fs::canonicalize`（解析符号链接），不存在的尾部按词法拼接；`\` 统一替换为 `/`，`.` / `..` 按词法解析（不要求文件存在）。这样同一文件在不同设备、不同挂载点、甚至软链路径下都保持同一身份。
+路径中**已存在的最长前缀**会做 `fs::canonicalize`（解析符号链接），不存在的尾部按词法拼接；`\` 统一替换为 `/`，`.` / `..` 按词法解析（不要求文件存在）。其中**文件型符号链接**只规范化其父目录、保留链接自身的名字（仓库内指向仓库外的软链文件仍得到仓库相对身份），**目录型软链**以及软链形式的 store 根 / CWD 仍被解析。这样同一文件在不同设备、不同挂载点、甚至软链路径下都保持同一身份。
 
 ### 冲突解决保证
 

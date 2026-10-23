@@ -58,6 +58,7 @@ mem --path /path/to/store list -p <project>
 - 如果显示的是绝对路径（例如 `/home/alice/repo/src/main.rs`），说明是旧版本写入的数据：
   读取端不会自动改写，按相对名查不到。按 [MIGRATION.md](MIGRATION.md) 的「迁移 B」处理。
 - 如果显示 `src/main.rs`，确认查询时的目录分隔符与大小写完全一致。
+- 记录的是**文件型符号链接**（如 `src/config.json -> ../dotfiles/config.json`）：0.1.4 起保留链接自身的仓库相对名字，不会因为被解析到仓库外而退化成绝对路径；**目录型软链**仍会被解析，改变软链指向会改变身份。
 - 确认 `-p` 项目名一致（项目名是写入时的逻辑名，不是目录名）。
 - 刚写入就查不到：确认写到了同一个 store（§1），并检查 `events/` 下当月的文件是否新增了行。
 
@@ -122,9 +123,10 @@ mem --path /path/to/store sync     # 再次同步
   `git -C <store> check-ignore -v events/2026-10.jsonl`，必要时 `git add -f` 后再运行 `mem resolve`。
 - 空补丁提交会自动 `git rebase --skip`：多轮冲突解决时，某个提交要应用的改动可能已经在目标分支里，
   `mem resolve` 会自动跳过它并继续推进 rebase，这是正常行为，不是冲突。
-- 未跟踪文件不再阻止空补丁恢复（0.1.3）：空补丁的 `git rebase --skip` 判定只看**已跟踪**变更
-  （`git status --porcelain --untracked-files=no`）；store 里存在未跟踪临时文件时 `mem resolve`
-  仍能正常跳过空补丁，不会再因此报错停下。
+- 无关未暂存修改不再阻止空补丁恢复（0.1.4）：空补丁判定只看 **index 是否等于 HEAD**
+  （`git diff --cached --quiet`）且没有未解决文件；store 里无关文件的未暂存修改或未跟踪临时文件都不再阻止
+  `mem resolve` 跳过空补丁。注意 `git rebase --skip` 可能重置工作区里无关的未暂存修改（Git 自身行为）——
+  需要保留的改动请先 commit 或 stash。
 - `git worktree` / submodule：`.git` 是**文件**而不是目录，0.1.2 起通过 `git rev-parse --git-path`
   定位 per-worktree 的 rebase 状态，可以直接在 worktree 内运行 `mem resolve`。
 - resolve 后仍然冲突：看 `git -C <store> status`；确认冲突文件在仓库内、`.jsonl` 后缀、
@@ -165,8 +167,8 @@ mem --path /path/to/store sync     # 再次同步
 - **启动即退出**：未知启动参数会打印 usage 并 `exit 2`（防止拼写错误静默用错 store）；
   确认只传 `--path`。
 - **客户端一直等待响应**：没有 `id` 的报文是 Notification，按设计**不会**有响应；如果客户端给
-  `notifications/*` 方法带了 `id`，0.1.3 会返回 `-32601 Method not found: notifications/...` 而不是
-  静默丢弃；如果旧版本 server 让你一直等，请升级到 0.1.3。
+  `notifications/*` 方法带了 `id`，0.1.4 会返回 `-32601 Method not found: notifications/...` 而不是
+  静默丢弃；如果旧版本 server 让你一直等，请升级到 0.1.4。
 - **工具调用返回 error**：先区分协议错误与业务错误：
   - `-32700` 请求不是合法 JSON；
   - `-32600` `jsonrpc` 不是 `"2.0"`，或单行请求超过 16 MiB（超限后 server 会丢弃该行并继续服务）；
@@ -176,10 +178,11 @@ mem --path /path/to/store sync     # 再次同步
     而是成功响应 + `result.isError = true`，错误文本在 `result.content[].text`；
     `-32603` 保留给真正的服务端故障，当前版本不会出现。
 - **工具执行失败但 server 还活着**：这是预期行为，读 `isError` 文本、修正参数后重试即可。
-- **`mem_add_event` 报 Invalid file_name**：0.1.3 起空白 `file_name` 返回 `isError`，文本为
-  `Invalid file_name: must not be empty`；规范化后等于 store 根目录的 `file_name`（`"."` / `"./"`，
-  即客户端 CWD 恰好是 store 时，或 store 的绝对路径）返回 `isError`，文本为 `Invalid file_name: must not be the store root`。
-  修正传入的 `file_name`（使用具体文件路径）后重试即可。
+- **`mem_add_event` 报 Invalid file_name**：0.1.4 起 `file_name` 校验扩展——空白 → `Invalid file_name: must not be empty`；
+  规范化后等于 **store 根 / 进程工作目录 / 所在 git 工作树根** → `Invalid file_name: must not be a directory root (store root, working directory or enclosing git work tree)`；
+  原路径本身是目录 → `Invalid file_name: '<path>' is a directory, not a file`。以上都是 `isError` 结果，
+  且同一事件的 `files[]` 内会按规范化名**批次去重**（`b.rs` + `./b.rs` 只记录 1 个文件）。
+  修正为具体文件路径后重试即可。
 - **找不到 store / 事件写到奇怪位置**：MCP 启动时会 `init`（缺 store 时在解析出的根目录自建）。
   建议显式 `--path` 或设置 `ACDM_STORE`，避免依赖客户端进程的 CWD。
 - **多客户端并发**：每个客户端各自启动一个 `mem-mcp` 进程；写操作由**跨进程 store 写锁**（`fs2`）串行化。

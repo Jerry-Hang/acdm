@@ -3,7 +3,7 @@
 # ACDM Architecture
 
 > Intended for developers who want to understand how ACDM works, plan to contribute code, or troubleshoot storage/sync problems.
-> This document describes the actual behavior of the current source (v0.1.3); for the rationale behind the design see [DESIGN.md](DESIGN.md), and for command usage see [CLI.md](CLI.md) and [MCP.md](MCP.md).
+> This document describes the actual behavior of the current source (v0.1.4); for the rationale behind the design see [DESIGN.md](DESIGN.md), and for command usage see [CLI.md](CLI.md) and [MCP.md](MCP.md).
 
 ## 1. Design goals and constraints
 
@@ -79,7 +79,7 @@ The entry point is the `Commands::Add` branch in [`mem-cli/src/main.rs`](../mem-
 
    | Step | Behavior |
    | --- | --- |
-   | Path normalization | [`normalize_file_name(file_path, &store.root)`](../mem-core/src/util.rs); if the result is still an absolute path (the file is neither inside the store, nor inside any Git repository, nor under the CWD), print a warning to stderr |
+   | Path normalization | [`normalize_file_name(file_path, &store.root)`](../mem-core/src/util.rs); if the result is still an absolute path (the file is neither inside the store, nor inside any Git repository, nor under the CWD), print a warning to stderr. A final symlink to a file keeps its own name (only the parent is canonicalized), so an in-repo symlink pointing outside the work tree stays repository-relative |
    | Existence | Checked against the **original path supplied by the user**, not the normalized name |
    | Missing | `action = Deleted`, `size_bytes = 0`, `hash = ""`; a path that disappears while being opened or hashed is also recorded as `Deleted` instead of failing the command |
    | Present | Must be a **regular file**, checked on the **same open handle** that is then hashed (single-handle: no TOCTOU race); [`hash_reader`](../mem-core/src/models.rs) streams it through SHA-256 in 64 KiB chunks → `size_bytes` = byte count, `hash` = SHA256 hex (never loaded whole). FIFOs, device nodes and directories are rejected with `cannot record '<path>': not a regular file` |
@@ -299,7 +299,7 @@ YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ     # exactly 30 characters, UTC
 
 Implementation details:
 
-- Paths are made absolute lexically (`.` / `..` resolved) and the **longest on-disk-existing prefix is canonicalized**, so symbolic links are resolved for store roots and existing files; the still-missing tail is appended lexically (a deleted file keeps a deterministic identity);
+- Paths are made absolute lexically (`.` / `..` resolved) and the **longest on-disk-existing prefix is canonicalized**, so symbolic links are resolved for store roots and existing files; the still-missing tail is appended lexically (a deleted file keeps a deterministic identity); a final symbolic link **to a file** is a deliberate exception: only its parent directory is canonicalized and the link's own name is kept, so an in-repo symlink pointing outside the work tree is still recorded as a repository-relative path instead of degrading to an absolute path (symlinks to directories, store roots and CWDs keep the full canonicalize behaviour; a dangling file symlink is also kept by name);
 - Both sides of every `strip_prefix` comparison are canonicalized the same way, so a store reached through a symlink yields the same relative identity as its real path;
 - Components always use `/` (Windows `\` is replaced);
 - Non-UTF-8 paths go through `to_string_lossy` and may be lossy.
@@ -451,7 +451,7 @@ Steps in [`resolve_conflicts`](../mem-core/src/resolve.rs):
    6. Preserved lines (including identical duplicates, collapsed once) are re-emitted **byte-for-byte** and appended at the end of the file.
    7. Write the result back with an exclusive lock and `truncate`; if the store is a Git repository (detected with `git rev-parse --git-dir`, so linked worktrees and submodules whose `.git` is a **file** work too), stage the file with `git add -- <relative path>`. A failed `git add` is now a **hard error** — continuing would only hide the real reason why `rebase --continue` can never succeed. Accumulate the report across rounds.
    8. If no rebase is active, deduplicate the reported file list and return.
-   9. Otherwise run `git rebase --continue`: success → next round (the next replayed commit may conflict too). On failure, inspect the still-unresolved files: if every one is a `.jsonl` file and this round actually resolved something, continue with the next round. When nothing is unresolved and the work tree has **no tracked changes** (`git status --porcelain --untracked-files=no`, 0.1.3 — untracked scratch files in the store no longer prevent recovery), the replayed commit became an **empty patch** after de-duplication (every record it added already exists upstream): git refuses to commit it ("No changes"), so the resolver drops it with `git rebase --skip` and continues. Otherwise return an error that lists the **non-JSONL files** that genuinely need manual resolution. The unresolved list comes from `git diff --name-only --diff-filter=U -z` (NUL-separated), so paths containing spaces or special characters are reported verbatim without git's quoting/escaping.
+   9. Otherwise run `git rebase --continue`: success → next round (the next replayed commit may conflict too). On failure, inspect the still-unresolved files: if every one is a `.jsonl` file and this round actually resolved something, continue with the next round. When nothing is unresolved and the **index is clean** (`git diff --cached --quiet`: no staged difference between the index and `HEAD`, 0.1.4 — neither untracked scratch files nor unstaged edits to unrelated tracked files prevent recovery), the replayed commit became an **empty patch** after de-duplication (every record it added already exists upstream): git refuses to commit it ("No changes"), so the resolver drops it with `git rebase --skip` and continues. Note that `git rebase --skip` itself may reset unstaged changes to unrelated files in the working tree; that is Git's own behaviour and the resolver does not promise to preserve them. Otherwise return an error that lists the **non-JSONL files** that genuinely need manual resolution. The unresolved list comes from `git diff --name-only --diff-filter=U -z` (NUL-separated), so paths containing spaces or special characters are reported verbatim without git's quoting/escaping.
 3. After 100 rounds without finishing, return an error listing the still-conflicted files and the manual recovery steps.
 
 `ResolveReport` aggregates `resolved_files`, `total_conflicts_resolved`, `deduplicated_items`, and `lines_preserved` across all rounds.
@@ -463,7 +463,7 @@ The old implementation matched the error text from `git rebase --continue` (the 
 - `<git-path>/rebase-merge` (an interactive/ordinary rebase is in progress)
 - `<git-path>/rebase-apply` (an `am` / non-interactive rebase is in progress)
 
-Resolving the paths through `--git-path` (rather than assuming `<root>/.git` is a directory) is what makes `git worktree` and submodule checkouts work: in those layouts `.git` is a *file* and the rebase state lives in a per-worktree git directory. The decision is Git's internal state, independent of the language environment; the multi-round loop uses the same bookkeeping (`git status --porcelain` conflict codes, the **tracked-only** clean check for empty patches — `--untracked-files=no`, so local scratch files do not block recovery, and `git diff --name-only --diff-filter=U -z` for the unresolved list) to decide whether the resolver can still make progress or whether a non-JSONL file is blocking the rebase. The `-z` form also keeps paths with spaces or special characters intact, so the reported/`jsonl` check uses the raw path instead of git's quoted rendering.
+Resolving the paths through `--git-path` (rather than assuming `<root>/.git` is a directory) is what makes `git worktree` and submodule checkouts work: in those layouts `.git` is a *file* and the rebase state lives in a per-worktree git directory. The decision is Git's internal state, independent of the language environment; the multi-round loop uses the same bookkeeping (`git status --porcelain` conflict codes, the **index-clean** check for empty patches — `git diff --cached --quiet`, so local scratch files and unstaged unrelated edits do not block recovery, and `git diff --name-only --diff-filter=U -z` for the unresolved list) to decide whether the resolver can still make progress or whether a non-JSONL file is blocking the rebase. The `-z` form also keeps paths with spaces or special characters intact, so the reported/`jsonl` check uses the raw path instead of git's quoted rendering.
 
 ### 7.5 After conflicts are resolved
 

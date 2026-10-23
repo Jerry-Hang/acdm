@@ -2,7 +2,7 @@
 
 # Migration Guide
 
-> Audience: users upgrading an existing ACDM store to 0.1.3, or developers migrating from internal prerelease snapshots.
+> Audience: users upgrading an existing ACDM store to 0.1.4, or developers migrating from internal prerelease snapshots.
 > This document explains "which changes require action and which are already compatible on the read side", and provides a migration script that has been tested in practice.
 
 ## Data format and compatibility ground rules
@@ -76,6 +76,23 @@ Action items:
 
 1. Optional: run `mem compact -p <project>` once per project to rebuild the `files.jsonl` projection from the authoritative event log (also heals a stale or truncated projection).
 2. No other action is needed; the 0.1.2 recommendations remain valid but are optional.
+
+## Upgrading from 0.1.3 to 0.1.4
+
+Nothing to migrate: **0.1.4 changes no data format** (the same `events/`, `files.jsonl`, `meta.json`, `.mem` files are read and written), so an existing store works as-is and every fix takes effect automatically after replacing the binaries.
+
+What you get for free after upgrading:
+
+- **Directory anchors are rejected by MCP**: `mem_add_event` now refuses a `files[].file_name` that normalizes to a directory root — the store root, the process working directory, or the enclosing Git work tree (`Invalid file_name: must not be a directory root (...)`), and also refuses a path that is itself an existing directory (`Invalid file_name: '<path>' is a directory, not a file`). A whole directory can no longer be recorded as a tracked file.
+- **MCP batch de-duplication**: duplicate normalized file names within one event (`b.rs` + `./b.rs`) are collapsed to the first occurrence, matching `mem add`.
+- **Repository-relative file symlinks**: `normalize_file_name` canonicalizes only the **parent** of a final symbolic link to a file and keeps the link's own name, so a tracked in-repo symlink pointing outside the work tree (e.g. `repo/src/config.json -> ../dotfiles/config.json`) keeps a repository-relative identity instead of an absolute path that no other device can match; symlinks to directories (a symlinked store root or parent) behave as before.
+- **More reliable `resolve` recovery**: the empty-patch test for `git rebase --skip` is now **index-clean** (`git diff --cached --quiet`) instead of requiring a clean working tree, so untracked scratch files and unstaged edits to unrelated files no longer stop the recovery. Note that `git rebase --skip` may reset unstaged changes to unrelated files in the working tree — that is Git's own behaviour; commit or stash unrelated work before running `mem resolve` if you need to keep it.
+- **Test suite**: 105 → 109 tests (65 core + 16 CLI integration + 6 MCP unit + 22 MCP integration).
+
+Action items:
+
+1. Optional: run `mem compact -p <project>` once per project to rebuild the `files.jsonl` projection from the authoritative event log (also heals a stale or truncated projection).
+2. No other action is needed; the 0.1.3 recommendations remain valid but are optional.
 
 ## Upgrade steps (single machine)
 

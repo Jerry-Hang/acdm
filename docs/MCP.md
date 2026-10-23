@@ -4,7 +4,7 @@
 
 > Audience: developers who want to integrate ACDM into Claude Desktop, Cursor, or a custom MCP client. This document covers how `mem-mcp` starts, the JSON-RPC 2.0 session over stdio, and the parameters, return values, edge-case behavior, and error codes of the 8 tools; for the CLI side see [CLI.md](CLI.md), and for the overall design see [ARCHITECTURE.md](ARCHITECTURE.md) and [DESIGN.md](DESIGN.md).
 
-This document treats the `inputSchema` returned by `tools/list` in `mem-mcp/src/main.rs` and the actual behavior of each handler as the **sole authority**. All messages and return texts below were produced by feeding stdin to the real v0.1.3 binary through a pipe; for readability, absolute local paths in the examples are replaced with `/path/to/...` placeholders, while event IDs, timestamps, and hashes are kept as-is. Actual responses are **single-line JSON**; examples that keep the original single-line message quote the measured output directly, and the few structural illustrations (such as the tree-style expansion of `tools/list`) are explicitly labeled as illustrations.
+This document treats the `inputSchema` returned by `tools/list` in `mem-mcp/src/main.rs` and the actual behavior of each handler as the **sole authority**. All messages and return texts below were produced by feeding stdin to the real v0.1.4 binary through a pipe; for readability, absolute local paths in the examples are replaced with `/path/to/...` placeholders, while event IDs, timestamps, and hashes are kept as-is. Actual responses are **single-line JSON**; examples that keep the original single-line message quote the measured output directly, and the few structural illustrations (such as the tree-style expansion of `tools/list`) are explicitly labeled as illustrations.
 
 ## Table of Contents
 
@@ -42,7 +42,7 @@ This document treats the `inputSchema` returned by `tools/list` in `mem-mcp/src/
 Key facts:
 
 - **Transport**: **newline-delimited JSON-RPC 2.0** over stdio. One JSON object per line on stdin; one response object per line on stdout. Not `Content-Length` framing like LSP. A single request line is capped at **16 MiB**; an oversized line is discarded up to its newline, answered with `-32600`, and the server keeps serving.
-- **Protocol version**: `initialize` always returns `protocolVersion: "2024-11-05"`, with `serverInfo` being `{"name":"mem-mcp","version":"0.1.3"}`.
+- **Protocol version**: `initialize` always returns `protocolVersion: "2024-11-05"`, with `serverInfo` being `{"name":"mem-mcp","version":"0.1.4"}`.
 - **Capabilities**: declares only `capabilities.tools = {}`; no resources, prompts, logging, sampling, or other capabilities.
 - **Single-threaded and serial**: the main loop reads stdin line by line, handles one request synchronously, writes one response back and flushes it, and only then reads the next line; there is no concurrent processing.
 - **Store initialized at startup**: at startup the store is resolved with the same rules as the CLI, and `MemStore::init()` is called — missing directory structure or `.mem` is created automatically (equivalent to `mem init`).
@@ -171,13 +171,13 @@ The first step of the client handshake. The server **does not validate** the req
 Request (real message):
 
 ```json
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"docs-client","version":"0.1.3"}}}
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"docs-client","version":"0.1.4"}}}
 ```
 
 Response (real message):
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"tools":{}},"protocolVersion":"2024-11-05","serverInfo":{"name":"mem-mcp","version":"0.1.3"}}}
+{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"tools":{}},"protocolVersion":"2024-11-05","serverInfo":{"name":"mem-mcp","version":"0.1.4"}}}
 ```
 
 ### 3.3 notifications/initialized
@@ -186,12 +186,12 @@ The notification sent after the handshake completes, which **produces no respons
 
 ```text
 # stdin (3 lines)
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"docs-client","version":"0.1.3"}}}
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"docs-client","version":"0.1.4"}}}
 {"jsonrpc":"2.0","method":"notifications/initialized"}
 {"jsonrpc":"2.0","id":2,"method":"ping"}
 
 # stdout (2 lines)
-{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"tools":{}},"protocolVersion":"2024-11-05","serverInfo":{"name":"mem-mcp","version":"0.1.3"}}}
+{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"tools":{}},"protocolVersion":"2024-11-05","serverInfo":{"name":"mem-mcp","version":"0.1.4"}}}
 {"jsonrpc":"2.0","id":2,"result":{}}
 ```
 
@@ -389,7 +389,7 @@ Records one event and its associated file changes. This is the primary entry poi
 | `device` | string | No | Local hostname | Device name; `null`/whitespace-only is treated as not given and falls back to the hostname (same rules as the CLI) |
 | `agent` | string | No | `mcp-agent` | Recorder name; whitespace-only falls back to the default |
 | `files` | array | No | `[]` | List of affected files; omitted means this event has no file changes |
-| `files[].file_name` | string | **Yes** | — | File path; **absolute paths are normalized** to a store / git repository / CWD relative path. An empty/whitespace-only value is rejected (`Invalid file_name: must not be empty`), and so is a value that normalizes to the **store root** itself (e.g. `"."` or `"./"` when the client CWD is the store, or an absolute path to the store — `Invalid file_name: must not be the store root`); both come back as `isError` results |
+| `files[].file_name` | string | **Yes** | — | File path; **absolute paths are normalized** to a store / git repository / CWD relative path. Since 0.1.4 it is validated: empty/whitespace-only → `Invalid file_name: must not be empty`; a value that normalizes to a **directory root** — store root, process working directory, or the enclosing Git work tree (e.g. `"."`, `"./"`, or an absolute repository path) → `Invalid file_name: must not be a directory root (store root, working directory or enclosing git work tree)`; a path that is itself an existing directory → `Invalid file_name: '<path>' is a directory, not a file`. All come back as `isError` results. Duplicate normalized names within one event are collapsed to the first one (same as CLI `mem add`) |
 | `files[].action` | string | No | `Modified` | Must be exactly `Created` / `Modified` / `Deleted` (case-sensitive); any other value fails argument deserialization with `-32602` |
 | `files[].size_bytes` | integer | No | `0` | File size in bytes |
 | `files[].hash` | string | No | `""` | SHA256 hex digest supplied by the caller; the server **neither computes nor validates it** |
@@ -456,8 +456,9 @@ Real request and response with the optional fields omitted (`action` defaults to
 
 - When `project` is recorded for the first time — and equally when its `meta.json` is missing **or corrupt** — minimal metadata is **written automatically** in the same critical section as the event append (`description` = `"Project <name>"`, `github_url` = null, `created_at` = the event time). A metadata write failure aborts the tool call (it is no longer swallowed), so the call either records event + metadata together or reports an error.
 - When `files` is omitted or is an empty array, the event is still written (`recorded with 0 files`), and no `files.jsonl` record is appended.
-- `file_name` normalization rules are the same as the CLI: relative to the store root → relative to the git repository root → relative to the CWD → absolute path (the MCP side does **not** print the absolute-path warning that the CLI does). Existing path prefixes are canonicalized, so a symlinked store/project still yields a relative identity.
-- `file_name` is validated before it is stored (0.1.3): an empty or whitespace-only string is rejected with a tool-level error (`isError: true`, text `Invalid file_name: must not be empty`), and a value whose normalized identity is the store root itself (`"."`, `"./"`, or an absolute path to the store) is rejected with `Invalid file_name: must not be the store root`. The store directory is not a file identity, so it is never written into the projection; the whole call fails instead of silently recording it.
+- `file_name` normalization rules are the same as the CLI: relative to the store root → relative to the git repository root → relative to the CWD → absolute path (the MCP side does **not** print the absolute-path warning that the CLI does). Existing path prefixes are canonicalized, so a symlinked store/project still yields a relative identity; a final symlink **to a file** keeps its own name (only the parent is canonicalized, 0.1.4), so a tracked in-repo symlink pointing outside the repository is still stored repo-relative.
+- `file_name` is validated before it is stored (0.1.4): an empty or whitespace-only string is rejected with a tool-level error (`isError: true`, text `Invalid file_name: must not be empty`); a value whose normalized identity is a **directory root** — the store root, the process working directory, or the enclosing Git work tree (`"."`, `"./"`, an absolute path to the repository, ...) — is rejected with `Invalid file_name: must not be a directory root (store root, working directory or enclosing git work tree)`; and a path that is itself an existing directory is rejected with `Invalid file_name: '<path>' is a directory, not a file`. These are never written into the file projection; the whole call fails instead of silently recording a directory.
+- `files[]` is **de-duplicated by normalized `file_name` within one event** (0.1.4): `b.rs` and `./b.rs` (or otherwise equivalent paths) produce one `FileRecord`, keeping the first occurrence — the same batch semantics as CLI `mem add`. The response count (`recorded with N files`) reflects the de-duplicated list.
 - `action` is enum-validated: only the exact strings `Created` / `Modified` / `Deleted` are accepted; `"Renamed"` or any other value fails argument deserialization with JSON-RPC `-32602` (`unknown variant \`Renamed\`, expected one of \`Created\`, \`Modified\`, \`Deleted\``). `size_bytes` / `hash` are still passed through without checking whether the file exists.
 - An unsafe `project` is validated **first** and returned immediately as a tool-level error (`isError: true`, message `Invalid project: invalid project name ...`) — before any ID generation or file access — so a rejected name never creates a directory outside `projects/`. This covers traversal (`"../escape"`, `"a/b"`, absolute paths), Windows-reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, case-insensitive, including `con.txt`), names ending in `.`, and the Windows-invalid characters `<>:"|?*` (e.g. `Invalid project: invalid project name "a:b": character ':' is not allowed (would be invalid on Windows)`). File paths are supplied by the caller here: the MCP server never reads file contents, so the "regular file only" rule of `mem add` does not apply to `mem_add_event`.
 - Event IDs are generated by the server (`YYYYMMDDHHMMSS_nanos9_pid5_counter4`, UTC); `ts` is a fixed-width UTC nanosecond timestamp.
@@ -831,7 +832,7 @@ Generates or updates `projects/<project>/README.md`.
 - **Two error channels**: protocol problems use the JSON-RPC `error` object (and there is no `result`); business failures use a success response with `result.isError = true` (and there is no `error`). A success result without `isError` means the tool really succeeded.
 - An unparseable line affects only that line: the loop continues after `-32700` (`id` is `null`).
 - An over-long request line is discarded in a stream-preserving way: the server answers `-32600` (with `id: null`) and keeps reading later lines.
-- **Notifications vs. requests**: a message without `id` is a Notification and gets **no response** (this includes `notifications/initialized`). A `notifications/*` method **with** an `id` is a Request, so it is answered with `-32601 Method not found` rather than dropped silently — verified against the 0.1.3 binary (`{"jsonrpc":"2.0","id":99,"method":"notifications/foo"}` → `Method not found: notifications/foo`).
+- **Notifications vs. requests**: a message without `id` is a Notification and gets **no response** (this includes `notifications/initialized`). A `notifications/*` method **with** an `id` is a Request, so it is answered with `-32601 Method not found` rather than dropped silently — verified against the 0.1.4 binary (`{"jsonrpc":"2.0","id":99,"method":"notifications/foo"}` → `Method not found: notifications/foo`).
 - `-32602` covers both the outer `tools/call` params and a tool's `arguments`; clients should treat `error.message` / `result.content[0].text` as displayable text.
 
 ## 6. Recommended Workflow for Sharing a Store with the CLI
@@ -877,7 +878,7 @@ Notes for sharing with the CLI:
 - **Sync prerequisites**: `mem_sync` requires the store to be a git repository and a usable push target (remote + credentials); an upstream is optional (the pull is skipped without one). Conflicts and failures are returned as `isError` results, not `-32603`.
 - **Conflict resolution covers JSONL only**: `mem_resolve` does not handle conflicts in non-JSONL files such as `meta.json` (they may need to be resolved manually followed by `git rebase --continue`); a single call does advance a multi-commit rebase for JSONL conflicts.
 - **Fixed protocol version / notifications**: always returns `2024-11-05`; does not validate the client version, does not support batch arrays, and does not send server-initiated notifications. Client Notifications are supported in the JSON-RPC sense: a message without `id` is never answered, while a `notifications/*` method *with* an `id` is an ordinary request and gets `-32601`.
-- **Project names and file names are validated**: `project` must be a single safe path component (non-empty, not `.`/`..`, no `/` or `\`, no control characters, ≤200 bytes; Windows-reserved device names such as `CON`/`NUL`/`LPT1`/`con.txt`, names ending in `.`, and the Windows-invalid characters `<>:"|?*` are rejected too); unsafe names are validated first and returned as `isError` results, so an agent-supplied name cannot escape `projects/` or break a Windows checkout. `files[].file_name` must be non-empty and must not normalize to the store root (`Invalid file_name: must not be empty` / `must not be the store root`).
+- **Project names and file names are validated**: `project` must be a single safe path component (non-empty, not `.`/`..`, no `/` or `\`, no control characters, ≤200 bytes; Windows-reserved device names such as `CON`/`NUL`/`LPT1`/`con.txt`, names ending in `.`, and the Windows-invalid characters `<>:"|?*` are rejected too); unsafe names are validated first and returned as `isError` results, so an agent-supplied name cannot escape `projects/` or break a Windows checkout. `files[].file_name` must be non-empty, must not normalize to a directory root (store root, process CWD or enclosing Git work tree) and must not point at an existing directory — i.e. `Invalid file_name: must not be empty` / `must not be a directory root (...)` / `'<path>' is a directory, not a file`; duplicate normalized names within one event are collapsed to the first occurrence.
 
 ## 8. Related Documentation
 
