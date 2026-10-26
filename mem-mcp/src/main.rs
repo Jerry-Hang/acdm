@@ -395,8 +395,14 @@ struct AddEventArgs {
 }
 
 /// Key used for "is this a directory root" comparisons: `/`-separated path text.
+///
+/// Delegates to `mem_core::path_identity` so it renders identically to
+/// `normalize_file_name`: on Windows both sides must strip the verbatim
+/// (`\\?\`) prefix from canonicalized paths, otherwise a `.` file name never
+/// compares equal to the store root and the "is a directory" branch is hit
+/// before the "directory root" one.
 fn slash_identity(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
+    mem_core::path_identity(path)
 }
 
 /// Every string form under which `path` may appear as a normalised identity.

@@ -324,8 +324,36 @@ fn lexical_clean(path: &Path) -> PathBuf {
 }
 
 /// Render a path using `/` separators on every platform.
+///
+/// On Windows `Path::canonicalize` returns a verbatim path (`\\?\C:\...`, or
+/// `\\?\UNC\server\share`); those prefixes are stripped so a recorded
+/// `file_name` stays readable and matches the identity the same file gets on
+/// other devices.
 fn to_slash(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
+    strip_verbatim_prefix(path.to_string_lossy().replace('\\', "/"))
+}
+
+/// Remove the Windows verbatim (`\\?\`) prefix from an already slash-normalized
+/// path string. Other paths are returned unchanged.
+fn strip_verbatim_prefix(slash_path: String) -> String {
+    if let Some(rest) = slash_path.strip_prefix("//?/UNC/") {
+        format!("//{rest}")
+    } else if let Some(rest) = slash_path.strip_prefix("//?/") {
+        rest.to_string()
+    } else {
+        slash_path
+    }
+}
+
+/// Render a path as a stable `/`-separated identity string.
+///
+/// This is the canonical rendering used for both recorded file identities and
+/// the directory-root identities they are compared against. On Windows
+/// `Path::canonicalize` returns a verbatim path (`\\?\C:\...`); the prefix is
+/// stripped here so both sides of such a comparison agree, and so a recorded
+/// `file_name` stays readable and matches on other devices.
+pub fn path_identity(path: &Path) -> String {
+    to_slash(path)
 }
 
 #[cfg(test)]
@@ -604,5 +632,29 @@ mod tests {
         let name = default_device_name();
         assert!(!name.is_empty());
         assert!(!name.contains('\n'));
+    }
+
+    #[test]
+    fn test_verbatim_prefix_is_stripped_from_recorded_paths() {
+        // Windows canonicalize() yields verbatim paths; recording them would make
+        // the same file look different from another device.
+        assert_eq!(
+            strip_verbatim_prefix("//?/C:/data/file.txt".into()),
+            "C:/data/file.txt"
+        );
+        assert_eq!(
+            strip_verbatim_prefix("//?/UNC/server/share/file.txt".into()),
+            "//server/share/file.txt"
+        );
+        // Non-verbatim paths (all Unix paths, and already-normalized Windows ones)
+        // must pass through untouched.
+        assert_eq!(
+            strip_verbatim_prefix("/home/u/file.txt".into()),
+            "/home/u/file.txt"
+        );
+        assert_eq!(
+            strip_verbatim_prefix("C:/data/file.txt".into()),
+            "C:/data/file.txt"
+        );
     }
 }

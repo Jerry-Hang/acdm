@@ -10,12 +10,17 @@ use std::path::{Component, Path, PathBuf};
 
 /// Cross-process exclusive lock guarding writes to one memory store.
 ///
-/// This is an advisory `fs2`/`flock` lock. It is taken on the store's `.mem`
-/// marker file when that marker exists: opening the marker read-only and
+/// This is an advisory `fs2`/`flock` lock. On Unix it is taken on the store's
+/// `.mem` marker file when that marker exists: opening the marker read-only and
 /// flocking it mutates nothing, so the synchronized Git repository stays clean,
 /// and the lock naturally inherits the store's file permissions. A store that
 /// has no marker yet (only the very first [`MemStore::init`] is in that state)
 /// falls back to an owner-only lock file in the runtime/temp directory.
+///
+/// On Windows the lock always uses that runtime lock file instead of `.mem`,
+/// because `LockFileEx` is a *mandatory* lock: holding it on a file that Git
+/// indexes would make `git add` inside [`MemStore::sync`] fail (see
+/// [`lock_store`]).
 ///
 /// Holding the lock across a multi-file operation (event append, projection
 /// rebuild, README render, conflict resolution, sync) removes the interleaving
@@ -76,18 +81,33 @@ fn marker_temp_path(root: &Path) -> PathBuf {
 
 /// Acquire the store-wide write lock (blocks while another writer holds it).
 ///
-/// The `.mem` marker is preferred as the lock target: it is opened **read-only**
-/// and flocked, so taking the lock neither writes to the store nor dirty the Git
-/// work tree, and permission errors for other users surface naturally. Only a
-/// marker-less store (during its first `init`) falls back to a user-scoped,
-/// owner-only (`0600` on Unix) file in the runtime/temp directory.
+/// On Unix the lock target is the `.mem` marker when it exists (advisory
+/// `flock`; taking it leaves the Git work tree untouched), and only a
+/// marker-less store uses the runtime/temp lock file.
+///
+/// 🔴 **Windows (reported 2026-10-26, fs2 0.4.3): `LockFileEx` is a *mandatory*
+/// lock.** Two consequences broke every write command (`add`/`compact`/`sync`/
+/// `resolve`/`render`) while `list` kept working:
+///
+/// 1. A read-only handle is not enough for `LockFileEx` in this setup: locking
+///    the marker opened with `File::open` failed with `os error 5`
+///    (ACCESS_DENIED).
+/// 2. Even with a writable handle, locking the tracked `.mem` marker makes
+///    `git add -A` (run by `sync` while the store lock is held) fail with
+///    `read error while indexing .mem: Permission denied`, because Git's read of
+///    the marker hits the locked byte range.
+///
+/// So on Windows the lock always lives in the runtime/temp directory, where Git
+/// never looks, and it is opened read+write so `LockFileEx` can succeed.
 pub fn lock_store(root: &Path) -> Result<StoreWriteLock, Box<dyn Error>> {
-    let marker_path = root.join(util::STORE_MARKER);
-    if marker_path.is_file() {
-        // `flock` (and fs2's Windows equivalent) works on read-only handles.
-        let file = File::open(&marker_path)?;
-        file.lock_exclusive()?;
-        return Ok(StoreWriteLock { _file: file });
+    #[cfg(not(windows))]
+    {
+        let marker_path = root.join(util::STORE_MARKER);
+        if marker_path.is_file() {
+            let file = File::open(&marker_path)?;
+            file.lock_exclusive()?;
+            return Ok(StoreWriteLock { _file: file });
+        }
     }
 
     let path = fallback_lock_file_path(root);
@@ -122,7 +142,20 @@ fn open_for_recording(path: &Path) -> std::io::Result<File> {
             .custom_flags(libc::O_NONBLOCK)
             .open(path)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // 🔴 FILE_FLAG_BACKUP_SEMANTICS is required on Windows to open a
+        // **directory** at all (plain `File::open` fails with ACCESS_DENIED).
+        // Opening it here lets the caller's `metadata` check reject it with the
+        // same "not a regular file" error as on Unix. Harmless for regular files.
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         File::open(path)
     }
@@ -307,6 +340,7 @@ impl MemStore {
         if !gitignore_path.exists() {
             let mut file = OpenOptions::new()
                 .create(true)
+                .read(true)
                 .append(true)
                 .open(&gitignore_path)?;
             file.lock_exclusive()?;
@@ -560,8 +594,12 @@ impl MemStore {
 
         fs::create_dir_all(self.events_dir())?;
         let event_file_path = self.events_dir().join(format!("{}.jsonl", ym));
+        // 🔴 `.read(true)` is required on Windows: an append-only handle has no
+        // GENERIC_READ, and fs2's `LockFileEx` then fails with ACCESS_DENIED(5).
+        // (Windows 2026-10-26: every write command died here until this was added.)
         let mut event_file = OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .open(&event_file_path)?;
 
@@ -578,6 +616,7 @@ impl MemStore {
 
             let mut files_file = OpenOptions::new()
                 .create(true)
+                .read(true)
                 .append(true)
                 .open(&files_path)?;
 
@@ -1232,6 +1271,12 @@ mod tests {
     /// With a `.mem` marker the marker file itself is the lock target: it is
     /// opened read-only, so taking the lock never modifies the synchronized Git
     /// repository, and a second writer still blocks on it.
+    ///
+    /// Unix-only: on Windows the marker is deliberately **not** the lock target,
+    /// because `LockFileEx` is mandatory and Git would fail to index `.mem`
+    /// during `sync`; see [`lock_store`] and
+    /// `test_lock_store_uses_runtime_file_on_windows`.
+    #[cfg(unix)]
     #[test]
     fn test_lock_store_uses_marker_when_present() {
         use std::sync::mpsc;
@@ -1280,6 +1325,28 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("the second writer must acquire the lock after release");
         second.join().unwrap();
+    }
+
+    /// Windows: even with a `.mem` marker present, the lock must live in the
+    /// runtime/temp directory. Locking the tracked marker with the mandatory
+    /// `LockFileEx` made `git add -A` inside `sync` fail with
+    /// `read error while indexing .mem: Permission denied`.
+    #[cfg(windows)]
+    #[test]
+    fn test_lock_store_uses_runtime_file_on_windows() {
+        let (_tmp, store) = create_temp_store();
+        let marker = store.root.join(crate::util::STORE_MARKER);
+        assert!(marker.is_file());
+
+        let fallback_path = fallback_lock_file_path(&store.root);
+        let _ = fs::remove_file(&fallback_path);
+
+        let guard = store.lock_writes().unwrap();
+        assert!(
+            fallback_path.is_file(),
+            "on Windows the lock must use the runtime lock file, not the tracked .mem marker"
+        );
+        drop(guard);
     }
 
     /// A store without a `.mem` marker (only the first `init` is in that state)

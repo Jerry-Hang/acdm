@@ -355,7 +355,16 @@ fn add_outside_store_and_git_warns_and_records_absolute_path() {
 
     let records = file_record_lines(&store, "demo");
     assert_eq!(records.len(), 1);
-    let absolute = loose.to_string_lossy().replace('\\', "/");
+    // The recorded identity is the **canonical** absolute path: on Windows
+    // `env::temp_dir()` can hand out an 8.3 short-name spelling (JERRY-~1) while
+    // the identity is the long form, and the verbatim `\\?\` prefix is stripped
+    // before rendering. Compare against canonicalize() with both normalized.
+    let canonical = fs::canonicalize(&loose).expect("canonicalize the loose path");
+    let absolute = canonical
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_start_matches("//?/")
+        .to_string();
     assert!(
         records[0].contains(&format!("\"file_name\":\"{absolute}\"")),
         "an unnormalisable path is recorded absolutely, got: {}",
